@@ -2,5 +2,5 @@ package net.runelite.client.plugins.lendingtracker;
 
 interface EventSink
 {
-    void onTradeCompleted(TradeRecord rec);
+    void push(TradeRecord rec);
 }

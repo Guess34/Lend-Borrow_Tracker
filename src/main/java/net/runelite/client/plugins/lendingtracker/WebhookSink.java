@@ -1,99 +1,64 @@
 package net.runelite.client.plugins.lendingtracker;
 
 import com.google.gson.Gson;
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
-}
 
-
-class WebhookSink implements EventSink
+final class WebhookSink implements EventSink
 {
-    
-    WebhookSink(Gson gson) { this.gson = gson; }
-private final Gson gson;
+    private final Gson gson;
+    private final HttpClient http = HttpClient.newHttpClient();
     private final String url;
-    private final String hmacSecret;
-    private final HttpClient http = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
-        .build();
+    private final String secret; // optional; use if you sign payloads
 
-    WebhookSink(final Gson gson, final String url, final String hmacSecret)
+    WebhookSink(Gson gson, String url, String secret)
     {
         this.gson = gson;
         this.url = url;
-        this.hmacSecret = (hmacSecret != null && !hmacSecret.isBlank()) ? hmacSecret : null;
+        this.secret = secret;
     }
 
     @Override
-    public void onTradeCompleted(final TradeRecord record)
-    {
-        if (url == null || url.isBlank() || record == null)
-        {
-            return; // nothing to do
-        }
-
-        // Build payload
-        String body;
-        if (hmacSecret == null)
-        {
-            body = gson.toJson(new Payload(record));
-        }
-        else
-        {
-            String unsigned = gson.toJson(new Payload(record));
-            String signature = hmacSha256Hex(unsigned, hmacSecret);
-            body = gson.toJson(new SignedPayload(record, signature));
-        }
-
-        // Fire-and-forget POST
-        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-            .timeout(Duration.ofSeconds(10))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-            .build();
-
-        http.sendAsync(req, HttpResponse.BodyHandlers.discarding())
-            .exceptionally(ex -> null); // swallow errors (log-free to avoid client spam)
-    }
-
-    private static String hmacSha256Hex(String data, String key)
+    public void push(TradeRecord rec)
     {
         try
         {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] raw = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(raw.length * 2);
-            for (byte b : raw)
+            if (url == null || url.isBlank())
             {
-                sb.append(String.format("%02x", b));
+                return;
             }
-            return sb.toString();
+
+            var payload = new Payload(rec);
+            var json = gson.toJson(payload);
+
+            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+                .header("Content-Type", "application/json");
+
+            // If you sign requests, compute header here with `secret`:
+            // if (secret != null && !secret.isBlank()) {
+            //     String sig = Hmac.sha256Hex(secret, json);
+            //     b.header("X-Signature", sig);
+            // }
+
+            HttpRequest req = b.POST(HttpRequest.BodyPublishers.ofString(json)).build();
+            http.sendAsync(req, HttpResponse.BodyHandlers.discarding());
         }
         catch (Exception e)
         {
-            // If HMAC fails, fall back to empty signature
-            return "";
+            // swallow/log; never crash the client
         }
     }
 
-    // Minimal payload structs
-    static class Payload {
+    static final class Payload
+    {
         final String type = "trade_completed";
         final TradeRecord record;
-        Payload(TradeRecord r){ this.record = r; }
-    }
-    static class SignedPayload {
-        final String type = "trade_completed";
-        final TradeRecord record;
-        final String signature;
-        SignedPayload(TradeRecord r, String s){ this.record = r; this.signature = s; }
+
+        Payload(TradeRecord r)
+        {
+            this.record = r;
+        }
     }
 }
