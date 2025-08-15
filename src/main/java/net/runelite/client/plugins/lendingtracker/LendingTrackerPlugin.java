@@ -39,7 +39,6 @@ import net.runelite.client.util.ImageUtil;
 )
 public class LendingTrackerPlugin extends Plugin
 {
-    @Inject
 @Inject private Gson gson;
 
     private static final Logger log = LoggerFactory.getLogger(LendingTrackerPlugin.class);

@@ -10,27 +10,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
-
-
-interface EventSink
-{
-    void onTradeCompleted(TradeRecord record);
-}
-
-
-class NoopSink implements EventSink
-{
-    @Override
-    public void onTradeCompleted(TradeRecord record)
-    {
-        // intentionally no-op
-    }
 }
 
 
 class WebhookSink implements EventSink
 {
-    private final Gson gson;
+    
+    WebhookSink(Gson gson) { this.gson = gson; }
+private final Gson gson;
     private final String url;
     private final String hmacSecret;
     private final HttpClient http = HttpClient.newBuilder()
