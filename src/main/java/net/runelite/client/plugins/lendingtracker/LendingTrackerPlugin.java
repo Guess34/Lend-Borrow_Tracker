@@ -43,7 +43,6 @@ public class LendingTrackerPlugin extends Plugin
     private Gson gson;
 
     private static final Logger log = LoggerFactory.getLogger(LendingTrackerPlugin.class);
-    private static final Gson GSON = gson;
     private static final Type LIST_TYPE = new TypeToken<List<TradeRecord>>() {}.getType();
     private static final Path DATA_FILE = RuneLite.RUNELITE_DIR.toPath()
         .resolve("lendingtracker").resolve("trades.json");
@@ -89,7 +88,7 @@ public class LendingTrackerPlugin extends Plugin
             Files.createDirectories(DATA_FILE.getParent());
             if (Files.exists(DATA_FILE))
             {
-                List<TradeRecord> prev = GSON.fromJson(Files.readString(DATA_FILE), LIST_TYPE);
+                List<TradeRecord> prev = gson.fromJson(Files.readString(DATA_FILE), LIST_TYPE);
                 if (prev != null)
                 {
                     for (int i = prev.size() - 1; i >= 0 && i >= prev.size() - 50; i--)
@@ -126,7 +125,7 @@ public class LendingTrackerPlugin extends Plugin
     private void configureSink()
     {
         if (config.enableWebhook() && config.webhookUrl() != null && !config.webhookUrl().isBlank())
-            sink = new WebhookSink(config.webhookUrl(), config.hmacSecret());
+            sink = new WebhookSink(gson, config.webhookUrl(), config.hmacSecret());
         else
             sink = new NoopSink();
     }
@@ -208,7 +207,7 @@ public class LendingTrackerPlugin extends Plugin
         {
             List<TradeRecord> out = new ArrayList<>(buffer);
             Files.createDirectories(DATA_FILE.getParent());
-            Files.writeString(DATA_FILE, GSON.toJson(out));
+            Files.writeString(DATA_FILE, gson.toJson(out));
         }
         catch (IOException e) { log.warn("Unable to write history", e); }
     }

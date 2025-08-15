@@ -1,7 +1,4 @@
 package net.runelite.client.plugins.lendingtracker;
-
-
-import javax.inject.Inject;
 import com.google.gson.Gson;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -10,15 +7,13 @@ import java.net.http.HttpResponse;
 
 class WebhookSink implements EventSink
 {
-    @Inject
-    private Gson gson;
-
-    private static final Gson GSON = gson;
-    private final String url;
+    
+    private final Gson gson;
+private final String url;
     private final String hmacSecret;
     private final HttpClient http = HttpClient.newHttpClient();
 
-    WebhookSink(String url, String hmacSecret)
+    WebhookSink(Gson gson, String url, String hmacSecret)
     {
         this.url = url;
         this.hmacSecret = (hmacSecret == null || hmacSecret.isBlank()) ? null : hmacSecret;
@@ -29,7 +24,7 @@ class WebhookSink implements EventSink
     {
         try
         {
-            String body = GSON.toJson(new Payload(rec));
+            String body = gson.toJson(new Payload(rec));
             var b = HttpRequest.newBuilder(URI.create(url))
                     .header("Content-Type", "application/json");
 
@@ -38,7 +33,7 @@ class WebhookSink implements EventSink
             {
                 String sig = HmacSigner.sign(hmacSecret, body);
                 // Send as JSON with signature field, or as a header.
-                finalBody = GSON.toJson(new SignedPayload(rec, sig));
+                finalBody = gson.toJson(new SignedPayload(rec, sig));
             }
 
             HttpRequest req = b.POST(HttpRequest.BodyPublishers.ofString(finalBody)).build();
