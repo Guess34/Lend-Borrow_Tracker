@@ -1,5 +1,7 @@
 package net.runelite.client.plugins.lendingtracker;
 
+
+import javax.inject.Inject;
 import com.google.gson.Gson;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -8,7 +10,10 @@ import java.net.http.HttpResponse;
 
 class WebhookSink implements EventSink
 {
-    private static final Gson GSON = new Gson();
+    @Inject
+    private Gson gson;
+
+    private static final Gson GSON = gson;
     private final String url;
     private final String hmacSecret;
     private final HttpClient http = HttpClient.newHttpClient();

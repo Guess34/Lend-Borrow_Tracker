@@ -39,8 +39,11 @@ import net.runelite.client.util.ImageUtil;
 )
 public class LendingTrackerPlugin extends Plugin
 {
+    @Inject
+    private Gson gson;
+
     private static final Logger log = LoggerFactory.getLogger(LendingTrackerPlugin.class);
-    private static final Gson GSON = new Gson();
+    private static final Gson GSON = gson;
     private static final Type LIST_TYPE = new TypeToken<List<TradeRecord>>() {}.getType();
     private static final Path DATA_FILE = RuneLite.RUNELITE_DIR.toPath()
         .resolve("lendingtracker").resolve("trades.json");
