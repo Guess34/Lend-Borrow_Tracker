@@ -190,7 +190,7 @@ public class LendingTrackerPlugin extends Plugin
         while (buffer.size() > max) buffer.removeFirst();
 
         flush();
-        sink.onTradeCompleted(rec);
+            sink.push(rec);
 
         client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "LendingTracker: trade completed with " + partner +
             (role != LendingTrackerConfig.Role.NONE ? " (" + role.name() + ")" : ""), null);
