@@ -40,7 +40,7 @@ import net.runelite.client.util.ImageUtil;
 public class LendingTrackerPlugin extends Plugin
 {
     @Inject
-    private Gson gson;
+@Inject private Gson gson;
 
     private static final Logger log = LoggerFactory.getLogger(LendingTrackerPlugin.class);
     private static final Type LIST_TYPE = new TypeToken<List<TradeRecord>>() {}.getType();
@@ -82,7 +82,6 @@ public class LendingTrackerPlugin extends Plugin
         panel.borrowBtn.addActionListener(e -> selectedRole = LendingTrackerConfig.Role.BORROWER);
         panel.noneBtn.addActionListener(e -> selectedRole = LendingTrackerConfig.Role.NONE);
 
-        // Load prior
         try
         {
             Files.createDirectories(DATA_FILE.getParent());
