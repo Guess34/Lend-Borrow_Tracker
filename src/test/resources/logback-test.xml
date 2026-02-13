@@ -26,5 +26,5 @@
 		<appender-ref ref="STDOUT"/>
 		<appender-ref ref="FILE"/>
 	</root>
-	<logger name="net.runelite.client.plugins.lendingtracker" level="DEBUG" />
+	<logger name="com.guess34.lendingtracker" level="DEBUG" />
 </configuration>

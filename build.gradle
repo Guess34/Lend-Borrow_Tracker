@@ -26,7 +26,7 @@ dependencies {
 	testImplementation group: 'net.runelite', name:'jshell', version: runeLiteVersion
 }
 
-group = 'net.runelite.client.plugins.lendingtracker'
+group = 'com.guess34.lendingtracker'
 version = '1.0-SNAPSHOT'
 
 tasks.withType(JavaCompile).configureEach {
@@ -36,7 +36,7 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.register('run', JavaExec) {
 	classpath = sourceSets.test.runtimeClasspath
-	mainClass = 'net.runelite.client.plugins.lendingtracker.LendingTrackerPluginTest'
+	mainClass = 'com.guess34.lendingtracker.LendingTrackerPluginTest'
 
 	jvmArgs "-ea"
 	args "--developer-mode", "--debug"
@@ -46,7 +46,7 @@ tasks.register('shadowJar', Jar) {
 	dependsOn configurations.testRuntimeClasspath
 	manifest {
 		attributes(
-			'Main-Class': 'net.runelite.client.plugins.lendingtracker.LendingTrackerPluginTest',
+			'Main-Class': 'com.guess34.lendingtracker.LendingTrackerPluginTest',
 			'Multi-Release': true
 		)
 	}
