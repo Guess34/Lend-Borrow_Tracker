@@ -159,12 +159,6 @@ public class GroupsManagementPanel extends JPanel
 
 		String currentPlayer = getCurrentPlayerName();
 		GroupMember member = group.getMember(currentPlayer);
-
-		// For sample group, also check if there's a member called "You" (placeholder owner)
-		if (member == null && "sample-group".equals(group.getId())) {
-			member = group.getMember("You");
-		}
-
 		String role = member != null ? member.getRole() : ROLE_MEMBER;
 
 		// Group info section
@@ -261,14 +255,7 @@ public class GroupsManagementPanel extends JPanel
 		regenBtn.setForeground(Color.WHITE);
 		regenBtn.setPreferredSize(new Dimension(70, 26));
 		regenBtn.setToolTipText("Generate new group code or enter custom code");
-		// Disable regen for sample group
-		boolean isSampleGroup = "sample-group".equals(group.getId());
-		if (isSampleGroup) {
-			regenBtn.setEnabled(false);
-			regenBtn.setToolTipText("Cannot modify sample group codes. Create your own group to use this feature.");
-		} else {
-			regenBtn.addActionListener(e -> showCustomCodeDialog(group, true));
-		}
+		regenBtn.addActionListener(e -> showCustomCodeDialog(group, true));
 		actionRow.add(regenBtn, BorderLayout.WEST);
 
 		JLabel usedLabel = new JLabel("Used: " + group.getUsedGroupCodes().size());
@@ -326,24 +313,16 @@ public class GroupsManagementPanel extends JPanel
 		JPanel controlRow = new JPanel(new BorderLayout(5, 0));
 		controlRow.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 
-		// Disable controls for sample group
-		boolean isSampleGroup = "sample-group".equals(group.getId());
-
 		JButton toggleBtn = new JButton(group.isClanCodeEnabled() ? "Off" : "On");
 		toggleBtn.setBackground(group.isClanCodeEnabled() ? Color.RED.darker() : Color.GREEN.darker());
 		toggleBtn.setForeground(Color.WHITE);
 		toggleBtn.setPreferredSize(new Dimension(50, 26));
 		toggleBtn.setToolTipText("Enable or disable the clan code");
-		if (isSampleGroup) {
-			toggleBtn.setEnabled(false);
-			toggleBtn.setToolTipText("Cannot modify sample group. Create your own group to use this feature.");
-		} else {
-			toggleBtn.addActionListener(e -> {
-				group.setClanCodeEnabled(!group.isClanCodeEnabled());
-				saveGroup(group);
-				refreshContent();
-			});
-		}
+		toggleBtn.addActionListener(e -> {
+			group.setClanCodeEnabled(!group.isClanCodeEnabled());
+			saveGroup(group);
+			refreshContent();
+		});
 		controlRow.add(toggleBtn, BorderLayout.WEST);
 
 		JButton regenBtn = new JButton("Regen");
@@ -351,12 +330,7 @@ public class GroupsManagementPanel extends JPanel
 		regenBtn.setForeground(Color.WHITE);
 		regenBtn.setPreferredSize(new Dimension(70, 26));
 		regenBtn.setToolTipText("Generate new clan code or enter custom code");
-		if (isSampleGroup) {
-			regenBtn.setEnabled(false);
-			regenBtn.setToolTipText("Cannot modify sample group codes. Create your own group to use this feature.");
-		} else {
-			regenBtn.addActionListener(e -> showCustomCodeDialog(group, false));
-		}
+		regenBtn.addActionListener(e -> showCustomCodeDialog(group, false));
 		controlRow.add(regenBtn, BorderLayout.EAST);
 
 		contentPanel.add(controlRow);

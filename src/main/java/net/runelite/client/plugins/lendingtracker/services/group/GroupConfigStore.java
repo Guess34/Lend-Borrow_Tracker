@@ -136,11 +136,6 @@ public class GroupConfigStore {
             log.info("  - Group: '{}' (id: {})", g.getName(), g.getId());
         }
 
-        // Create sample group if no groups exist
-        if (groups.isEmpty()) {
-            log.info("No groups found in storage, creating sample group");
-            createSampleGroup();
-        }
     }
 
     /**
@@ -204,26 +199,6 @@ public class GroupConfigStore {
         return currentAccountName + CFG_KEY_ACTIVE_SUFFIX;
     }
 
-    private void createSampleGroup() {
-        String id = "sample-group";
-        LendingGroup sampleGroup = new LendingGroup(id, "Sample Group", "This is a sample group to demonstrate features. Create your own group to get started!");
-
-        // Add sample members - use generic "You" as owner so codes are visible
-        sampleGroup.addMember(new GroupMember("You", "owner"));
-        sampleGroup.addMember(new GroupMember("SampleMember1", "member"));
-        sampleGroup.addMember(new GroupMember("SampleMember2", "member"));
-
-        // Set sample codes
-        sampleGroup.setInviteCode("ABC-123-XYZ");
-        sampleGroup.setClanCode("CLAN-456");
-        sampleGroup.setClanCodeEnabled(true);
-
-        groups.put(id, sampleGroup);
-        activeGroupId = id;
-        saveActiveGroup();
-        saveGroups();
-    }
-    
     /**
      * FIXED: Check if user is currently logged in
      * Must check BOTH GameState AND local player name to be sure

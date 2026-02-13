@@ -467,8 +467,6 @@ public class LendingTrackerPlugin extends Plugin {
         if (event.getMenuOption().equals("Add to Lending List")) {
             handleAddToAvailableList(event);
         } else if (event.getMenuOption().equals("Lend to Group")) {
-            // IMMEDIATE TEST - send chat message to confirm this code is running
-            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "DEBUG: Lend to Group clicked!", "");
             handleLendToGroup(event);
         } else if (event.getMenuOption().equals("Borrow from Marketplace")) {
             handleBorrowFromMarketplace(event);
@@ -1445,15 +1443,12 @@ public class LendingTrackerPlugin extends Plugin {
     private void handleLendToGroup(MenuOptionClicked event)
     {
         log.info("handleLendToGroup called");
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "DEBUG: handleLendToGroup called", "");
 
         String target = event.getMenuTarget();
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "DEBUG: Target = " + target, "");
 
         if (target == null || target.isEmpty())
         {
             log.warn("Target is null or empty, aborting");
-            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "DEBUG: Target is null/empty, aborting", "");
             return;
         }
 
@@ -1482,8 +1477,6 @@ public class LendingTrackerPlugin extends Plugin {
         }
 
         log.info("Attempting to lend item: {} (ID: {})", itemName, itemId);
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-            "DEBUG: Item = " + itemName + " (ID: " + itemId + ")", "");
 
         if (itemId == -1)
         {
@@ -1492,7 +1485,6 @@ public class LendingTrackerPlugin extends Plugin {
         }
 
         // FIXED: Do all client thread checks BEFORE invoking on EDT
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "DEBUG: About to call showLendItemDialog", "");
 
         // Get group ID on client thread
         final String currentGroupId = groupConfigStore.getCurrentGroupId();
