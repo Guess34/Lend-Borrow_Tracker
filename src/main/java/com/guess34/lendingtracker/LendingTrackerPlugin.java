@@ -74,8 +74,7 @@ import java.util.stream.Collectors;
 @PluginDescriptor(
     name = "Lending Tracker",
     description = "Track items lent to other players with advanced features",
-    tags = {"lending", "items", "tracker", "party", "group", "risk"},
-    enabledByDefault = false
+    tags = {"lending", "items", "tracker", "party", "group", "risk"}
 )
 public class LendingTrackerPlugin extends Plugin {
     private static final int LENDING_WIDGET_GROUP = 334;
