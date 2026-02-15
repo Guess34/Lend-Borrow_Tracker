@@ -29,7 +29,8 @@ public class StorageService
 	@Inject
 	private ConfigManager configManager;
 
-	private final Gson gson = new Gson();
+	@Inject
+	private Gson gson;
 
 	/**
 	 * Save group-specific data (lent, borrowed, available)

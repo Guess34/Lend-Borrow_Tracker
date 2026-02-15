@@ -42,14 +42,11 @@ public class LocalDataSyncService {
     @Inject
     private ScheduledExecutorService executor;
     
-    private final Gson gson;
+    @Inject
+    private Gson gson;
+
     private Path backupDirectory;
     private Path syncDataFile;
-    
-    // FIXED: Removed manual constructor - using only @Inject dependency injection
-    public LocalDataSyncService() {
-        this.gson = new Gson();
-    }
     
     public void initialize() {
         try {

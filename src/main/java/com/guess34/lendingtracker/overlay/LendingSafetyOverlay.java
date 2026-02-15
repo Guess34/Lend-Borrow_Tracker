@@ -4,7 +4,6 @@ import net.runelite.api.Client;
 import net.runelite.api.Player;
 import net.runelite.api.Point;
 import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetInfo;
 import com.guess34.lendingtracker.LendingTrackerConfig;
 import com.guess34.lendingtracker.model.LendingEntry;
 import com.guess34.lendingtracker.model.RiskLevel;

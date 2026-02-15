@@ -26,13 +26,10 @@ public class NotificationMessageService
 	@Inject
 	private ConfigManager configManager;
 
-	private final Gson gson;
-	private final Map<String, List<NotificationMessage>> playerMessages = new ConcurrentHashMap<>();
+	@Inject
+	private Gson gson;
 
-	public NotificationMessageService()
-	{
-		this.gson = new Gson();
-	}
+	private final Map<String, List<NotificationMessage>> playerMessages = new ConcurrentHashMap<>();
 
 	/**
 	 * Notification message data class

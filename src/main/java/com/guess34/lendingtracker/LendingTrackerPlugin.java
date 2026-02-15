@@ -5,7 +5,6 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.events.*;
 import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.api.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
@@ -195,7 +194,8 @@ public class LendingTrackerPlugin extends Plugin {
     private LendingTrackerPanel panel;
     private LendingPanel newPanel;
     private NavigationButton navButton;
-    private final Gson gson = new Gson();
+    @Inject
+    private Gson gson;
     
     private volatile LendingEntry pendingLending = null;
     private volatile String lastLendingTarget = null;
@@ -1342,7 +1342,7 @@ public class LendingTrackerPlugin extends Plugin {
     }
 
     // RECONNECTED: Security Log Viewer - Provide access to risk log
-    public List<Object> getRiskLogEntries() {
+    public List<RiskLogEntry> getRiskLogEntries() {
         return new ArrayList<>(riskLog);
     }
     
@@ -2898,30 +2898,6 @@ public class LendingTrackerPlugin extends Plugin {
         }
     }
     
-    /**
-     * Risk log entry class
-     */
-    private static class RiskLogEntry {
-        private long timestamp;
-        private String reporter;
-        private String affectedPlayer;
-        private String eventType;
-        private String description;
-        
-        public RiskLogEntry(long timestamp, String reporter, String affectedPlayer, String eventType, String description) {
-            this.timestamp = timestamp;
-            this.reporter = reporter;
-            this.affectedPlayer = affectedPlayer;
-            this.eventType = eventType;
-            this.description = description;
-        }
-        
-        public long getTimestamp() { return timestamp; }
-        public String getReporter() { return reporter; }
-        public String getAffectedPlayer() { return affectedPlayer; }
-        public String getEventType() { return eventType; }
-        public String getDescription() { return description; }
-    }
     
     /**
      * Get active borrow requests for a group

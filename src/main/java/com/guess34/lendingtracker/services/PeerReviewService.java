@@ -26,11 +26,8 @@ public class PeerReviewService {
     @Inject
     private GroupConfigStore groupConfigStore;
     
-    private final Gson gson;
-    
-    public PeerReviewService() {
-        this.gson = new Gson();
-    }
+    @Inject
+    private Gson gson;
     
     /**
      * Submit a new peer review (compliant - stores locally only)

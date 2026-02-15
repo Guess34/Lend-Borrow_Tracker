@@ -11,20 +11,14 @@ import com.guess34.lendingtracker.model.LendingGroup;
 import com.guess34.lendingtracker.services.group.GroupConfigStore;
 import net.runelite.client.util.QuantityFormatter;
 
+import okhttp3.*;
+
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 @Slf4j
 @Singleton
@@ -55,17 +49,16 @@ public class DiscordWebhookService {
     @Inject
     private OnlineStatusService onlineStatusService;
 
-    private final HttpClient httpClient;
-    private final ExecutorService executor;
-    private final Gson gson;
-    
-    public DiscordWebhookService() {
-        this.httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build();
-        this.executor = Executors.newFixedThreadPool(2);
-        this.gson = new Gson();
-    }
+    @Inject
+    private OkHttpClient httpClient;
+
+    @Inject
+    private ScheduledExecutorService executor;
+
+    @Inject
+    private Gson gson;
+
+    private static final MediaType JSON_MEDIA_TYPE = MediaType.parse("application/json; charset=utf-8");
     
     /**
      * Set Discord webhook URL for a specific group.
@@ -347,19 +340,19 @@ public class DiscordWebhookService {
 
                 String jsonPayload = gson.toJson(webhook);
 
-                HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(webhookUrl))
-                    .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(30))
-                    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+                RequestBody body = RequestBody.create(JSON_MEDIA_TYPE, jsonPayload);
+                Request request = new Request.Builder()
+                    .url(webhookUrl)
+                    .post(body)
                     .build();
 
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-                if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                    log.info("Discord webhook test successful for group: {}", groupName);
-                } else {
-                    log.warn("Discord webhook test failed with status {}: {}", response.statusCode(), response.body());
+                try (Response response = httpClient.newCall(request).execute()) {
+                    if (response.isSuccessful()) {
+                        log.info("Discord webhook test successful for group: {}", groupName);
+                    } else {
+                        log.warn("Discord webhook test failed with status {}: {}",
+                            response.code(), response.body() != null ? response.body().string() : "");
+                    }
                 }
             } catch (Exception e) {
                 log.error("Failed to send Discord webhook test message", e);
@@ -573,33 +566,32 @@ public class DiscordWebhookService {
     /**
      * Send webhook synchronously
      */
-    private boolean sendWebhookSync(String groupId, DiscordEmbed embed) throws IOException, InterruptedException {
+    private boolean sendWebhookSync(String groupId, DiscordEmbed embed) throws IOException {
         String webhookUrl = getWebhookUrl(groupId);
         if (webhookUrl == null || webhookUrl.trim().isEmpty()) {
             return false;
         }
-        
+
         DiscordWebhook webhook = new DiscordWebhook()
             .addEmbed(embed);
-        
+
         String jsonPayload = gson.toJson(webhook);
-        
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(webhookUrl))
-            .header("Content-Type", "application/json")
-            .timeout(Duration.ofSeconds(30))
-            .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+
+        RequestBody body = RequestBody.create(JSON_MEDIA_TYPE, jsonPayload);
+        Request request = new Request.Builder()
+            .url(webhookUrl)
+            .post(body)
             .build();
-        
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-        
-        if (response.statusCode() >= 200 && response.statusCode() < 300) {
-            log.debug("Discord webhook sent successfully for group {}", groupId);
-            return true;
-        } else {
-            log.warn("Discord webhook failed for group {} with status {}: {}", 
-                groupId, response.statusCode(), response.body());
-            return false;
+
+        try (Response response = httpClient.newCall(request).execute()) {
+            if (response.isSuccessful()) {
+                log.debug("Discord webhook sent successfully for group {}", groupId);
+                return true;
+            } else {
+                log.warn("Discord webhook failed for group {} with status {}: {}",
+                    groupId, response.code(), response.body() != null ? response.body().string() : "");
+                return false;
+            }
         }
     }
     
@@ -629,10 +621,10 @@ public class DiscordWebhookService {
         }
     }
     
+    /**
+     * Shutdown - no-op since we use RuneLite's shared executor and OkHttpClient
+     */
     public void shutdown() {
-        if (executor != null && !executor.isShutdown()) {
-            executor.shutdown();
-        }
     }
     
     /**

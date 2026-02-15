@@ -32,11 +32,8 @@ public class BorrowRequestService {
     @Inject
     private Client client;
     
-    private final Gson gson;
-    
-    public BorrowRequestService() {
-        this.gson = new Gson();
-    }
+    @Inject
+    private Gson gson;
     
     /**
      * Result of submitting a borrow request

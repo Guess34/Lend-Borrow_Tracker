@@ -25,7 +25,8 @@ public class WebhookAuditLogger {
 
 	@Inject
 	private ConfigManager configManager;
-	private final Gson gson = new Gson();
+	@Inject
+	private Gson gson;
 	private final List<AuditEntry> auditLog = Collections.synchronizedList(new ArrayList<>());
 
 	/**

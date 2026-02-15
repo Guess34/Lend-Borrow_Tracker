@@ -31,7 +31,8 @@ public class ItemSetManager {
     @Inject
     private GroupSyncService groupSyncService;
 
-    private final Gson gson = new Gson();
+    @Inject
+    private Gson gson;
 
     // Group-specific item sets: groupId -> setId -> ItemSet
     private final Map<String, Map<String, ItemSet>> groupItemSets = new ConcurrentHashMap<>();

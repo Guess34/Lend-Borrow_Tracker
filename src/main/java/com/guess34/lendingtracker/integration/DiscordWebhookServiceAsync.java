@@ -19,7 +19,6 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
  * DiscordWebhookServiceAsync - Async Discord webhook integration
@@ -50,21 +49,11 @@ public class DiscordWebhookServiceAsync
 	@Inject
 	private WebhookAuditLogger auditLogger;
 
-	private final OkHttpClient httpClient;
-	private final Gson gson;
+	@Inject
+	private OkHttpClient httpClient;
 
 	@Inject
-	public DiscordWebhookServiceAsync()
-	{
-		// Create OkHttpClient with proper timeouts
-		this.httpClient = new OkHttpClient.Builder()
-			.connectTimeout(10, TimeUnit.SECONDS)
-			.writeTimeout(30, TimeUnit.SECONDS)
-			.readTimeout(30, TimeUnit.SECONDS)
-			.build();
-
-		this.gson = new Gson();
-	}
+	private Gson gson;
 
 	/**
 	 * Set Discord webhook URL for a specific group
@@ -453,15 +442,10 @@ public class DiscordWebhookServiceAsync
 	}
 
 	/**
-	 * Shutdown HTTP client
+	 * Shutdown - no-op since we use RuneLite's shared OkHttpClient
 	 */
 	public void shutdown()
 	{
-		if (httpClient != null)
-		{
-			httpClient.dispatcher().executorService().shutdown();
-			httpClient.connectionPool().evictAll();
-		}
 	}
 
 	// ===== Discord payload structures =====

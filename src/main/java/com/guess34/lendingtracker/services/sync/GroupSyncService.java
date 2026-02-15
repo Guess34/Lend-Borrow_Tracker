@@ -61,7 +61,8 @@ public class GroupSyncService {
     @Inject
     private GroupConfigStore groupConfigStore;
 
-    private final Gson gson = new Gson();
+    @Inject
+    private Gson gson;
     private ScheduledExecutorService syncExecutor;
     private String currentGroupId;
     private String currentPlayerName;

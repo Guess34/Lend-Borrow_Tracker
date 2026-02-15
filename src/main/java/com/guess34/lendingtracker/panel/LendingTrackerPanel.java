@@ -47,6 +47,7 @@ import com.guess34.lendingtracker.model.GroupMember;
 import com.guess34.lendingtracker.model.WarningLogEntry;
 import com.guess34.lendingtracker.model.PeerReview;
 import com.guess34.lendingtracker.model.BorrowRequest;
+import com.guess34.lendingtracker.model.RiskLogEntry;
 import com.guess34.lendingtracker.LendingTrackerPlugin.LenderAgreement;
 import com.guess34.lendingtracker.services.*;
 import com.guess34.lendingtracker.services.group.GroupConfigStore;
@@ -79,7 +80,8 @@ public class LendingTrackerPanel extends PluginPanel
     private final WebhookRateLimiter webhookRateLimiter;
     private final WebhookAuditLogger webhookAuditLogger;
     private final NotificationMessageService notificationMessageService; // ADDED: For notification management
-    private final Gson gson = new Gson();
+    @Inject
+    private Gson gson;
 
     // RECONNECTED: Risk Session Management - Plugin reference for accessing active sessions
     private com.guess34.lendingtracker.LendingTrackerPlugin plugin;
@@ -4182,36 +4184,25 @@ public class LendingTrackerPanel extends PluginPanel
         try {
             if (plugin != null) {
                 // Get security log entries from plugin's risk log
-                List<Object> riskLogEntries = plugin.getRiskLogEntries();
-                
-                for (Object entry : riskLogEntries) {
-                    // Use reflection to access RiskLogEntry fields since it's a private inner class
-                    try {
-                        java.lang.reflect.Method getTimestamp = entry.getClass().getMethod("getTimestamp");
-                        java.lang.reflect.Method getReporter = entry.getClass().getMethod("getReporter");
-                        java.lang.reflect.Method getAffectedPlayer = entry.getClass().getMethod("getAffectedPlayer");
-                        java.lang.reflect.Method getEventType = entry.getClass().getMethod("getEventType");
-                        java.lang.reflect.Method getDescription = entry.getClass().getMethod("getDescription");
-                        
-                        long timestamp = (Long) getTimestamp.invoke(entry);
-                        String reporter = (String) getReporter.invoke(entry);
-                        String affectedPlayer = (String) getAffectedPlayer.invoke(entry);
-                        String eventType = (String) getEventType.invoke(entry);
-                        String description = (String) getDescription.invoke(entry);
-                        
-                        securityLogModel.addRow(new Object[]{
-                            new SimpleDateFormat("MM/dd HH:mm:ss").format(new Date(timestamp)),
-                            reporter,
-                            affectedPlayer,
-                            eventType.replace("_", " "),
-                            description,
-                            eventType.contains("REMOVED") ? "Removed from group" : 
-                            eventType.contains("WARNING") ? "Warning sent" : 
-                            eventType.contains("RESOLVED") ? "Marked resolved" : "Logged"
-                        });
-                    } catch (Exception e) {
-                        log.warn("Failed to process security log entry", e);
-                    }
+                List<RiskLogEntry> riskLogEntries = plugin.getRiskLogEntries();
+
+                for (RiskLogEntry entry : riskLogEntries) {
+                    long timestamp = entry.getTimestamp();
+                    String reporter = entry.getReporter();
+                    String affectedPlayer = entry.getAffectedPlayer();
+                    String eventType = entry.getEventType();
+                    String description = entry.getDescription();
+
+                    securityLogModel.addRow(new Object[]{
+                        new SimpleDateFormat("MM/dd HH:mm:ss").format(new Date(timestamp)),
+                        reporter,
+                        affectedPlayer,
+                        eventType.replace("_", " "),
+                        description,
+                        eventType.contains("REMOVED") ? "Removed from group" :
+                        eventType.contains("WARNING") ? "Warning sent" :
+                        eventType.contains("RESOLVED") ? "Marked resolved" : "Logged"
+                    });
                 }
             } else {
                 // Plugin not set yet, show placeholder
