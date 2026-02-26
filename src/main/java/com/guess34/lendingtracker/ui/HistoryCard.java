@@ -10,12 +10,12 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.image.BufferedImage;
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 
 /**
- * HistoryCard - Single transaction card for history list
- * Phase 3: Clean list-based design replacing JTable
+ * HistoryCard - Single transaction card for history list.
  */
 @Slf4j
 public class HistoryCard extends JPanel
@@ -24,7 +24,7 @@ public class HistoryCard extends JPanel
 	private static final Color RETURNED_COLOR = new Color(0, 200, 0);
 	private static final Color OVERDUE_COLOR = new Color(255, 140, 0);
 	private static final Color DEFAULTED_COLOR = new Color(200, 0, 0);
-	private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("MMM dd");
+	private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("MMM dd");
 
 	public HistoryCard(LendingEntry entry, ItemManager itemManager)
 	{
@@ -80,7 +80,7 @@ public class HistoryCard extends JPanel
 		rightPanel.setBackground(CARD_BACKGROUND);
 
 		// Date label
-		String dateStr = DATE_FORMAT.format(new Date(entry.getLendDate()));
+		String dateStr = DATE_FORMAT.format(Instant.ofEpochMilli(entry.getLendDate()).atZone(ZoneId.systemDefault()));
 		JLabel dateLabel = new JLabel(dateStr);
 		dateLabel.setFont(FontManager.getRunescapeSmallFont());
 		dateLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);

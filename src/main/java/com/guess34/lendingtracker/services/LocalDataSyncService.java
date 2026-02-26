@@ -1,15 +1,11 @@
 package com.guess34.lendingtracker.services;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.config.ConfigManager;
 import com.guess34.lendingtracker.model.LendingEntry;
 import com.guess34.lendingtracker.model.LendingGroup;
 import com.guess34.lendingtracker.model.GroupMember;
-import com.guess34.lendingtracker.services.group.GroupConfigStore;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -34,10 +30,10 @@ public class LocalDataSyncService {
     private ConfigManager configManager;
     
     @Inject
-    private GroupConfigStore groupConfigStore;
+    private GroupService groupService;
     
     @Inject
-    private Recorder recorder;
+    private DataService dataService;
     
     @Inject
     private ScheduledExecutorService executor;
@@ -54,19 +50,13 @@ public class LocalDataSyncService {
             backupDirectory = Paths.get(BACKUP_DIR);
             if (!Files.exists(backupDirectory)) {
                 Files.createDirectories(backupDirectory);
-                log.info("Created backup directory: {}", backupDirectory);
+
             }
 
             syncDataFile = backupDirectory.resolve(SYNC_DATA_FILE);
 
-            // FIXED: Do NOT load sync data on startup - only on explicit login
-            // Data will be loaded via onAccountLogin() when user logs in
-            // loadSyncData();  // Removed - don't load until logged in
-
-            // Schedule periodic backups every 5 minutes (only saves if logged in)
             schedulePeriodicBackup();
 
-            log.info("LocalDataSyncService initialized - data will load on login");
 
         } catch (IOException e) {
             log.error("Failed to initialize LocalDataSyncService", e);
@@ -77,7 +67,7 @@ public class LocalDataSyncService {
      * ADDED: Called when user logs in - now safe to load sync data
      */
     public void onAccountLogin() {
-        log.info("Loading sync data for logged-in user");
+
         loadSyncData();
     }
     
@@ -88,9 +78,9 @@ public class LocalDataSyncService {
         try {
             BackupData backupData = new BackupData();
             backupData.timestamp = Instant.now().toEpochMilli();
-            backupData.groups = new ArrayList<>(groupConfigStore.getAllGroups());
-            backupData.activeEntries = recorder.getActiveEntries();
-            backupData.historyEntries = recorder.getHistoryEntries();
+            backupData.groups = new ArrayList<>(groupService.getAllGroups());
+            backupData.activeEntries = dataService.getActiveEntries();
+            backupData.historyEntries = dataService.getHistoryEntries();
             backupData.availableEntries = new HashMap<>();
             backupData.borrowedEntries = new HashMap<>();
             backupData.lentEntries = new HashMap<>();
@@ -98,9 +88,9 @@ public class LocalDataSyncService {
             // Collect per-group data
             for (LendingGroup group : backupData.groups) {
                 String groupId = group.getId();
-                backupData.availableEntries.put(groupId, recorder.getAvailable(groupId));
-                backupData.borrowedEntries.put(groupId, recorder.getBorrowed(groupId));
-                backupData.lentEntries.put(groupId, recorder.getLent(groupId));
+                backupData.availableEntries.put(groupId, dataService.getAvailable(groupId));
+                backupData.borrowedEntries.put(groupId, dataService.getBorrowed(groupId));
+                backupData.lentEntries.put(groupId, dataService.getLent(groupId));
             }
             
             String backupJson = gson.toJson(backupData);
@@ -116,8 +106,7 @@ public class LocalDataSyncService {
             // Clean up old backup files
             cleanupOldBackups();
             
-            log.debug("Created backup: {}", backupFile);
-            
+
         } catch (IOException e) {
             log.error("Failed to create backup", e);
         }
@@ -128,7 +117,7 @@ public class LocalDataSyncService {
      */
     private void loadSyncData() {
         if (!Files.exists(syncDataFile)) {
-            log.debug("No sync data file found, starting fresh");
+
             return;
         }
         
@@ -143,7 +132,7 @@ public class LocalDataSyncService {
                 // Sync lending entries - merge new entries and update existing ones
                 syncLendingEntries(syncData);
                 
-                log.info("Successfully loaded and synced data from previous session");
+
             }
             
         } catch (IOException e) {
@@ -158,27 +147,25 @@ public class LocalDataSyncService {
         if (syncedGroups == null) return;
         
         for (LendingGroup syncedGroup : syncedGroups) {
-            LendingGroup existingGroup = groupConfigStore.getGroup(syncedGroup.getId());
+            LendingGroup existingGroup = groupService.getGroup(syncedGroup.getId());
             
             if (existingGroup == null) {
-            } else {
-                // New group - recreate it using createGroup
-                // Get owner from synced group members
+                // FIXED: New group - recreate it using createGroup (was in wrong branch)
                 String ownerName = syncedGroup.getMembers().stream()
                     .filter(m -> "owner".equalsIgnoreCase(m.getRole()))
                     .map(GroupMember::getName)
                     .findFirst()
                     .orElse("Unknown");
-                String groupId = groupConfigStore.createGroup(syncedGroup.getName(), syncedGroup.getDescription(), ownerName);
+                String groupId = groupService.createGroup(syncedGroup.getName(), syncedGroup.getDescription(), ownerName);
                 // Add remaining members to the new group
                 if (syncedGroup.getMembers() != null) {
                     for (var member : syncedGroup.getMembers()) {
                         if (!"owner".equalsIgnoreCase(member.getRole())) {
-                            groupConfigStore.addMember(groupId, member.getName(), member.getRole());
+                            groupService.addMember(groupId, member.getName(), member.getRole());
                         }
                     }
                 }
-                log.debug("Imported new group: {}", syncedGroup.getName());
+            } else {
                 // Existing group - check for new members
                 syncGroupMembers(existingGroup, syncedGroup);
             }
@@ -199,9 +186,9 @@ public class LocalDataSyncService {
         boolean membersAdded = false;
         for (var syncedMember : synced.getMembers()) {
             if (!existingMemberNames.contains(syncedMember.getName())) {
-                groupConfigStore.addMember(existing.getId(), syncedMember.getName(), syncedMember.getRole());
+                groupService.addMember(existing.getId(), syncedMember.getName(), syncedMember.getRole());
                 membersAdded = true;
-                log.debug("Added new member {} to group {}", syncedMember.getName(), existing.getName());
+
             }
         }
         
@@ -214,21 +201,21 @@ public class LocalDataSyncService {
     private void syncLendingEntries(BackupData syncData) {
         // Get current entry IDs to avoid duplicates
         Set<String> existingEntryIds = new HashSet<>();
-        recorder.getActiveEntries().forEach(entry -> existingEntryIds.add(entry.getId()));
-        recorder.getHistoryEntries().forEach(entry -> existingEntryIds.add(entry.getId()));
+        dataService.getActiveEntries().forEach(entry -> existingEntryIds.add(entry.getId()));
+        dataService.getHistoryEntries().forEach(entry -> existingEntryIds.add(entry.getId()));
 
         // FIXED: Also include available, borrowed, and lent entry IDs to prevent duplication
         // This was causing quantity to increase on every login because available entries
         // were not in existingEntryIds and got re-added via addToAvailableList
-        for (LendingGroup group : groupConfigStore.getAllGroups()) {
+        for (LendingGroup group : groupService.getAllGroups()) {
             String groupId = group.getId();
-            recorder.getAvailable(groupId).forEach(entry -> {
+            dataService.getAvailable(groupId).forEach(entry -> {
                 if (entry.getId() != null) existingEntryIds.add(entry.getId());
             });
-            recorder.getBorrowed(groupId).forEach(entry -> {
+            dataService.getBorrowed(groupId).forEach(entry -> {
                 if (entry.getId() != null) existingEntryIds.add(entry.getId());
             });
-            recorder.getLent(groupId).forEach(entry -> {
+            dataService.getLent(groupId).forEach(entry -> {
                 if (entry.getId() != null) existingEntryIds.add(entry.getId());
             });
         }
@@ -237,8 +224,8 @@ public class LocalDataSyncService {
         if (syncData.activeEntries != null) {
             for (LendingEntry entry : syncData.activeEntries) {
                 if (!existingEntryIds.contains(entry.getId())) {
-                    recorder.addEntry(entry);
-                    log.debug("Synced active entry: {} for {}", entry.getItem(), entry.getBorrower());
+                    dataService.addEntry(entry);
+
                 }
             }
         }
@@ -248,9 +235,9 @@ public class LocalDataSyncService {
             for (LendingEntry entry : syncData.historyEntries) {
                 if (!existingEntryIds.contains(entry.getId())) {
                     // Use completeEntry to add to history
-                    recorder.addEntry(entry);
-                    recorder.completeEntry(entry.getId(), true);
-                    log.debug("Synced history entry: {} for {}", entry.getItem(), entry.getBorrower());
+                    dataService.addEntry(entry);
+                    dataService.completeEntry(entry.getId(), true);
+
                 }
             }
         }
@@ -272,7 +259,7 @@ public class LocalDataSyncService {
                     if (!existingEntryIds.contains(entry.getId())) {
                         // FIXED: Use restoreAvailable instead of addToAvailableList
                         // This prevents quantity from being added on every login
-                        recorder.restoreAvailable(groupId, entry.getLender(), entry);
+                        dataService.restoreAvailable(groupId, entry.getLender(), entry);
                     }
                 }
             }
@@ -285,7 +272,7 @@ public class LocalDataSyncService {
                 for (LendingEntry entry : groupEntry.getValue()) {
                     if (!existingEntryIds.contains(entry.getId())) {
                         // FIXED: Use restoreBorrowed instead of markAsBorrowed
-                        recorder.restoreBorrowed(groupId, entry.getBorrower(), entry);
+                        dataService.restoreBorrowed(groupId, entry.getBorrower(), entry);
                     }
                 }
             }
@@ -298,97 +285,11 @@ public class LocalDataSyncService {
                 for (LendingEntry entry : groupEntry.getValue()) {
                     if (!existingEntryIds.contains(entry.getId())) {
                         // FIXED: Use restoreLent instead of markAsLent
-                        recorder.restoreLent(groupId, entry.getLender(), entry.getBorrower(), entry, entry.getDueTime());
+                        dataService.restoreLent(groupId, entry.getLender(), entry.getBorrower(), entry, entry.getDueTime());
                     }
                 }
             }
         }
-    }
-    
-    /**
-     * Export all data to a portable backup file
-     */
-    public File exportPortableBackup() throws IOException {
-        BackupData backupData = new BackupData();
-        backupData.timestamp = Instant.now().toEpochMilli();
-        backupData.groups = new ArrayList<>(groupConfigStore.getAllGroups());
-        backupData.activeEntries = recorder.getActiveEntries();
-        backupData.historyEntries = recorder.getHistoryEntries();
-        backupData.availableEntries = new HashMap<>();
-        backupData.borrowedEntries = new HashMap<>();
-        backupData.lentEntries = new HashMap<>();
-        
-        // Collect per-group data
-        for (LendingGroup group : backupData.groups) {
-            String groupId = group.getId();
-            backupData.availableEntries.put(groupId, recorder.getAvailable(groupId));
-            backupData.borrowedEntries.put(groupId, recorder.getBorrowed(groupId));
-            backupData.lentEntries.put(groupId, recorder.getLent(groupId));
-        }
-        
-        String backupJson = gson.toJson(backupData);
-        
-        String exportFileName = "lending-tracker-export-" + Instant.now().toEpochMilli() + ".json";
-        Path exportFile = backupDirectory.resolve(exportFileName);
-        Files.write(exportFile, backupJson.getBytes());
-        
-        return exportFile.toFile();
-    }
-    
-    /**
-     * Import data from a portable backup file
-     */
-    public boolean importPortableBackup(File backupFile) {
-        try {
-            String backupJson = new String(Files.readAllBytes(backupFile.toPath()));
-            BackupData importData = gson.fromJson(backupJson, BackupData.class);
-            
-            if (importData != null) {
-                // Import groups
-                syncGroups(importData.groups);
-                
-                // Import entries
-                syncLendingEntries(importData);
-                
-                // Create a backup after successful import
-                createBackup();
-                
-                log.info("Successfully imported data from backup file: {}", backupFile.getName());
-                return true;
-            }
-            
-        } catch (IOException e) {
-            log.error("Failed to import backup file", e);
-        }
-        
-        return false;
-    }
-    
-    /**
-     * Get list of available backup files
-     */
-    public List<File> getAvailableBackups() {
-        List<File> backups = new ArrayList<>();
-        
-        try {
-            Files.list(backupDirectory)
-                .filter(path -> path.getFileName().toString().startsWith(BACKUP_FILE_PREFIX))
-                .map(Path::toFile)
-                .sorted((a, b) -> Long.compare(b.lastModified(), a.lastModified())) // Most recent first
-                .forEach(backups::add);
-                
-        } catch (IOException e) {
-            log.error("Failed to list backup files", e);
-        }
-        
-        return backups;
-    }
-    
-    /**
-     * Restore from a specific backup file
-     */
-    public boolean restoreFromBackup(File backupFile) {
-        return importPortableBackup(backupFile);
     }
     
     /**
@@ -424,20 +325,13 @@ public class LocalDataSyncService {
             if (backupFiles.size() > MAX_BACKUP_FILES) {
                 for (int i = MAX_BACKUP_FILES; i < backupFiles.size(); i++) {
                     Files.deleteIfExists(backupFiles.get(i));
-                    log.debug("Deleted old backup file: {}", backupFiles.get(i));
+
                 }
             }
             
         } catch (IOException e) {
             log.error("Failed to cleanup old backups", e);
         }
-    }
-    
-    /**
-     * Get backup directory for user access
-     */
-    public Path getBackupDirectory() {
-        return backupDirectory;
     }
     
     /**

@@ -4,147 +4,39 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.game.ItemManager;
 import com.guess34.lendingtracker.LendingTrackerPlugin;
 import com.guess34.lendingtracker.model.LendingEntry;
-import com.guess34.lendingtracker.model.StoredNotification;
-import com.guess34.lendingtracker.services.NotificationService;
-import com.guess34.lendingtracker.services.core.LendingManager;
+import com.guess34.lendingtracker.services.DataService;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.List;
 
 /**
- * HistoryPanel - Transaction log with notifications section
- * UPDATED: Now includes notifications display at the top
+ * HistoryPanel - Transaction history log for completed lending transactions
+ * CHANGED: Removed notifications view (NotificationService deleted). History is now the sole view.
  */
 @Slf4j
 public class HistoryPanel extends JPanel
 {
 	private final LendingTrackerPlugin plugin;
-	private final LendingManager lendingManager;
+	private final DataService dataService;
 	private final ItemManager itemManager;
 
 	private final JLabel totalHistoryLabel;
 	private final JPanel historyListPanel;
 
-	// Notifications section
-	private final JPanel notificationsPanel;
-	private final JLabel notificationsLabel;
-
-	// ADDED: View toggle and containers for switching between notifications/history
-	private final JPanel notificationsView;
-	private final JPanel historyView;
-	private final JToggleButton notifToggle;
-	private final JToggleButton historyToggle;
-
 	public HistoryPanel(LendingTrackerPlugin plugin)
 	{
 		this.plugin = plugin;
-		this.lendingManager = plugin.getLendingManager();
+		this.dataService = plugin.getDataService();
 		this.itemManager = plugin.getItemManager();
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
 
-		// === VIEW TOGGLE BAR ===
-		// ADDED: Toggle buttons to switch between Notifications and History views
-		JPanel toggleBar = new JPanel(new GridLayout(1, 2, 0, 0));
-		toggleBar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		toggleBar.setBorder(new EmptyBorder(5, 5, 5, 5));
-		toggleBar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
-
-		notifToggle = new JToggleButton("Notifications");
-		notifToggle.setFont(FontManager.getRunescapeSmallFont());
-		notifToggle.setBackground(ColorScheme.MEDIUM_GRAY_COLOR);
-		notifToggle.setForeground(Color.WHITE);
-		notifToggle.setFocusPainted(false);
-
-		historyToggle = new JToggleButton("History");
-		historyToggle.setFont(FontManager.getRunescapeSmallFont());
-		historyToggle.setBackground(ColorScheme.MEDIUM_GRAY_COLOR);
-		historyToggle.setForeground(Color.WHITE);
-		historyToggle.setFocusPainted(false);
-
-		ButtonGroup viewGroup = new ButtonGroup();
-		viewGroup.add(notifToggle);
-		viewGroup.add(historyToggle);
-
-		// Default to history view
-		historyToggle.setSelected(true);
-
-		notifToggle.addActionListener(e -> switchView(true));
-		historyToggle.addActionListener(e -> switchView(false));
-
-		toggleBar.add(notifToggle);
-		toggleBar.add(historyToggle);
-
-		add(toggleBar, BorderLayout.NORTH);
-
-		// === CARD PANEL: holds both views, switches between them ===
-		JPanel cardPanel = new JPanel(new CardLayout());
-		cardPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		// === NOTIFICATIONS VIEW ===
-		notificationsView = new JPanel(new BorderLayout());
-		notificationsView.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		JPanel notificationsHeader = new JPanel(new BorderLayout());
-		notificationsHeader.setBackground(new Color(255, 140, 0));
-		notificationsHeader.setBorder(new EmptyBorder(8, 10, 8, 10));
-
-		notificationsLabel = new JLabel("Notifications (0)");
-		notificationsLabel.setFont(FontManager.getRunescapeBoldFont());
-		notificationsLabel.setForeground(Color.WHITE);
-		notificationsHeader.add(notificationsLabel, BorderLayout.CENTER);
-
-		JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 5));
-		buttonRow.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		buttonRow.setBorder(new EmptyBorder(5, 5, 5, 5));
-
-		JButton markAllReadBtn = new JButton("Mark All Read");
-		markAllReadBtn.setFont(FontManager.getRunescapeSmallFont());
-		markAllReadBtn.setBackground(new Color(0, 120, 0));
-		markAllReadBtn.setForeground(Color.WHITE);
-		markAllReadBtn.setFocusPainted(false);
-		markAllReadBtn.addActionListener(e -> markAllNotificationsRead());
-		buttonRow.add(markAllReadBtn);
-
-		JButton clearAllBtn = new JButton("Clear All");
-		clearAllBtn.setFont(FontManager.getRunescapeSmallFont());
-		clearAllBtn.setBackground(new Color(150, 50, 50));
-		clearAllBtn.setForeground(Color.WHITE);
-		clearAllBtn.setFocusPainted(false);
-		clearAllBtn.addActionListener(e -> clearAllNotifications());
-		buttonRow.add(clearAllBtn);
-
-		notificationsPanel = new JPanel();
-		notificationsPanel.setLayout(new BoxLayout(notificationsPanel, BoxLayout.Y_AXIS));
-		notificationsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		notificationsPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
-
-		JPanel notifTopPanel = new JPanel();
-		notifTopPanel.setLayout(new BoxLayout(notifTopPanel, BoxLayout.Y_AXIS));
-		notifTopPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		notifTopPanel.add(notificationsHeader);
-		notifTopPanel.add(buttonRow);
-
-		notificationsView.add(notifTopPanel, BorderLayout.NORTH);
-
-		JScrollPane notifScrollPane = new JScrollPane(notificationsPanel);
-		notifScrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		notifScrollPane.setBorder(new EmptyBorder(5, 5, 5, 5));
-		notifScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-		notifScrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
-		notificationsView.add(notifScrollPane, BorderLayout.CENTER);
-
-		// === HISTORY VIEW ===
-		historyView = new JPanel(new BorderLayout());
-		historyView.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
+		// === HISTORY HEADER ===
 		JPanel historyHeader = new JPanel(new BorderLayout());
 		historyHeader.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 		historyHeader.setBorder(new EmptyBorder(10, 10, 10, 10));
@@ -155,8 +47,9 @@ public class HistoryPanel extends JPanel
 		totalHistoryLabel.setHorizontalAlignment(SwingConstants.CENTER);
 		historyHeader.add(totalHistoryLabel, BorderLayout.CENTER);
 
-		historyView.add(historyHeader, BorderLayout.NORTH);
+		add(historyHeader, BorderLayout.NORTH);
 
+		// === HISTORY LIST ===
 		historyListPanel = new JPanel();
 		historyListPanel.setLayout(new BoxLayout(historyListPanel, BoxLayout.Y_AXIS));
 		historyListPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -167,32 +60,10 @@ public class HistoryPanel extends JPanel
 		historyScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
 		historyScrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
 
-		historyView.add(historyScrollPane, BorderLayout.CENTER);
+		add(historyScrollPane, BorderLayout.CENTER);
 
 		// Footer with clear old entries button
-		historyView.add(createFooter(), BorderLayout.SOUTH);
-
-		// Add both views to card panel
-		cardPanel.add(historyView, "history");
-		cardPanel.add(notificationsView, "notifications");
-
-		add(cardPanel, BorderLayout.CENTER);
-
-		// Default: show history view
-		switchView(false);
-	}
-
-	/**
-	 * ADDED: Switch between notifications and history views
-	 */
-	private void switchView(boolean showNotifications)
-	{
-		Container parent = historyView.getParent();
-		if (parent != null && parent.getLayout() instanceof CardLayout)
-		{
-			CardLayout cl = (CardLayout) parent.getLayout();
-			cl.show(parent, showNotifications ? "notifications" : "history");
-		}
+		add(createFooter(), BorderLayout.SOUTH);
 	}
 
 	/**
@@ -216,20 +87,19 @@ public class HistoryPanel extends JPanel
 	}
 
 	/**
-	 * Refresh the history and notifications with latest data
+	 * Refresh the history with latest data
 	 */
 	public void refresh()
 	{
 		SwingUtilities.invokeLater(() ->
 		{
-			// ADDED: Check login status first
+			// Check login status first
 			boolean isLoggedIn = false;
-			String currentPlayer = null;
 			try
 			{
 				if (plugin.getClient() != null && plugin.getClient().getLocalPlayer() != null)
 				{
-					currentPlayer = plugin.getClient().getLocalPlayer().getName();
+					String currentPlayer = plugin.getClient().getLocalPlayer().getName();
 					if (currentPlayer != null && !currentPlayer.isEmpty())
 					{
 						isLoggedIn = true;
@@ -240,9 +110,6 @@ public class HistoryPanel extends JPanel
 			{
 				log.debug("Could not check login status", e);
 			}
-
-			// Refresh notifications section
-			refreshNotifications(isLoggedIn, currentPlayer);
 
 			// Clear and rebuild history cards
 			historyListPanel.removeAll();
@@ -270,7 +137,7 @@ public class HistoryPanel extends JPanel
 			}
 
 			// Get history entries (with null safety) - only if logged in
-			List<LendingEntry> historyEntries = lendingManager.getHistoryEntries();
+			List<LendingEntry> historyEntries = dataService.getHistoryEntries();
 			if (historyEntries == null)
 			{
 				historyEntries = java.util.Collections.emptyList();
@@ -314,184 +181,6 @@ public class HistoryPanel extends JPanel
 	}
 
 	/**
-	 * ADDED: Refresh the notifications section
-	 */
-	private void refreshNotifications(boolean isLoggedIn, String currentPlayer)
-	{
-		notificationsPanel.removeAll();
-
-		if (!isLoggedIn || currentPlayer == null)
-		{
-			notificationsLabel.setText("Notifications (0)");
-			JLabel noNotifLabel = new JLabel("Log in to see notifications");
-			noNotifLabel.setFont(FontManager.getRunescapeSmallFont());
-			noNotifLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-			noNotifLabel.setBorder(new EmptyBorder(10, 10, 10, 10));
-			notificationsPanel.add(noNotifLabel);
-			notificationsPanel.revalidate();
-			notificationsPanel.repaint();
-			return;
-		}
-
-		NotificationService notificationService = plugin.getNotificationService();
-		if (notificationService == null)
-		{
-			notificationsLabel.setText("Notifications (0)");
-			return;
-		}
-
-		List<StoredNotification> notifications = notificationService.getNotificationsForPlayer(currentPlayer);
-		int unreadCount = (int) notifications.stream().filter(n -> !n.isRead()).count();
-
-		notificationsLabel.setText("Notifications (" + unreadCount + " unread)");
-
-		if (notifications.isEmpty())
-		{
-			JLabel noNotifLabel = new JLabel("No notifications");
-			noNotifLabel.setFont(FontManager.getRunescapeSmallFont());
-			noNotifLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-			noNotifLabel.setBorder(new EmptyBorder(10, 10, 10, 10));
-			notificationsPanel.add(noNotifLabel);
-		}
-		else
-		{
-			for (StoredNotification notification : notifications)
-			{
-				JPanel notifCard = createNotificationCard(notification, currentPlayer);
-				notificationsPanel.add(notifCard);
-				notificationsPanel.add(Box.createVerticalStrut(2));
-			}
-		}
-
-		notificationsPanel.revalidate();
-		notificationsPanel.repaint();
-	}
-
-	/**
-	 * ADDED: Create a notification card for display
-	 */
-	private JPanel createNotificationCard(StoredNotification notification, String currentPlayer)
-	{
-		JPanel card = new JPanel(new BorderLayout(5, 0));
-		card.setBackground(notification.isRead() ? ColorScheme.DARK_GRAY_COLOR : new Color(60, 50, 30));
-		card.setBorder(new EmptyBorder(8, 10, 8, 10));
-		card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 80));
-
-		// Left: Unread indicator
-		JLabel indicator = new JLabel(notification.isRead() ? "" : "\u2022");
-		indicator.setFont(new Font("Arial", Font.BOLD, 20));
-		indicator.setForeground(new Color(255, 140, 0));
-		card.add(indicator, BorderLayout.WEST);
-
-		// Center: Notification content
-		JPanel contentPanel = new JPanel();
-		contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
-		contentPanel.setBackground(card.getBackground());
-
-		// Type and time
-		String typeText = notification.getType() == StoredNotification.NotificationType.BORROW_REQUEST
-			? "Borrow Request"
-			: "Lend Offer";
-		SimpleDateFormat sdf = new SimpleDateFormat("MMM dd, HH:mm");
-		String timeText = sdf.format(new Date(notification.getTimestamp()));
-
-		JLabel typeLabel = new JLabel(typeText + " - " + timeText);
-		typeLabel.setFont(FontManager.getRunescapeSmallFont());
-		typeLabel.setForeground(notification.isRead() ? ColorScheme.LIGHT_GRAY_COLOR : Color.WHITE);
-		contentPanel.add(typeLabel);
-
-		// Message
-		JLabel msgLabel = new JLabel("<html>" + notification.getDisplayText() + "</html>");
-		msgLabel.setFont(FontManager.getRunescapeSmallFont());
-		msgLabel.setForeground(notification.isRead() ? ColorScheme.LIGHT_GRAY_COLOR : Color.WHITE);
-		contentPanel.add(msgLabel);
-
-		// Group name
-		JLabel groupLabel = new JLabel("Group: " + (notification.getGroupName() != null ? notification.getGroupName() : "Unknown"));
-		groupLabel.setFont(new Font(Font.SANS_SERIF, Font.ITALIC, 10));
-		groupLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-		contentPanel.add(groupLabel);
-
-		card.add(contentPanel, BorderLayout.CENTER);
-
-		// Right: Action buttons
-		JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
-		buttonPanel.setBackground(card.getBackground());
-
-		if (!notification.isRead())
-		{
-			JButton readBtn = new JButton("\u2713"); // Checkmark
-			readBtn.setFont(new Font("Arial", Font.PLAIN, 12));
-			readBtn.setToolTipText("Mark as read");
-			readBtn.setBackground(new Color(0, 150, 0));
-			readBtn.setForeground(Color.WHITE);
-			readBtn.setFocusPainted(false);
-			readBtn.setBorderPainted(false);
-			readBtn.setPreferredSize(new Dimension(30, 25));
-			readBtn.addActionListener(e -> {
-				plugin.getNotificationService().markAsRead(currentPlayer, notification.getId());
-				refresh();
-			});
-			buttonPanel.add(readBtn);
-		}
-
-		JButton deleteBtn = new JButton("\u2715"); // X mark
-		deleteBtn.setFont(new Font("Arial", Font.PLAIN, 12));
-		deleteBtn.setToolTipText("Delete notification");
-		deleteBtn.setBackground(new Color(150, 0, 0));
-		deleteBtn.setForeground(Color.WHITE);
-		deleteBtn.setFocusPainted(false);
-		deleteBtn.setBorderPainted(false);
-		deleteBtn.setPreferredSize(new Dimension(30, 25));
-		deleteBtn.addActionListener(e -> {
-			plugin.getNotificationService().deleteNotification(currentPlayer, notification.getId());
-			refresh();
-		});
-		buttonPanel.add(deleteBtn);
-
-		card.add(buttonPanel, BorderLayout.EAST);
-
-		return card;
-	}
-
-	/**
-	 * ADDED: Mark all notifications as read
-	 */
-	private void markAllNotificationsRead()
-	{
-		String currentPlayer = plugin.getCurrentPlayerName();
-		if (currentPlayer != null && plugin.getNotificationService() != null)
-		{
-			plugin.getNotificationService().markAllAsRead(currentPlayer);
-			refresh();
-		}
-	}
-
-	/**
-	 * ADDED: Clear all notifications
-	 */
-	private void clearAllNotifications()
-	{
-		String currentPlayer = plugin.getCurrentPlayerName();
-		if (currentPlayer != null && plugin.getNotificationService() != null)
-		{
-			int confirm = JOptionPane.showConfirmDialog(
-				this,
-				"Are you sure you want to clear all notifications?",
-				"Clear Notifications",
-				JOptionPane.YES_NO_OPTION,
-				JOptionPane.WARNING_MESSAGE
-			);
-
-			if (confirm == JOptionPane.YES_OPTION)
-			{
-				plugin.getNotificationService().clearAllNotifications(currentPlayer);
-				refresh();
-			}
-		}
-	}
-
-	/**
 	 * Clear old history entries
 	 */
 	private void clearOldEntries()
@@ -510,13 +199,9 @@ public class HistoryPanel extends JPanel
 			{
 				long thirtyDaysAgo = System.currentTimeMillis() - (30L * 24 * 60 * 60 * 1000);
 
-				// FIXED: Actually remove old entries from both LendingManager and Recorder
-				int removedFromManager = lendingManager.removeOldHistoryEntries(thirtyDaysAgo);
-				int removedFromRecorder = plugin.getRecorder().removeOldHistoryEntries(thirtyDaysAgo);
-				int removedCount = removedFromManager + removedFromRecorder;
+				// Remove old entries from DataService (unified store)
+				int removedCount = dataService.removeOldHistoryEntries(thirtyDaysAgo);
 
-				log.info("Cleared {} old history entries ({} from manager, {} from recorder)",
-					removedCount, removedFromManager, removedFromRecorder);
 				refresh();
 
 				JOptionPane.showMessageDialog(

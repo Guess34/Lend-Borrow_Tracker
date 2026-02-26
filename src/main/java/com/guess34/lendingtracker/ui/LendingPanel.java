@@ -15,8 +15,7 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 
 /**
- * LendingPanel - Main UI shell with Material Design tabs
- * Phase 3: Modular UI with Flipping Utilities style
+ * LendingPanel - Main UI shell with Material Design tabs.
  */
 @Slf4j
 public class LendingPanel extends PluginPanel
@@ -27,12 +26,19 @@ public class LendingPanel extends PluginPanel
 	// Group control panel (persistent header)
 	private final GroupControlPanel groupControlPanel;
 
-	// Display panel that holds the active tab content
-	private final JPanel display = new JPanel();
+	// Display panel — reports small preferred height so child scroll panes can scroll
+	private final JPanel display = new JPanel()
+	{
+		@Override
+		public Dimension getPreferredSize()
+		{
+			return new Dimension(super.getPreferredSize().width, 0);
+		}
+	};
 	private final MaterialTabGroup tabGroup;
 
 	// Tab panels
-	private DashboardPanel marketplacePanel; // Renamed from dashboardPanel
+	private DashboardPanel marketplacePanel;
 	private RosterPanel rosterPanel;
 	private HistoryPanel historyPanel;
 	private SettingsPanel settingsPanel;
@@ -49,13 +55,12 @@ public class LendingPanel extends PluginPanel
 		// Create group control panel at the top
 		groupControlPanel = new GroupControlPanel(plugin, eventBus);
 
-		// FIXED: MaterialTabGroup needs display panel in constructor
 		tabGroup = new MaterialTabGroup(display);
 		tabGroup.setBorder(new EmptyBorder(5, 0, 0, 0));
 		tabGroup.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
 		// Create tab panels
-		marketplacePanel = new DashboardPanel(plugin); // Marketplace (was Dashboard)
+		marketplacePanel = new DashboardPanel(plugin);
 		rosterPanel = new RosterPanel(plugin);
 		historyPanel = new HistoryPanel(plugin);
 		settingsPanel = new SettingsPanel(plugin);
@@ -74,95 +79,49 @@ public class LendingPanel extends PluginPanel
 
 		// Register for group change events
 		eventBus.register(this);
-
-		log.info("LendingPanel initialized with group controls and 4 tabs");
 	}
 
 	/**
-	 * Refresh all panels (called when data changes)
-	 * FIXED: Now ensures data is loaded for the active group before refreshing panels
+	 * Refresh all panels (called when data changes).
 	 */
 	public void refresh()
 	{
 		SwingUtilities.invokeLater(() ->
 		{
-			// FIXED: Ensure data is loaded for the active group BEFORE refreshing panels
-			// This fixes the issue where items don't show on login until group switch
-			String activeGroupId = plugin.getGroupConfigStore().getCurrentGroupIdUnchecked();
+			// Ensure data is loaded for the active group BEFORE refreshing panels
+			String activeGroupId = plugin.getGroupService().getCurrentGroupIdUnchecked();
 			if (activeGroupId != null)
 			{
-				// Load data from all storage systems for the active group
-				plugin.getRecorder().loadGroupData(activeGroupId);
-				plugin.getMarketplaceManager().loadGroupData(activeGroupId);
-				plugin.getItemSetManager().loadGroupData(activeGroupId);
-				log.debug("LendingPanel.refresh: Loaded data for active group: {}", activeGroupId);
+				plugin.getDataService().loadGroupData(activeGroupId);
 			}
 
-			if (groupControlPanel != null)
-			{
-				groupControlPanel.refresh();
-			}
-			if (marketplacePanel != null)
-			{
-				marketplacePanel.refresh();
-			}
-			if (rosterPanel != null)
-			{
-				rosterPanel.refresh();
-			}
-			if (historyPanel != null)
-			{
-				historyPanel.refresh();
-			}
-			if (settingsPanel != null)
-			{
-				settingsPanel.refresh();
-			}
+			groupControlPanel.refresh();
+			marketplacePanel.refresh();
+			rosterPanel.refresh();
+			historyPanel.refresh();
+			settingsPanel.refresh();
 		});
 	}
 
-	/**
-	 * Handle group change events
-	 */
 	@Subscribe
 	public void onGroupChangedEvent(GroupControlPanel.GroupChangedEvent event)
 	{
-		log.info("Group changed event received: {}", event.getGroupId());
-
-		// Load data for the newly selected group from ALL systems
+		// Load data for the newly selected group
 		if (event.getGroupId() != null) {
-			// Load from recorder (primary storage used by right-click "Add to Lending List")
-			plugin.getRecorder().loadGroupData(event.getGroupId());
-			log.info("Loaded recorder data for group: {}", event.getGroupId());
+			plugin.getDataService().loadGroupData(event.getGroupId());
 
-			// Also load from marketplaceManager (used by button adds)
-			plugin.getMarketplaceManager().loadGroupData(event.getGroupId());
-			log.info("Loaded marketplace manager data for group: {}", event.getGroupId());
-
-			// Load item sets for the group
-			plugin.getItemSetManager().loadGroupData(event.getGroupId());
-			log.info("Loaded item set data for group: {}", event.getGroupId());
-
-			// FIXED: Restart sync for the newly selected group
+			// Restart sync for the newly selected group
 			String playerName = plugin.getCurrentPlayerName();
 			if (playerName != null) {
-				plugin.getGroupSyncService().startSync(event.getGroupId(), playerName);
-				log.info("Restarted sync for group: {}", event.getGroupId());
+				plugin.getGroupService().startSync(event.getGroupId(), playerName);
 			}
 		}
 
 		refresh();
 	}
 
-	// Store tabs for easy access
-	private MaterialTab marketplaceTab;
-	private MaterialTab rosterTab;
-	private MaterialTab historyTab;
-	private MaterialTab settingsTab;
-
 	/**
-	 * Initialize tabs with drawn icon-based MaterialTabs
-	 * CHANGED: Replaced Unicode symbol tabs with Graphics2D drawn icons
+	 * Initialize tabs with drawn icon-based MaterialTabs.
 	 */
 	private void initializeTabs()
 	{
@@ -171,10 +130,10 @@ public class LendingPanel extends PluginPanel
 		ImageIcon logIcon = createClockIcon(new Color(0, 170, 0));
 		ImageIcon cfgIcon = createGearIcon(ColorScheme.MEDIUM_GRAY_COLOR);
 
-		marketplaceTab = new MaterialTab(shopIcon, tabGroup, marketplacePanel);
-		rosterTab = new MaterialTab(teamIcon, tabGroup, rosterPanel);
-		historyTab = new MaterialTab(logIcon, tabGroup, historyPanel);
-		settingsTab = new MaterialTab(cfgIcon, tabGroup, settingsPanel);
+		MaterialTab marketplaceTab = new MaterialTab(shopIcon, tabGroup, marketplacePanel);
+		MaterialTab rosterTab = new MaterialTab(teamIcon, tabGroup, rosterPanel);
+		MaterialTab historyTab = new MaterialTab(logIcon, tabGroup, historyPanel);
+		MaterialTab settingsTab = new MaterialTab(cfgIcon, tabGroup, settingsPanel);
 
 		marketplaceTab.setToolTipText("Marketplace");
 		rosterTab.setToolTipText("Group Roster");
@@ -187,13 +146,8 @@ public class LendingPanel extends PluginPanel
 		tabGroup.addTab(settingsTab);
 
 		tabGroup.select(marketplaceTab);
-
-		log.info("Tabs initialized with drawn icons");
 	}
 
-	/**
-	 * Create a base icon image with antialiasing enabled
-	 */
 	private static Graphics2D createIconGraphics(BufferedImage img)
 	{
 		Graphics2D g = img.createGraphics();
@@ -202,9 +156,6 @@ public class LendingPanel extends PluginPanel
 		return g;
 	}
 
-	/**
-	 * Shopping bag icon for Marketplace tab
-	 */
 	private static ImageIcon createShopIcon(Color color)
 	{
 		int size = 20;
@@ -222,9 +173,6 @@ public class LendingPanel extends PluginPanel
 		return new ImageIcon(img);
 	}
 
-	/**
-	 * Two-person silhouette icon for Roster tab
-	 */
 	private static ImageIcon createPeopleIcon(Color color)
 	{
 		int size = 20;
@@ -246,9 +194,6 @@ public class LendingPanel extends PluginPanel
 		return new ImageIcon(img);
 	}
 
-	/**
-	 * Clock icon for History tab
-	 */
 	private static ImageIcon createClockIcon(Color color)
 	{
 		int size = 20;
@@ -270,9 +215,6 @@ public class LendingPanel extends PluginPanel
 		return new ImageIcon(img);
 	}
 
-	/**
-	 * Gear/cog icon for Settings tab
-	 */
 	private static ImageIcon createGearIcon(Color color)
 	{
 		int size = 20;
@@ -306,102 +248,5 @@ public class LendingPanel extends PluginPanel
 		return new ImageIcon(img);
 	}
 
-	/**
-	 * Switch to marketplace tab
-	 */
-	public void switchToMarketplace()
-	{
-		tabGroup.select(marketplaceTab);
-	}
-
-	/**
-	 * Switch to roster tab
-	 */
-	public void switchToRoster()
-	{
-		tabGroup.select(rosterTab);
-	}
-
-	/**
-	 * Switch to history tab
-	 */
-	public void switchToHistory()
-	{
-		tabGroup.select(historyTab);
-	}
-
-	/**
-	 * Get the marketplace panel
-	 */
-	public DashboardPanel getMarketplacePanel()
-	{
-		return marketplacePanel;
-	}
-
-	/**
-	 * Get the roster panel
-	 */
-	public RosterPanel getRosterPanel()
-	{
-		return rosterPanel;
-	}
-
-	/**
-	 * Get the history panel
-	 */
-	public HistoryPanel getHistoryPanel()
-	{
-		return historyPanel;
-	}
-
-	/**
-	 * Get the settings panel
-	 */
-	public SettingsPanel getSettingsPanel()
-	{
-		return settingsPanel;
-	}
-
-	/**
-	 * FIXED: Set the current account name directly.
-	 * This is the proper way to update the account dropdown on login.
-	 * Called from the plugin after detecting login on the client thread.
-	 *
-	 * @param accountName The logged-in player's name, or null if logged out
-	 */
-	public void setCurrentAccount(String accountName)
-	{
-		log.info("LendingPanel.setCurrentAccount: {}", accountName);
-		if (groupControlPanel != null)
-		{
-			groupControlPanel.setCurrentAccount(accountName);
-		}
-	}
-
-	/**
-	 * FIXED: Clear the current account (called on logout)
-	 */
-	public void clearCurrentAccount()
-	{
-		log.info("LendingPanel.clearCurrentAccount called");
-		if (groupControlPanel != null)
-		{
-			groupControlPanel.clearCurrentAccount();
-		}
-	}
-
-	/**
-	 * ADDED: Shutdown method to clean up timers and resources
-	 */
-	public void shutdown()
-	{
-		// Stop the online status refresh timer in the marketplace panel
-		if (marketplacePanel != null)
-		{
-			marketplacePanel.stopRefreshTimer();
-		}
-		// Unregister from event bus
-		eventBus.unregister(this);
-		log.info("LendingPanel shutdown complete");
-	}
+	// Panel lifecycle (creation, disposal) is managed by RuneLite via NavigationButton.
 }

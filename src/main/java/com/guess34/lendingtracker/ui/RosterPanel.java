@@ -7,8 +7,7 @@ import net.runelite.api.FriendsChatMember;
 import com.guess34.lendingtracker.LendingTrackerPlugin;
 import com.guess34.lendingtracker.model.GroupMember;
 import com.guess34.lendingtracker.model.LendingGroup;
-import com.guess34.lendingtracker.services.group.GroupConfigStore;
-import com.guess34.lendingtracker.services.OnlineStatusService;
+import com.guess34.lendingtracker.services.GroupService;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.components.IconTextField;
@@ -19,18 +18,15 @@ import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
-/**
- * RosterPanel - Shows group members with online/offline status (like friends list)
- */
 @Slf4j
 public class RosterPanel extends JPanel
 {
 	private final LendingTrackerPlugin plugin;
-	private final GroupConfigStore groupConfigStore;
+	private final GroupService groupService;
 
 	private final JLabel headerLabel;
 	private final IconTextField searchBar;
@@ -40,7 +36,7 @@ public class RosterPanel extends JPanel
 	public RosterPanel(LendingTrackerPlugin plugin)
 	{
 		this.plugin = plugin;
-		this.groupConfigStore = plugin.getGroupConfigStore();
+		this.groupService = plugin.getGroupService();
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -101,17 +97,10 @@ public class RosterPanel extends JPanel
 		add(scrollPane, BorderLayout.CENTER);
 	}
 
-	/**
-	 * Refresh the roster with latest data
-	 * FIXED: Now checks login status before showing group data
-	 */
 	public void refresh()
 	{
 		SwingUtilities.invokeLater(() ->
 		{
-			log.info("RosterPanel.refresh() called");
-
-			// ADDED: Check login status first
 			boolean isLoggedIn = false;
 			try
 			{
@@ -129,35 +118,29 @@ public class RosterPanel extends JPanel
 				log.debug("Could not check login status", e);
 			}
 
-			// If not logged in, show login message and don't show any group data
 			if (!isLoggedIn)
 			{
-				log.info("User not logged in - showing login message");
 				headerLabel.setText("Group Roster");
-				showNotLoggedInMessage();
+				showMessage("<html><center><b style='color: #ff9900;'>Not Logged In</b><br><br>Please log in to your<br>OSRS account to see<br>group members.</center></html>");
 				return;
 			}
 
-			// Get active group - only if logged in
-			LendingGroup activeGroup = groupConfigStore.getActiveGroup();
+			LendingGroup activeGroup = groupService.getActiveGroup();
 			if (activeGroup == null)
 			{
-				log.info("No active group - showing message");
 				headerLabel.setText("No Group Selected");
-				showNoGroupMessage();
+				showMessage("<html><center><b>No Active Group</b><br><br>Create or join a group<br>to see group members</center></html>");
 				return;
 			}
 
 			// Update header with group name
 			headerLabel.setText(activeGroup.getName() + " Roster");
-			log.info("Active group: {} ({})", activeGroup.getName(), activeGroup.getId());
 
-			// Get online players for status checking
-			Set<String> onlinePlayers = getOnlinePlayers();
+			// Get online players for status checking (maps lowercase name -> world number)
+			Map<String, Integer> onlinePlayers = getOnlinePlayers();
 
 			// Get group members
 			List<GroupMember> members = activeGroup.getMembers();
-			log.info("Group has {} members", members != null ? members.size() : 0);
 
 			// Clear and rebuild member list
 			memberListPanel.removeAll();
@@ -165,33 +148,31 @@ public class RosterPanel extends JPanel
 
 			if (members == null || members.isEmpty())
 			{
-				showEmptyMessage();
+				showMessage("<html><center>No members in this group<br><br>Invite members using<br>the Settings tab</center></html>");
 			}
 			else
 			{
 				// Sort members: online first, then by role rank, then alphabetically
 				List<GroupMember> sortedMembers = new ArrayList<>(members);
 				sortedMembers.sort((a, b) -> {
-					boolean aOnline = isPlayerOnline(a.getName(), onlinePlayers);
-					boolean bOnline = isPlayerOnline(b.getName(), onlinePlayers);
+					boolean aOnline = onlinePlayers.containsKey(a.getName().toLowerCase());
+					boolean bOnline = onlinePlayers.containsKey(b.getName().toLowerCase());
 
-					// Online first
 					if (aOnline != bOnline) return aOnline ? -1 : 1;
 
-					// Then by role rank (higher rank first)
-					int aRank = GroupConfigStore.getRoleRank(a.getRole());
-					int bRank = GroupConfigStore.getRoleRank(b.getRole());
+					int aRank = GroupService.getRoleRank(a.getRole());
+					int bRank = GroupService.getRoleRank(b.getRole());
 					if (aRank != bRank) return bRank - aRank;
 
-					// Then alphabetically
 					return a.getName().compareToIgnoreCase(b.getName());
 				});
 
-				// Create member rows
 				for (GroupMember member : sortedMembers)
 				{
-					boolean isOnline = isPlayerOnline(member.getName(), onlinePlayers);
-					JPanel memberRow = createMemberRow(member, isOnline);
+					boolean isOnline = onlinePlayers.containsKey(member.getName().toLowerCase());
+					Integer worldVal = onlinePlayers.get(member.getName().toLowerCase());
+					int world = worldVal != null ? worldVal : 0;
+					JPanel memberRow = createMemberRow(member, isOnline, world);
 					allMemberRows.add(memberRow);
 					memberListPanel.add(memberRow);
 					memberListPanel.add(Box.createVerticalStrut(2));
@@ -203,11 +184,7 @@ public class RosterPanel extends JPanel
 		});
 	}
 
-	/**
-	 * Create a row for a group member
-	 * FIXED: Now shows online status with world number
-	 */
-	private JPanel createMemberRow(GroupMember member, boolean isOnline)
+	private JPanel createMemberRow(GroupMember member, boolean isOnline, int world)
 	{
 		JPanel row = new JPanel(new BorderLayout(8, 0));
 		row.setBackground(ColorScheme.DARKER_GRAY_COLOR);
@@ -223,24 +200,15 @@ public class RosterPanel extends JPanel
 		statusDot.setFont(new Font("Arial", Font.BOLD, 20));
 		statusDot.setForeground(isOnline ? new Color(0, 200, 83) : new Color(150, 150, 150));
 
-		// Get world number for online players
+		// Get world number for online players from friends list
 		String statusTooltip = "Offline";
 		String worldText = "";
 		if (isOnline)
 		{
-			OnlineStatusService onlineStatusService = plugin.getOnlineStatusService();
-			if (onlineStatusService != null)
+			if (world > 0)
 			{
-				OnlineStatusService.OnlineStatus status = onlineStatusService.getPlayerStatus(member.getName());
-				if (status != null && status.world > 0)
-				{
-					worldText = " (W" + status.world + ")";
-					statusTooltip = "Online - World " + status.world;
-				}
-				else
-				{
-					statusTooltip = "Online";
-				}
+				worldText = " (W" + world + ")";
+				statusTooltip = "Online - World " + world;
 			}
 			else
 			{
@@ -260,42 +228,19 @@ public class RosterPanel extends JPanel
 
 		// Right: Role badge
 		String role = member.getRole() != null ? member.getRole() : "member";
-		JLabel roleLabel = new JLabel(formatRoleName(role));
+		JLabel roleLabel = new JLabel(GroupService.formatRoleName(role));
 		roleLabel.setFont(FontManager.getRunescapeSmallFont());
 		roleLabel.setOpaque(true);
 		roleLabel.setBorder(new EmptyBorder(2, 6, 2, 6));
-
-		// Color-code by role
-		switch (role.toLowerCase())
-		{
-			case "owner":
-				roleLabel.setBackground(new Color(255, 215, 0)); // Gold
-				roleLabel.setForeground(Color.BLACK);
-				break;
-			case "co-owner":
-				roleLabel.setBackground(new Color(192, 192, 192)); // Silver
-				roleLabel.setForeground(Color.BLACK);
-				break;
-			case "admin":
-				roleLabel.setBackground(ColorScheme.BRAND_ORANGE);
-				roleLabel.setForeground(Color.WHITE);
-				break;
-			case "mod":
-				roleLabel.setBackground(new Color(100, 149, 237)); // Cornflower blue
-				roleLabel.setForeground(Color.WHITE);
-				break;
-			default:
-				roleLabel.setBackground(ColorScheme.MEDIUM_GRAY_COLOR);
-				roleLabel.setForeground(Color.WHITE);
-				break;
-		}
+		roleLabel.setBackground(GroupService.getRoleBackgroundColor(role));
+		roleLabel.setForeground(GroupService.getRoleForegroundColor(role));
 
 		row.add(roleLabel, BorderLayout.EAST);
 
 		// Store the member name for filtering
 		row.putClientProperty("memberName", member.getName().toLowerCase());
 
-		// ADDED: Right-click context menu
+		// Right-click context menu
 		row.addMouseListener(new MouseAdapter()
 		{
 			@Override
@@ -314,7 +259,7 @@ public class RosterPanel extends JPanel
 			{
 				if (e.isPopupTrigger())
 				{
-					showMemberPopup(e.getComponent(), e.getX(), e.getY(), member, isOnline);
+					showMemberPopup(e.getComponent(), e.getX(), e.getY(), member, isOnline, world);
 				}
 			}
 		});
@@ -322,16 +267,13 @@ public class RosterPanel extends JPanel
 		return row;
 	}
 
-	/**
-	 * Get set of online players (from friends chat / clan chat / friends list)
-	 */
-	private Set<String> getOnlinePlayers()
+	private Map<String, Integer> getOnlinePlayers()
 	{
-		Set<String> online = new HashSet<>();
+		Map<String, Integer> online = new HashMap<>();
 
 		try
 		{
-			// Check Friends Chat members
+			// Check Friends Chat members (world not available from FriendsChatMember)
 			FriendsChatManager fcManager = plugin.getClient().getFriendsChatManager();
 			if (fcManager != null)
 			{
@@ -342,13 +284,13 @@ public class RosterPanel extends JPanel
 					{
 						if (m != null && m.getName() != null)
 						{
-							online.add(m.getName().toLowerCase());
+							online.putIfAbsent(m.getName().toLowerCase(), 0);
 						}
 					}
 				}
 			}
 
-			// Check friends list for online status
+			// Check friends list for online status (includes world number)
 			Friend[] friends = plugin.getClient().getFriendContainer().getMembers();
 			if (friends != null)
 			{
@@ -356,18 +298,19 @@ public class RosterPanel extends JPanel
 				{
 					if (f != null && f.getName() != null && f.getWorld() > 0)
 					{
-						online.add(f.getName().toLowerCase());
+						online.put(f.getName().toLowerCase(), f.getWorld());
 					}
 				}
 			}
 
-			// Current player is always "online"
+			// Current player is always "online" on their current world
 			if (plugin.getClient().getLocalPlayer() != null)
 			{
 				String localName = plugin.getClient().getLocalPlayer().getName();
 				if (localName != null)
 				{
-					online.add(localName.toLowerCase());
+					int currentWorld = plugin.getClient().getWorld();
+					online.put(localName.toLowerCase(), currentWorld);
 				}
 			}
 		}
@@ -379,34 +322,7 @@ public class RosterPanel extends JPanel
 		return online;
 	}
 
-	/**
-	 * Check if a player is online
-	 * FIXED: Also checks OnlineStatusService for test/fake players
-	 */
-	private boolean isPlayerOnline(String playerName, Set<String> onlinePlayers)
-	{
-		if (playerName == null) return false;
-
-		// First check the game-based online players
-		if (onlinePlayers.contains(playerName.toLowerCase()))
-		{
-			return true;
-		}
-
-		// Also check OnlineStatusService for manually set status (test players)
-		OnlineStatusService onlineStatusService = plugin.getOnlineStatusService();
-		if (onlineStatusService != null && onlineStatusService.isPlayerOnline(playerName))
-		{
-			return true;
-		}
-
-		return false;
-	}
-
-	/**
-	 * ADDED: Show right-click context menu for a member row
-	 */
-	private void showMemberPopup(Component component, int x, int y, GroupMember member, boolean isOnline)
+	private void showMemberPopup(Component component, int x, int y, GroupMember member, boolean isOnline, int world)
 	{
 		JPopupMenu popup = new JPopupMenu();
 
@@ -414,7 +330,6 @@ public class RosterPanel extends JPanel
 		JMenuItem viewActivity = new JMenuItem("View Activity");
 		viewActivity.addActionListener(e ->
 		{
-			log.info("View activity for: {}", member.getName());
 			JOptionPane.showMessageDialog(this,
 				"Activity history for " + member.getName() + "\n(Switch to Log tab for full history)",
 				"Player Activity",
@@ -422,36 +337,17 @@ public class RosterPanel extends JPanel
 		});
 		popup.add(viewActivity);
 
-		// CHANGED: Show world info for online players (informational, not actionable)
-		if (isOnline)
+		// Show world info for online players (informational, not actionable)
+		if (isOnline && world > 0)
 		{
-			OnlineStatusService onlineStatusService = plugin.getOnlineStatusService();
-			if (onlineStatusService != null)
-			{
-				OnlineStatusService.OnlineStatus status = onlineStatusService.getPlayerStatus(member.getName());
-				if (status != null && status.world > 0)
-				{
-					JMenuItem worldInfo = new JMenuItem("World " + status.world);
-					worldInfo.setEnabled(false);
-					popup.add(worldInfo);
-				}
-			}
+			JMenuItem worldInfo = new JMenuItem("World " + world);
+			worldInfo.setEnabled(false);
+			popup.add(worldInfo);
 		}
 
 		popup.show(component, x, y);
 	}
 
-	/**
-	 * CHANGED: Delegates to shared utility in GroupConfigStore
-	 */
-	private String formatRoleName(String role)
-	{
-		return GroupConfigStore.formatRoleName(role);
-	}
-
-	/**
-	 * Filter members by name
-	 */
 	private void filterMembers(String query)
 	{
 		String lowerQuery = query.toLowerCase().trim();
@@ -468,78 +364,30 @@ public class RosterPanel extends JPanel
 		memberListPanel.repaint();
 	}
 
-	/**
-	 * Clear search filter
-	 */
 	private void clearSearch()
 	{
 		searchBar.setText("");
 		filterMembers("");
 	}
 
-	/**
-	 * ADDED: Show not logged in message
-	 */
-	private void showNotLoggedInMessage()
+	private void showMessage(String html)
 	{
 		memberListPanel.removeAll();
 		allMemberRows.clear();
 
-		JPanel emptyPanel = new JPanel(new BorderLayout());
-		emptyPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		emptyPanel.setBorder(new EmptyBorder(40, 20, 40, 20));
+		JPanel panel = new JPanel(new BorderLayout());
+		panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		panel.setBorder(new EmptyBorder(40, 20, 40, 20));
 
-		JLabel emptyLabel = new JLabel("<html><center><b style='color: #ff9900;'>Not Logged In</b><br><br>Please log in to your<br>OSRS account to see<br>group members.</center></html>");
-		emptyLabel.setFont(FontManager.getRunescapeFont());
-		emptyLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-		emptyLabel.setHorizontalAlignment(SwingConstants.CENTER);
+		JLabel label = new JLabel(html);
+		label.setFont(FontManager.getRunescapeFont());
+		label.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		label.setHorizontalAlignment(SwingConstants.CENTER);
 
-		emptyPanel.add(emptyLabel, BorderLayout.CENTER);
-		memberListPanel.add(emptyPanel);
-
-		memberListPanel.revalidate();
-		memberListPanel.repaint();
-	}
-
-	/**
-	 * Show no group message
-	 */
-	private void showNoGroupMessage()
-	{
-		memberListPanel.removeAll();
-		allMemberRows.clear();
-
-		JPanel emptyPanel = new JPanel(new BorderLayout());
-		emptyPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		emptyPanel.setBorder(new EmptyBorder(40, 20, 40, 20));
-
-		JLabel emptyLabel = new JLabel("<html><center><b>No Active Group</b><br><br>Create or join a group<br>to see group members</center></html>");
-		emptyLabel.setFont(FontManager.getRunescapeFont());
-		emptyLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-		emptyLabel.setHorizontalAlignment(SwingConstants.CENTER);
-
-		emptyPanel.add(emptyLabel, BorderLayout.CENTER);
-		memberListPanel.add(emptyPanel);
+		panel.add(label, BorderLayout.CENTER);
+		memberListPanel.add(panel);
 
 		memberListPanel.revalidate();
 		memberListPanel.repaint();
-	}
-
-	/**
-	 * Show empty members message
-	 */
-	private void showEmptyMessage()
-	{
-		JPanel emptyPanel = new JPanel(new BorderLayout());
-		emptyPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		emptyPanel.setBorder(new EmptyBorder(40, 20, 40, 20));
-
-		JLabel emptyLabel = new JLabel("<html><center>No members in this group<br><br>Invite members using<br>the Settings tab</center></html>");
-		emptyLabel.setFont(FontManager.getRunescapeFont());
-		emptyLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-		emptyLabel.setHorizontalAlignment(SwingConstants.CENTER);
-
-		emptyPanel.add(emptyLabel, BorderLayout.CENTER);
-		memberListPanel.add(emptyPanel);
 	}
 }

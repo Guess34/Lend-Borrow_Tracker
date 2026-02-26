@@ -2,7 +2,6 @@ package com.guess34.lendingtracker.services;
 
 import java.awt.*;
 import java.awt.image.BufferedImage;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -16,7 +15,6 @@ import javax.inject.Singleton;
 import javax.imageio.ImageIO;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.client.game.ItemManager;
 import com.guess34.lendingtracker.LendingTrackerConfig;
 import com.guess34.lendingtracker.model.LendingEntry;
 
@@ -29,7 +27,6 @@ import com.guess34.lendingtracker.model.LendingEntry;
 public class ProofScreenshot
 {
 	private final Client client;
-	private final ItemManager itemManager;
 
 	@Inject
 	private LendingTrackerConfig config;
@@ -41,30 +38,21 @@ public class ProofScreenshot
 	private static final Path BASE_DIR = Paths.get(System.getProperty("user.home"), "LendingTracker", "proof");
 
 	@Inject
-	public ProofScreenshot(Client client, ItemManager itemManager)
+	public ProofScreenshot(Client client)
 	{
 		this.client = client;
-		this.itemManager = itemManager;
 	}
 
 	/**
 	 * Get the screenshot directory for a specific user and group
 	 */
-	public Path getScreenshotDirectory(String username, String groupName)
+	private Path getScreenshotDirectory(String username, String groupName)
 	{
 		// Clean up names for file system safety
 		String safeUsername = sanitizeFilename(username != null ? username : "unknown");
 		String safeGroupName = sanitizeFilename(groupName != null ? groupName : "default");
 
 		return BASE_DIR.resolve(safeUsername).resolve(safeGroupName);
-	}
-
-	/**
-	 * Get the base screenshot directory
-	 */
-	public Path getBaseScreenshotDirectory()
-	{
-		return BASE_DIR;
 	}
 
 	/**
@@ -80,7 +68,6 @@ public class ProofScreenshot
 			if (Desktop.isDesktopSupported())
 			{
 				Desktop.getDesktop().open(dir.toFile());
-				log.info("Opened screenshot folder: {}", dir);
 			}
 			else
 			{
@@ -159,33 +146,7 @@ public class ProofScreenshot
 			File outFile = outDir.resolve(filename).toFile();
 			ImageIO.write(screenshot, "png", outFile);
 
-			log.info("Saved proof screenshot: {}", outFile.getAbsolutePath());
 			return outFile;
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to capture proof screenshot: {}", e.getMessage());
-			return null;
-		}
-	}
-
-	/**
-	 * Legacy method for backward compatibility
-	 */
-	public File captureToFile(String eventType, String details, LendingEntry entry)
-	{
-		try
-		{
-			BufferedImage screenshot = captureGameWindow();
-			if (screenshot == null) return null;
-
-			screenshot = addLegacyOverlayText(screenshot, eventType, details, entry);
-
-			String timestamp = DATE_FORMAT.format(Date.from(Instant.now()));
-			Files.createDirectories(BASE_DIR);
-			File out = BASE_DIR.resolve("proof_" + timestamp + ".png").toFile();
-			ImageIO.write(screenshot, "png", out);
-			return out;
 		}
 		catch (Exception e)
 		{
@@ -289,46 +250,6 @@ public class ProofScreenshot
 	}
 
 	/**
-	 * Legacy overlay format for backward compatibility
-	 */
-	private BufferedImage addLegacyOverlayText(BufferedImage img, String eventType, String details, LendingEntry entry)
-	{
-		Graphics2D g = img.createGraphics();
-		try
-		{
-			g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
-
-			int y = 24;
-
-			g.setColor(new Color(0, 0, 0, 170));
-			g.fillRoundRect(10, 10, Math.min(img.getWidth() - 20, 900), 160, 12, 12);
-
-			g.setColor(Color.WHITE);
-			g.setFont(new Font("Dialog", Font.BOLD, 16));
-			g.drawString("LendingTracker Proof", 20, y);
-			y += 22;
-
-			g.setFont(new Font("Dialog", Font.PLAIN, 14));
-			if (eventType != null) { g.drawString("Event: " + eventType, 20, y); y += 18; }
-			if (details != null)    { g.drawString("Details: " + details, 20, y); y += 18; }
-
-			if (entry != null)
-			{
-				g.drawString("Borrower: " + safe(entry.getBorrower()), 20, y); y += 18;
-				g.drawString("Lender: " + safe(entry.getLender()), 20, y);     y += 18;
-				g.drawString("Item: " + safe(entry.getItem()) + " x" + entry.getQuantity(), 20, y); y += 18;
-				g.drawString("Collateral: " + formatCollateral(entry), 20, y);
-			}
-
-			return img;
-		}
-		finally
-		{
-			g.dispose();
-		}
-	}
-
-	/**
 	 * Format the phase for display
 	 */
 	private String formatPhase(String phase)
@@ -388,26 +309,4 @@ public class ProofScreenshot
 		return name.replaceAll("[^a-zA-Z0-9_\\-]", "_");
 	}
 
-	/**
-	 * Capture to bytes for Discord/webhook upload
-	 */
-	public byte[] captureToBytes(String eventType, String details, LendingEntry entry)
-	{
-		try
-		{
-			BufferedImage screenshot = captureGameWindow();
-			if (screenshot == null) return null;
-
-			screenshot = addLegacyOverlayText(screenshot, eventType, details, entry);
-
-			ByteArrayOutputStream baos = new ByteArrayOutputStream();
-			ImageIO.write(screenshot, "png", baos);
-			return baos.toByteArray();
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to capture screenshot bytes: {}", e.getMessage());
-			return null;
-		}
-	}
 }
