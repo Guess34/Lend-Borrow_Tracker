@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit;
 @Singleton
 public class LocalDataSyncService {
     
-    private static final String BACKUP_DIR = System.getProperty("user.home") + File.separator + ".runelite" + File.separator + "lending-tracker-backups";
+    private static final String BACKUP_DIR = System.getProperty("user.home") + File.separator + ".runelite" + File.separator + "lending-tracker" + File.separator + "backups";
     private static final String SYNC_DATA_FILE = "lending-data-sync.json";
     private static final String BACKUP_FILE_PREFIX = "lending-backup-";
     private static final int MAX_BACKUP_FILES = 10;

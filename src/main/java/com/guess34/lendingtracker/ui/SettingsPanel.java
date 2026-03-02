@@ -173,7 +173,7 @@ public class SettingsPanel extends JPanel
 		});
 		content.add(btn);
 		content.add(Box.createVerticalStrut(3));
-		content.add(smallLabel("<i>~/LendingTracker/proof/</i>"));
+		content.add(smallLabel("<i>~/.runelite/lending-tracker/proof/</i>"));
 		section.add(content, BorderLayout.CENTER);
 		return section;
 	}

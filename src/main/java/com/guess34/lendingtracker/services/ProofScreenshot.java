@@ -34,8 +34,8 @@ public class ProofScreenshot
 	private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
 	private static final SimpleDateFormat DISPLAY_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
-	// Base directory for all screenshots
-	private static final Path BASE_DIR = Paths.get(System.getProperty("user.home"), "LendingTracker", "proof");
+	// Base directory for all screenshots (inside .runelite per Plugin Hub rules)
+	private static final Path BASE_DIR = Paths.get(System.getProperty("user.home"), ".runelite", "lending-tracker", "proof");
 
 	@Inject
 	public ProofScreenshot(Client client)
