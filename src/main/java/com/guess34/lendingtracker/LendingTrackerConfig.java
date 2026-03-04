@@ -35,6 +35,14 @@ public interface LendingTrackerConfig extends Config
 	String screenshotSection = "screenshots";
 
 	@ConfigSection(
+		name = "Sync",
+		description = "Cross-machine group sync settings",
+		position = 60,
+		closedByDefault = true
+	)
+	String syncSection = "sync";
+
+	@ConfigSection(
 		name = "Data & Storage",
 		description = "Data retention and storage settings",
 		position = 70,
@@ -119,6 +127,32 @@ public interface LendingTrackerConfig extends Config
 	default boolean screenshotIncludeOverlay()
 	{
 		return true;
+	}
+
+	// Sync
+
+	@ConfigItem(
+		keyName = "enableRelaySync",
+		name = "Enable Cloud Sync",
+		description = "Sync group data between members on different computers via relay server",
+		position = 0,
+		section = syncSection
+	)
+	default boolean enableRelaySync()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "relayServerUrl",
+		name = "Relay Server URL",
+		description = "URL of the sync relay server (leave default unless self-hosting)",
+		position = 1,
+		section = syncSection
+	)
+	default String relayServerUrl()
+	{
+		return "wss://lending-tracker-relay.onrender.com";
 	}
 
 	// Data & Storage

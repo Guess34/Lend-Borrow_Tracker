@@ -26,6 +26,10 @@ public class LendingPanel extends PluginPanel
 	// Group control panel (persistent header)
 	private final GroupControlPanel groupControlPanel;
 
+	// Connection status bar
+	private JLabel connectionDot;
+	private JLabel connectionLabel;
+
 	// Display panel — reports small preferred height so child scroll panes can scroll
 	private final JPanel display = new JPanel()
 	{
@@ -68,17 +72,45 @@ public class LendingPanel extends PluginPanel
 		// Initialize tabs
 		initializeTabs();
 
-		// Layout: Group control at top, tabs below, content in center
-		JPanel topPanel = new JPanel(new BorderLayout());
+		// Connection status bar
+		JPanel connectionBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 1));
+		connectionBar.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		connectionDot = new JLabel("\u25CF");
+		connectionDot.setForeground(ColorScheme.MEDIUM_GRAY_COLOR);
+		connectionDot.setFont(connectionDot.getFont().deriveFont(8f));
+		connectionLabel = new JLabel("Not connected");
+		connectionLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		connectionLabel.setFont(connectionLabel.getFont().deriveFont(Font.PLAIN, 10f));
+		connectionBar.add(connectionDot);
+		connectionBar.add(connectionLabel);
+
+		// Layout: Group control at top, connection bar, tabs, content in center
+		JPanel topPanel = new JPanel();
+		topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.Y_AXIS));
 		topPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		topPanel.add(groupControlPanel, BorderLayout.NORTH);
-		topPanel.add(tabGroup, BorderLayout.SOUTH);
+		topPanel.add(groupControlPanel);
+		topPanel.add(connectionBar);
+		topPanel.add(tabGroup);
 
 		add(topPanel, BorderLayout.NORTH);
 		add(display, BorderLayout.CENTER);
 
 		// Register for group change events
 		eventBus.register(this);
+
+		// Poll relay connection status until connected, then stop
+		Timer connectionPoller = new Timer(5000, null);
+		connectionPoller.addActionListener(e ->
+		{
+			boolean connected = plugin.isRelaySyncConnected();
+			updateConnectionStatus(connected);
+			if (connected)
+			{
+				connectionPoller.stop();
+			}
+		});
+		connectionPoller.setRepeats(true);
+		connectionPoller.start();
 	}
 
 	/**
@@ -100,6 +132,29 @@ public class LendingPanel extends PluginPanel
 			rosterPanel.refresh();
 			historyPanel.refresh();
 			settingsPanel.refresh();
+
+			// Sync connection status on every refresh so the indicator is always current
+			updateConnectionStatus(plugin.isRelaySyncConnected());
+		});
+	}
+
+	/**
+	 * Update the connection status indicator (called from relay sync callback).
+	 */
+	public void updateConnectionStatus(boolean connected)
+	{
+		SwingUtilities.invokeLater(() ->
+		{
+			if (connectionDot != null)
+			{
+				connectionDot.setForeground(connected ? new Color(0, 200, 0) : new Color(200, 60, 60));
+			}
+			if (connectionLabel != null)
+			{
+				connectionLabel.setText(connected ? "Synced" : "Offline");
+				connectionLabel.setForeground(connected
+					? new Color(0, 200, 0) : ColorScheme.LIGHT_GRAY_COLOR);
+			}
 		});
 	}
 

@@ -3,6 +3,8 @@ package com.guess34.lendingtracker.model;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+
+import java.security.SecureRandom;
 import java.util.*;
 
 @Data
@@ -18,6 +20,9 @@ public class LendingGroup {
     private Set<String> usedGroupCodes = new HashSet<>(); // Track who used group codes
     private int clanCodeUseCount = 0; // Track clan code usage
     private List<GroupMember> members = new ArrayList<>();
+
+    // ADDED: Shared secret for HMAC-SHA256 message signing on relay sync
+    private String syncSecret;
 
     // Permission settings - which roles can kick members
     // Default: co-owner, admin, mod can all kick (true)
@@ -42,6 +47,8 @@ public class LendingGroup {
         this.usedGroupCodes = new HashSet<>();
         this.clanCodeUseCount = 0;
         this.members = new ArrayList<>();
+        // ADDED: Generate sync secret for HMAC message signing
+        this.syncSecret = generateSyncSecret();
         // Default kick permissions - all staff can kick
         this.coOwnerCanKick = true;
         this.adminCanKick = true;
@@ -99,5 +106,26 @@ public class LendingGroup {
     public boolean hasMember(String memberName) {
         return members.stream()
             .anyMatch(m -> m.getName().equalsIgnoreCase(memberName));
+    }
+
+    // ADDED: Generate a cryptographically random sync secret (32 bytes, hex-encoded)
+    private static String generateSyncSecret() {
+        byte[] bytes = new byte[32];
+        new SecureRandom().nextBytes(bytes);
+        StringBuilder sb = new StringBuilder(64);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Ensure this group has a sync secret.
+     * Call this on groups loaded from config that were created before HMAC was added.
+     */
+    public void ensureSyncSecret() {
+        if (syncSecret == null || syncSecret.isEmpty()) {
+            syncSecret = generateSyncSecret();
+        }
     }
 }

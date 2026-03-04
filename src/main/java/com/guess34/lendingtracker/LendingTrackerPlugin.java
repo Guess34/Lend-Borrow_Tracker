@@ -21,6 +21,7 @@ import com.guess34.lendingtracker.services.DataService;
 import com.guess34.lendingtracker.services.LocalDataSyncService;
 import com.guess34.lendingtracker.services.ProofScreenshot;
 import com.guess34.lendingtracker.services.GroupService;
+import com.guess34.lendingtracker.services.RelaySyncService;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.NavigationButton;
@@ -66,6 +67,7 @@ public class LendingTrackerPlugin extends Plugin
 	@Inject private GroupService groupService;
 	@Inject private LocalDataSyncService localDataSyncService;
 	@Inject private ProofScreenshot proofScreenshot;
+	@Inject private RelaySyncService relaySyncService;
 
 	private LendingPanel newPanel;
 	private NavigationButton navButton;
@@ -103,6 +105,13 @@ public class LendingTrackerPlugin extends Plugin
 		else { log.error("ClientToolbar is null - UI will not appear"); }
 
 		groupService.setOnSyncCallback(() -> { if (newPanel != null) { newPanel.refresh(); } });
+
+		// Register relay sync callbacks for cross-machine sync
+		relaySyncService.setOnEventReceived(event -> groupService.handleRelayEvent(event));
+		relaySyncService.setOnConnectionChanged(status ->
+		{
+			if (newPanel != null) { newPanel.updateConnectionStatus(status); }
+		});
 
 		if (client.getGameState() == GameState.LOGGED_IN
 			&& client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
@@ -654,19 +663,25 @@ public class LendingTrackerPlugin extends Plugin
 		JDialog dlg = new JDialog();
 		dlg.setTitle("Send Invite to " + playerName);
 		dlg.setModal(true);
-		dlg.setSize(400, 200);
+		dlg.setSize(400, 230);
 		dlg.setLocationRelativeTo(null);
 
 		JPanel p = new JPanel(new GridBagLayout());
 		p.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		GridBagConstraints c = new GridBagConstraints();
 
-		c.gridx = 0; c.gridy = 0; c.gridwidth = 2; c.insets = new Insets(10, 10, 10, 10);
+		c.gridx = 0; c.gridy = 0; c.gridwidth = 2; c.insets = new Insets(10, 10, 5, 10);
 		JLabel lbl = new JLabel("<html>Send this PM to <b>" + playerName + "</b>:</html>");
 		lbl.setForeground(Color.WHITE);
 		p.add(lbl, c);
 
-		c.gridy = 1; c.insets = new Insets(5, 10, 10, 10);
+		c.gridy = 1; c.insets = new Insets(0, 10, 10, 10);
+		JLabel hint = new JLabel("<html>Click <b>Copy Message</b>, then PM them in-game and press <b>Ctrl+V</b> to paste.</html>");
+		hint.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		hint.setFont(hint.getFont().deriveFont(Font.PLAIN, 11f));
+		p.add(hint, c);
+
+		c.gridy = 2; c.insets = new Insets(5, 10, 10, 10);
 		JTextField msgField = new JTextField(inviteMessage);
 		msgField.setPreferredSize(new Dimension(350, 25));
 		msgField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
@@ -675,7 +690,7 @@ public class LendingTrackerPlugin extends Plugin
 		msgField.selectAll();
 		p.add(msgField, c);
 
-		c.gridy = 2; c.gridwidth = 1; c.insets = new Insets(10, 10, 10, 5);
+		c.gridy = 3; c.gridwidth = 1; c.insets = new Insets(10, 10, 10, 5);
 		JButton copyBtn = new JButton("Copy Message");
 		copyBtn.addActionListener(ev ->
 		{
@@ -837,6 +852,7 @@ public class LendingTrackerPlugin extends Plugin
 	public DataService getDataService() { return dataService; }
 	public GroupService getGroupService() { return groupService; }
 	public ProofScreenshot getProofScreenshot() { return proofScreenshot; }
+	public boolean isRelaySyncConnected() { return relaySyncService != null && relaySyncService.isConnected(); }
 
 	@Provides
 	LendingTrackerConfig provideConfig(ConfigManager configManager)
