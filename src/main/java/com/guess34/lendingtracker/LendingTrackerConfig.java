@@ -134,7 +134,8 @@ public interface LendingTrackerConfig extends Config
 	@ConfigItem(
 		keyName = "enableRelaySync",
 		name = "Enable Cloud Sync",
-		description = "Sync group data between members on different computers via relay server. Warning: This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers.",
+		description = "Sync group data between members on different computers via relay server",
+		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers.",
 		position = 0,
 		section = syncSection
 	)
@@ -146,7 +147,7 @@ public interface LendingTrackerConfig extends Config
 	@ConfigItem(
 		keyName = "relayServerUrl",
 		name = "Relay Server URL",
-		description = "URL of the sync relay server (leave default unless self-hosting). Warning: This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers.",
+		description = "URL of the sync relay server (leave default unless self-hosting)",
 		position = 1,
 		section = syncSection
 	)

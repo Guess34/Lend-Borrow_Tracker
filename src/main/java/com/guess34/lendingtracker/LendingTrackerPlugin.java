@@ -172,8 +172,7 @@ public class LendingTrackerPlugin extends Plugin
 		if (target == null || target.isEmpty()) { return; }
 
 		if (event.getOption().equals("Examine")
-			&& (event.getType() == MenuAction.EXAMINE_ITEM.getId()
-				|| event.getType() == MenuAction.EXAMINE_ITEM_GROUND.getId()))
+			&& event.getType() == MenuAction.EXAMINE_ITEM.getId())
 		{
 			addMenuEntry("Add to Lending List", event);
 		}
