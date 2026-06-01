@@ -34,6 +34,14 @@ public class RelaySyncService
 	private static final String HMAC_ALGORITHM = "HmacSHA256";
 	// ADDED: Max age for sync messages to prevent replay attacks (5 minutes)
 	private static final long MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
+	// Keepalive cadence: ping ~every 12 min, never sooner than 2 min apart
+	private static final long KEEPALIVE_INTERVAL_MS = 12 * 60 * 1000;
+	private static final long KEEPALIVE_MIN_DELAY_MS = 2 * 60 * 1000;
+	// Render free tier takes 30-60s to wake from spindown — shared OkHttpClient's
+	// default 10s timeout would give up before the server responds, so the
+	// REST client used for relay calls needs its own longer timeouts.
+	private static final long REST_CONNECT_TIMEOUT_S = 30;
+	private static final long REST_READ_TIMEOUT_S = 60;
 
 	@Inject private OkHttpClient httpClient;
 	@Inject private Gson gson;
@@ -48,8 +56,11 @@ public class RelaySyncService
 	private volatile boolean intentionalClose = false;
 	private long reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 	private ScheduledExecutorService reconnectExecutor;
+	private ScheduledExecutorService keepaliveExecutor;
+	private volatile OkHttpClient restClient;
 	private Consumer<GroupService.SyncEvent> onEventReceived;
 	private Consumer<Boolean> onConnectionChanged;
+	private java.util.function.BiConsumer<String, String> onStateReceived; // (groupJson, dataJson)
 
 	// --- Connection Lifecycle ---
 
@@ -333,7 +344,13 @@ public class RelaySyncService
 	public void publishInviteCode(String code, String groupId, String groupJson)
 	{
 		String baseUrl = getRestBaseUrl();
-		if (baseUrl == null) return;
+		if (baseUrl == null)
+		{
+			log.warn("Cannot publish invite code: relay URL is not configured");
+			return;
+		}
+
+		log.info("Publishing invite code {} for group {} to relay at {}", code, groupId, baseUrl);
 
 		JsonObject body = new JsonObject();
 		body.addProperty("code", code);
@@ -346,7 +363,7 @@ public class RelaySyncService
 			.post(requestBody)
 			.build();
 
-		httpClient.newCall(request).enqueue(new Callback()
+		getRestClient().newCall(request).enqueue(new Callback()
 		{
 			@Override
 			public void onFailure(Call call, java.io.IOException e)
@@ -357,35 +374,152 @@ public class RelaySyncService
 			@Override
 			public void onResponse(Call call, Response response)
 			{
+				if (response.isSuccessful())
+				{
+					log.info("Invite code {} published to relay successfully", code);
+				}
+				else
+				{
+					log.warn("Relay returned {} when publishing invite code {}", response.code(), code);
+				}
 				response.close();
 			}
 		});
 	}
 
-	public String lookupInviteCode(String code)
+	/**
+	 * Publish an invite code to the relay SYNCHRONOUSLY, retrying through a Render cold-start.
+	 * Returns true only once the relay confirms it stored the code (HTTP 2xx).
+	 *
+	 * The fire-and-forget {@link #publishInviteCode} could silently fail against a sleeping
+	 * server, leaving the owner sharing a code that was never stored - which is exactly why
+	 * a freshly generated code could come back "invalid/expired" for a joiner seconds later.
+	 * Code generation now uses this and warns the owner if the code did not land.
+	 * Blocking - callers must run it off the EDT.
+	 */
+	public boolean publishInviteBlocking(String code, String groupId, String groupJson)
 	{
 		String baseUrl = getRestBaseUrl();
-		if (baseUrl == null) return null;
+		if (baseUrl == null)
+		{
+			log.warn("Cannot publish invite code: relay URL is not configured");
+			return false;
+		}
+
+		JsonObject body = new JsonObject();
+		body.addProperty("code", code);
+		body.addProperty("groupId", groupId);
+		body.addProperty("groupJson", groupJson);
+		RequestBody requestBody = RequestBody.create(JSON_MEDIA, body.toString());
+		Request request = new Request.Builder()
+			.url(baseUrl + "/api/invite")
+			.post(requestBody)
+			.build();
+
+		int maxAttempts = 3;
+		for (int attempt = 1; attempt <= maxAttempts; attempt++)
+		{
+			try (Response response = getRestClient().newCall(request).execute())
+			{
+				if (response.isSuccessful())
+				{
+					log.info("Invite code {} published to relay (attempt {})", code, attempt);
+					return true;
+				}
+				log.warn("Publish attempt {} for code {} got HTTP {}", attempt, code, response.code());
+			}
+			catch (Exception e)
+			{
+				log.warn("Publish attempt {} for code {} failed: {}", attempt, code, e.getMessage());
+			}
+
+			// Brief backoff before retrying - the relay may still be cold-starting
+			if (attempt < maxAttempts)
+			{
+				try { Thread.sleep(2500); }
+				catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Outcome of a relay invite-code lookup.
+	 * FOUND       - code exists, groupJson populated
+	 * NOT_FOUND   - relay responded 404 (code invalid/expired/consumed)
+	 * UNREACHABLE - relay not configured, timed out, or returned a server error
+	 *               (e.g. Render cold-start exceeded the timeout) - worth retrying
+	 */
+	public enum InviteStatus { FOUND, NOT_FOUND, UNREACHABLE }
+
+	public static final class InviteLookupResult
+	{
+		public final InviteStatus status;
+		public final String groupJson;
+
+		public InviteLookupResult(InviteStatus status, String groupJson)
+		{
+			this.status = status;
+			this.groupJson = groupJson;
+		}
+	}
+
+	/**
+	 * Look up an invite code on the relay, distinguishing "not found" from "couldn't reach
+	 * the server". The old String-returning lookupInviteCode collapsed both into null, so a
+	 * cold-start timeout looked identical to a genuinely invalid code.
+	 */
+	public InviteLookupResult lookupInvite(String code)
+	{
+		String baseUrl = getRestBaseUrl();
+		if (baseUrl == null)
+		{
+			log.warn("Cannot lookup invite code: relay URL is not configured");
+			return new InviteLookupResult(InviteStatus.UNREACHABLE, null);
+		}
+
+		log.info("Looking up invite code {} from relay at {}", code, baseUrl);
 
 		Request request = new Request.Builder()
 			.url(baseUrl + "/api/invite/" + code)
 			.get()
 			.build();
 
-		try (Response response = httpClient.newCall(request).execute())
+		try (Response response = getRestClient().newCall(request).execute())
 		{
+			log.info("Relay returned {} for invite code lookup {}", response.code(), code);
 			if (response.isSuccessful() && response.body() != null)
 			{
 				String responseBody = response.body().string();
 				JsonObject json = gson.fromJson(responseBody, JsonObject.class);
-				return json != null && json.has("groupJson") ? json.get("groupJson").getAsString() : null;
+				String groupJson = json != null && json.has("groupJson")
+					? json.get("groupJson").getAsString() : null;
+				return groupJson != null
+					? new InviteLookupResult(InviteStatus.FOUND, groupJson)
+					: new InviteLookupResult(InviteStatus.NOT_FOUND, null);
 			}
+			if (response.code() == 404)
+			{
+				return new InviteLookupResult(InviteStatus.NOT_FOUND, null);
+			}
+			// 5xx / unexpected status - treat as transient so the user is told to retry
+			return new InviteLookupResult(InviteStatus.UNREACHABLE, null);
 		}
 		catch (Exception e)
 		{
 			log.warn("Failed to lookup invite code from relay: {}", e.getMessage());
+			return new InviteLookupResult(InviteStatus.UNREACHABLE, null);
 		}
-		return null;
+	}
+
+	/**
+	 * @deprecated Use {@link #lookupInvite(String)} which distinguishes not-found from
+	 * unreachable. Retained for any callers that only need the group JSON.
+	 */
+	@Deprecated
+	public String lookupInviteCode(String code)
+	{
+		return lookupInvite(code).groupJson;
 	}
 
 	public void consumeInviteCode(String code)
@@ -398,7 +532,7 @@ public class RelaySyncService
 			.delete()
 			.build();
 
-		httpClient.newCall(request).enqueue(new Callback()
+		getRestClient().newCall(request).enqueue(new Callback()
 		{
 			@Override
 			public void onFailure(Call call, java.io.IOException e)
@@ -414,6 +548,27 @@ public class RelaySyncService
 		});
 	}
 
+	// --- REST: Group State (catch-up sync) ---
+
+	/**
+	 * Push the latest group + data state to the relay so offline members can catch up.
+	 */
+	public void publishState(String groupId, String groupJson, String dataJson)
+	{
+		if (!connected || webSocket == null || groupId == null) return;
+
+		JsonObject msg = new JsonObject();
+		msg.addProperty("type", "state");
+		msg.addProperty("groupId", groupId);
+		msg.addProperty("groupJson", groupJson);
+		if (dataJson != null)
+		{
+			msg.addProperty("dataJson", dataJson);
+		}
+		webSocket.send(gson.toJson(msg));
+		log.debug("Published group state to relay for group {}", groupId);
+	}
+
 	// --- Callbacks ---
 
 	public void setOnEventReceived(Consumer<GroupService.SyncEvent> callback)
@@ -426,6 +581,94 @@ public class RelaySyncService
 		this.onConnectionChanged = callback;
 	}
 
+	public void setOnStateReceived(java.util.function.BiConsumer<String, String> callback)
+	{
+		this.onStateReceived = callback;
+	}
+
+	// --- Keepalive ---
+	// Prevents Render free-tier spindown (15 min idle) which wipes the relay's
+	// ephemeral filesystem and loses all invite codes. Each client with cloud
+	// sync enabled pings ~every 12 min while the plugin is running. If the
+	// server reports another client pinged recently, this client aligns its
+	// next ping with that cycle instead of starting its own — so multiple
+	// online members act like one coordinated pinger.
+
+	public void startKeepalive()
+	{
+		if (config == null || !config.enableRelaySync()) return;
+		if (keepaliveExecutor != null && !keepaliveExecutor.isShutdown()) return;
+
+		keepaliveExecutor = Executors.newSingleThreadScheduledExecutor();
+		// Immediate first ping wakes the server if it's spun down.
+		keepaliveExecutor.execute(this::sendKeepalive);
+	}
+
+	public void stopKeepalive()
+	{
+		if (keepaliveExecutor != null && !keepaliveExecutor.isShutdown())
+		{
+			keepaliveExecutor.shutdownNow();
+		}
+		keepaliveExecutor = null;
+	}
+
+	private void sendKeepalive()
+	{
+		String baseUrl = getRestBaseUrl();
+		if (baseUrl == null) return;
+
+		Request request = new Request.Builder()
+			.url(baseUrl + "/keepalive")
+			.get()
+			.build();
+
+		long nextDelayMs = KEEPALIVE_INTERVAL_MS;
+
+		try (Response response = getRestClient().newCall(request).execute())
+		{
+			if (response.isSuccessful() && response.body() != null)
+			{
+				JsonObject json = gson.fromJson(response.body().string(), JsonObject.class);
+				if (json != null && json.has("lastPingAgoSeconds"))
+				{
+					long agoSec = json.get("lastPingAgoSeconds").getAsLong();
+					// Another client pinged recently — align with their 12-min cycle
+					// instead of starting our own. Floor at 2 min so we don't spam.
+					if (agoSec >= 0 && agoSec < 600)
+					{
+						nextDelayMs = Math.max(KEEPALIVE_MIN_DELAY_MS,
+							(12L * 60 - agoSec) * 1000L);
+					}
+				}
+				log.debug("Keepalive OK, next ping in {}s", nextDelayMs / 1000);
+			}
+			else
+			{
+				log.debug("Keepalive got HTTP {}, retry in {}s",
+					response.code(), nextDelayMs / 1000);
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("Keepalive failed ({}), retry in {}s",
+				e.getMessage(), nextDelayMs / 1000);
+		}
+
+		scheduleNextKeepalive(nextDelayMs);
+	}
+
+	private void scheduleNextKeepalive(long delayMs)
+	{
+		ScheduledExecutorService exec = keepaliveExecutor;
+		if (exec == null || exec.isShutdown()) return;
+		try
+		{
+			exec.schedule(this::sendKeepalive, delayMs, TimeUnit.MILLISECONDS);
+		}
+		catch (Exception ignored) { }
+	}
+
 	// --- Internal Helpers ---
 
 	private String getRestBaseUrl()
@@ -434,6 +677,29 @@ public class RelaySyncService
 		String wsUrl = config.relayServerUrl();
 		if (wsUrl == null || wsUrl.isEmpty()) return null;
 		return wsUrl.replace("wss://", "https://").replace("ws://", "http://");
+	}
+
+	/**
+	 * Dedicated OkHttp client with longer timeouts for relay REST calls.
+	 * The shared client's 10s default isn't enough to survive Render cold-start.
+	 */
+	private OkHttpClient getRestClient()
+	{
+		OkHttpClient existing = restClient;
+		if (existing != null) return existing;
+
+		synchronized (this)
+		{
+			if (restClient == null)
+			{
+				restClient = httpClient.newBuilder()
+					.connectTimeout(REST_CONNECT_TIMEOUT_S, TimeUnit.SECONDS)
+					.readTimeout(REST_READ_TIMEOUT_S, TimeUnit.SECONDS)
+					.writeTimeout(REST_CONNECT_TIMEOUT_S, TimeUnit.SECONDS)
+					.build();
+			}
+			return restClient;
+		}
 	}
 
 	private void scheduleReconnect()
@@ -531,6 +797,19 @@ public class RelaySyncService
 					if (event != null && onEventReceived != null)
 					{
 						onEventReceived.accept(event);
+					}
+				}
+				else if ("state".equals(type))
+				{
+					// Catch-up state from relay (sent when joining a room)
+					String groupJson = msg.has("groupJson") ? msg.get("groupJson").getAsString() : null;
+					String dataJson = msg.has("dataJson") && !msg.get("dataJson").isJsonNull()
+						? msg.get("dataJson").getAsString() : null;
+					if (groupJson != null && onStateReceived != null)
+					{
+						log.info("Received catch-up state from relay for group {}",
+							msg.has("groupId") ? msg.get("groupId").getAsString() : "unknown");
+						onStateReceived.accept(groupJson, dataJson);
 					}
 				}
 			}

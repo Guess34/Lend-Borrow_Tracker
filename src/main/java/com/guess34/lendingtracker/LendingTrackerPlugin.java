@@ -10,6 +10,7 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.eventbus.EventBus;
 
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.RuneScapeProfileChanged;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.Notifier;
@@ -108,10 +109,15 @@ public class LendingTrackerPlugin extends Plugin
 
 		// Register relay sync callbacks for cross-machine sync
 		relaySyncService.setOnEventReceived(event -> groupService.handleRelayEvent(event));
+		relaySyncService.setOnStateReceived((groupJson, dataJson) -> groupService.handleRelayState(groupJson, dataJson));
 		relaySyncService.setOnConnectionChanged(status ->
 		{
 			if (newPanel != null) { newPanel.updateConnectionStatus(status); }
 		});
+
+		// Keep the Render free-tier relay warm so invite codes don't get
+		// wiped by spindown between when the owner creates one and a member uses it.
+		relaySyncService.startKeepalive();
 
 		if (client.getGameState() == GameState.LOGGED_IN
 			&& client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
@@ -132,6 +138,7 @@ public class LendingTrackerPlugin extends Plugin
 	@Override
 	protected void shutDown() throws Exception
 	{
+		relaySyncService.stopKeepalive();
 		groupService.stopSync();
 		if (navButton != null) { clientToolbar.removeNavigation(navButton); }
 		if (localDataSyncService != null)
@@ -182,7 +189,7 @@ public class LendingTrackerPlugin extends Plugin
 			addMenuEntry("Lend to Group", event);
 		}
 
-		if (isPlayerMenuAction(event.getType()) && canCurrentUserInvite())
+		if (event.getOption().equals("Report") && canCurrentUserInvite())
 		{
 			addMenuEntry("Invite to Lending Group", event);
 		}
@@ -259,6 +266,44 @@ public class LendingTrackerPlugin extends Plugin
 			&& client.getVarbitValue(Varbits.IN_WILDERNESS) == 1)
 		{
 			checkBorrowedItemsInWilderness();
+		}
+	}
+
+	// FIXED: React to the Cloud Sync toggle at runtime. Previously startKeepalive()/connect()
+	// only ran once in startUp() (gated on enableRelaySync), so enabling Cloud Sync mid-session
+	// did nothing until a full RuneLite restart - the relay was never kept warm, it spun down,
+	// and invite codes were wiped, which is why joiners saw "invalid or expired" for valid codes.
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!"lendingtracker".equals(event.getGroup()) || !"enableRelaySync".equals(event.getKey()))
+		{
+			return;
+		}
+
+		if (config.enableRelaySync())
+		{
+			log.debug("Cloud Sync enabled - starting relay keepalive and connection");
+			relaySyncService.startKeepalive();
+
+			LendingGroup activeGroup = groupService.getActiveGroup();
+			String playerName = getCurrentPlayerName();
+			if (activeGroup != null && playerName != null)
+			{
+				// startSync handles connect + room join + HMAC secret for the active group
+				groupService.startSync(activeGroup.getId(), playerName);
+			}
+			else
+			{
+				// No active group yet - at least open the socket so a later join is instant
+				relaySyncService.connect();
+			}
+		}
+		else
+		{
+			log.debug("Cloud Sync disabled - tearing down relay keepalive and connection");
+			relaySyncService.stopKeepalive();
+			relaySyncService.disconnect();
 		}
 	}
 
@@ -778,17 +823,7 @@ public class LendingTrackerPlugin extends Plugin
 
 	// --- Helpers ---
 
-	private boolean isPlayerMenuAction(int type)
-	{
-		return type == MenuAction.PLAYER_FIRST_OPTION.getId()
-			|| type == MenuAction.PLAYER_SECOND_OPTION.getId()
-			|| type == MenuAction.PLAYER_THIRD_OPTION.getId()
-			|| type == MenuAction.PLAYER_FOURTH_OPTION.getId()
-			|| type == MenuAction.PLAYER_FIFTH_OPTION.getId()
-			|| type == MenuAction.PLAYER_SIXTH_OPTION.getId()
-			|| type == MenuAction.PLAYER_SEVENTH_OPTION.getId()
-			|| type == MenuAction.PLAYER_EIGHTH_OPTION.getId();
-	}
+
 
 	private boolean canCurrentUserInvite()
 	{
@@ -852,6 +887,7 @@ public class LendingTrackerPlugin extends Plugin
 	public GroupService getGroupService() { return groupService; }
 	public ProofScreenshot getProofScreenshot() { return proofScreenshot; }
 	public boolean isRelaySyncConnected() { return relaySyncService != null && relaySyncService.isConnected(); }
+	public LendingTrackerConfig getConfig() { return config; }
 
 	@Provides
 	LendingTrackerConfig provideConfig(ConfigManager configManager)

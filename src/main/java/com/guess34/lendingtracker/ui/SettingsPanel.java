@@ -342,13 +342,68 @@ public class SettingsPanel extends JPanel
 				"Permission Denied", JOptionPane.WARNING_MESSAGE);
 			return;
 		}
-		String code = groupService.generateSingleUseInviteCode(g.getId());
-		if (code != null)
+		final String groupId = g.getId();
+		// Publishing to the relay is a blocking network call (with cold-start retries), so run it
+		// off the EDT and only present the code once we know whether it actually reached the server.
+		generateCodeButton.setEnabled(false);
+		final String origText = generateCodeButton.getText();
+		generateCodeButton.setText("Publishing...");
+
+		new SwingWorker<GroupService.InviteCodeResult, Void>()
 		{
-			inviteCodeLabel.setText(code);
-			inviteCodeLabel.setForeground(ColorScheme.BRAND_ORANGE);
-			copyCodeButton.setEnabled(true);
-		}
+			@Override
+			protected GroupService.InviteCodeResult doInBackground()
+			{
+				return groupService.generateAndPublishInviteCode(groupId);
+			}
+
+			@Override
+			protected void done()
+			{
+				generateCodeButton.setText(origText);
+				generateCodeButton.setEnabled(true);
+
+				GroupService.InviteCodeResult r;
+				try
+				{
+					r = get();
+				}
+				catch (Exception e)
+				{
+					log.error("Failed to generate invite code", e);
+					JOptionPane.showMessageDialog(SettingsPanel.this,
+						"Failed to generate code: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+					return;
+				}
+
+				if (r == null || r.code == null)
+				{
+					return;
+				}
+
+				inviteCodeLabel.setText(r.code);
+				inviteCodeLabel.setForeground(ColorScheme.BRAND_ORANGE);
+				copyCodeButton.setEnabled(true);
+
+				if (!r.syncEnabled)
+				{
+					JOptionPane.showMessageDialog(SettingsPanel.this,
+						"Code generated, but Cloud Sync is OFF.\n\n"
+							+ "This code only works for players on THIS computer. Turn on Settings -> Sync ->\n"
+							+ "Enable Cloud Sync (the joining player needs it on too), then generate a fresh code.",
+						"Cloud Sync Disabled", JOptionPane.WARNING_MESSAGE);
+				}
+				else if (!r.publishedToRelay)
+				{
+					JOptionPane.showMessageDialog(SettingsPanel.this,
+						"Code generated, but it could NOT be published to the sync server (it may still be\n"
+							+ "waking up). DON'T share this code yet - wait ~30 seconds and click Generate again\n"
+							+ "to get a code that works across computers.",
+						"Not Published Yet", JOptionPane.WARNING_MESSAGE);
+				}
+				// Published OK -> the code is live on the relay and safe to share.
+			}
+		}.execute();
 	}
 
 	private void copyInviteCode()

@@ -620,6 +620,44 @@ public class DataService
 	}
 
 	/**
+	 * Get the full data snapshot for a group as a JSON string.
+	 * Used for relay state sync so offline members can catch up.
+	 */
+	public String getGroupDataSnapshot(String groupId)
+	{
+		if (groupId == null) return null;
+		Map<String, Object> snapshot = new LinkedHashMap<>();
+		snapshot.put("lent", groupLent.getOrDefault(groupId, new HashMap<>()));
+		snapshot.put("borrowed", groupBorrowed.getOrDefault(groupId, new HashMap<>()));
+		snapshot.put("available", groupAvailable.getOrDefault(groupId, new HashMap<>()));
+		return gson.toJson(snapshot);
+	}
+
+	/**
+	 * Load group data from a JSON snapshot string (from relay state sync).
+	 * Merges remote data into local state.
+	 */
+	public void loadGroupDataFromSnapshot(String groupId, String snapshotJson)
+	{
+		if (groupId == null || snapshotJson == null || snapshotJson.isEmpty()) return;
+		try
+		{
+			@SuppressWarnings("unchecked")
+			Map<String, Map<String, List<Map<String, Object>>>> snapshot = gson.fromJson(snapshotJson, Map.class);
+			loadGroupEntries(snapshot.get("available"), groupId, groupAvailable);
+			loadGroupEntries(snapshot.get("lent"), groupId, groupLent);
+			loadGroupEntries(snapshot.get("borrowed"), groupId, groupBorrowed);
+			// Also persist locally so data survives restarts
+			persist(groupId, "relay-sync");
+			log.info("Loaded group data from relay snapshot for group {}", groupId);
+		}
+		catch (Exception e)
+		{
+			log.error("Failed to load group data from relay snapshot: {}", e.getMessage(), e);
+		}
+	}
+
+	/**
 	 * Load group-specific data from storage.
 	 * Called when switching groups to restore previously saved items.
 	 * Also loads item sets for the group.

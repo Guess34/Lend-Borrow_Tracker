@@ -307,32 +307,70 @@ public class GroupControlPanel extends JPanel
 
 	private void handleJoinWithCode(String playerName)
 	{
-		String code = JOptionPane.showInputDialog(this,
+		String input = JOptionPane.showInputDialog(this,
 			"Enter invite code:", "Join with Invite Code", JOptionPane.PLAIN_MESSAGE);
-		if (code == null || code.trim().isEmpty()) return;
+		if (input == null || input.trim().isEmpty()) return;
 
-		try
+		final String code = input.trim();
+
+		// The relay lookup is a blocking network call that can take up to a minute while a
+		// spun-down Render server cold-starts. Run it off the EDT so the client doesn't freeze,
+		// and give the button some "working" feedback in the meantime.
+		joinGroupButton.setEnabled(false);
+		final String originalText = joinGroupButton.getText();
+		joinGroupButton.setText("Joining...");
+
+		new SwingWorker<GroupService.JoinResult, Void>()
 		{
-			String groupId = groupService.useInviteCode(code.trim(), playerName);
-			if (groupId != null)
+			@Override
+			protected GroupService.JoinResult doInBackground()
 			{
-				refresh();
-				eventBus.post(new GroupChangedEvent(groupId));
-				JOptionPane.showMessageDialog(this,
-					String.format("Successfully joined group '%s'!",
-						groupService.getGroupNameById(groupId)),
-					"Joined Group", JOptionPane.INFORMATION_MESSAGE);
+				return groupService.useInviteCode(code, playerName);
 			}
-			else
+
+			@Override
+			protected void done()
 			{
-				showError("Invalid or expired invite code. Ask a group admin for a new one.");
+				joinGroupButton.setText(originalText);
+				joinGroupButton.setEnabled(true);
+
+				GroupService.JoinResult result;
+				try
+				{
+					result = get();
+				}
+				catch (Exception e)
+				{
+					log.error("Failed to join with invite code", e);
+					showError("Failed to join group: " + e.getMessage());
+					return;
+				}
+
+				switch (result.status)
+				{
+					case JOINED:
+						refresh();
+						eventBus.post(new GroupChangedEvent(result.groupId));
+						JOptionPane.showMessageDialog(GroupControlPanel.this,
+							String.format("Successfully joined group '%s'!",
+								groupService.getGroupNameById(result.groupId)),
+							"Joined Group", JOptionPane.INFORMATION_MESSAGE);
+						break;
+					case SERVER_UNREACHABLE:
+						showError("Couldn't reach the sync server - it may be waking up "
+							+ "(this can take 30-60s on first use). Please try the code again in a moment.");
+						break;
+					case SYNC_DISABLED:
+						showError("Cloud Sync is off, so invite codes from other computers can't be checked.\n"
+							+ "Enable it in Settings -> Sync -> Enable Cloud Sync, then try the code again.");
+						break;
+					case INVALID_CODE:
+					default:
+						showError("Invalid or expired invite code. Ask a group admin for a new one.");
+						break;
+				}
 			}
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to join with invite code", e);
-			showError("Failed to join group: " + e.getMessage());
-		}
+		}.execute();
 	}
 
 	private void showError(String message)
