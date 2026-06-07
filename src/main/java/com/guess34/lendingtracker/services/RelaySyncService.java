@@ -432,13 +432,9 @@ public class RelaySyncService
 			{
 				log.warn("Publish attempt {} for code {} failed: {}", attempt, code, e.getMessage());
 			}
-
-			// Brief backoff before retrying - the relay may still be cold-starting
-			if (attempt < maxAttempts)
-			{
-				try { Thread.sleep(2500); }
-				catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
-			}
+			// No delay between attempts: Thread.sleep is not permitted in Plugin Hub plugins, and
+			// the REST client's long read timeout already holds the request open through a Render
+			// cold-start, so the server's eventual 200 is normally received on the first attempt.
 		}
 		return false;
 	}
