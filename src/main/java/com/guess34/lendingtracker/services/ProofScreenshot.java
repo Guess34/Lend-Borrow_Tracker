@@ -3,18 +3,19 @@ package com.guess34.lendingtracker.services;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.util.Date;
+import java.util.concurrent.ScheduledExecutorService;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.imageio.ImageIO;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
+import net.runelite.client.ui.DrawManager;
+import net.runelite.client.util.LinkBrowser;
 import com.guess34.lendingtracker.LendingTrackerConfig;
 import com.guess34.lendingtracker.model.LendingEntry;
 
@@ -26,22 +27,20 @@ import com.guess34.lendingtracker.model.LendingEntry;
 @Singleton
 public class ProofScreenshot
 {
-	private final Client client;
-
 	@Inject
 	private LendingTrackerConfig config;
+
+	@Inject
+	private DrawManager drawManager;
+
+	@Inject
+	private ScheduledExecutorService executor;
 
 	private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
 	private static final SimpleDateFormat DISPLAY_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
 	// Base directory for all screenshots (inside .runelite per Plugin Hub rules)
 	private static final Path BASE_DIR = Paths.get(System.getProperty("user.home"), ".runelite", "lending-tracker", "proof");
-
-	@Inject
-	public ProofScreenshot(Client client)
-	{
-		this.client = client;
-	}
 
 	/**
 	 * Get the screenshot directory for a specific user and group
@@ -65,14 +64,7 @@ public class ProofScreenshot
 			Path dir = getScreenshotDirectory(username, groupName);
 			Files.createDirectories(dir);
 
-			if (Desktop.isDesktopSupported())
-			{
-				Desktop.getDesktop().open(dir.toFile());
-			}
-			else
-			{
-				log.warn("Desktop not supported - cannot open folder");
-			}
+			LinkBrowser.open(dir.toString());
 		}
 		catch (Exception e)
 		{
@@ -83,45 +75,50 @@ public class ProofScreenshot
 	/**
 	 * Capture screenshot during second accept screen
 	 */
-	public File captureSecondAcceptScreen(String username, String groupName, String tradePartner,
+	public void captureSecondAcceptScreen(String username, String groupName, String tradePartner,
 										   String eventType, LendingEntry entry)
 	{
-		String phase = "second_accept";
-		return captureTradeScreenshot(username, groupName, tradePartner, eventType, phase, entry);
+		captureTradeScreenshot(username, groupName, tradePartner, eventType, "second_accept", entry);
 	}
 
 	/**
 	 * Capture screenshot after trade completion
 	 */
-	public File captureTradeCompletion(String username, String groupName, String tradePartner,
+	public void captureTradeCompletion(String username, String groupName, String tradePartner,
 										String eventType, LendingEntry entry)
 	{
-		String phase = "completed";
-		return captureTradeScreenshot(username, groupName, tradePartner, eventType, phase, entry);
+		captureTradeScreenshot(username, groupName, tradePartner, eventType, "completed", entry);
 	}
 
 	/**
 	 * Capture screenshot for return transaction
 	 */
-	public File captureReturnScreenshot(String username, String groupName, String returnedBy,
+	public void captureReturnScreenshot(String username, String groupName, String returnedBy,
 										 String phase, LendingEntry entry)
 	{
-		return captureTradeScreenshot(username, groupName, returnedBy, "RETURN", phase, entry);
+		captureTradeScreenshot(username, groupName, returnedBy, "RETURN", phase, entry);
 	}
 
-	/**
-	 * Internal method to capture trade screenshots with full context
-	 */
-	private File captureTradeScreenshot(String username, String groupName, String tradePartner,
+	// Capture the game canvas with DrawManager, then overlay + save off-thread
+	private void captureTradeScreenshot(String username, String groupName, String tradePartner,
 										 String eventType, String phase, LendingEntry entry)
+	{
+		drawManager.requestNextFrameListener(image ->
+			executor.submit(() ->
+				saveScreenshot(image, username, groupName, tradePartner, eventType, phase, entry)));
+	}
+
+	// Overlay + write the PNG, off the client thread
+	private void saveScreenshot(Image image, String username, String groupName, String tradePartner,
+								 String eventType, String phase, LendingEntry entry)
 	{
 		try
 		{
-			BufferedImage screenshot = captureGameWindow();
+			BufferedImage screenshot = toBufferedImage(image);
 			if (screenshot == null)
 			{
-				log.warn("Failed to capture game window");
-				return null;
+				log.warn("Failed to capture game frame");
+				return;
 			}
 
 			// Add overlay if enabled
@@ -145,31 +142,25 @@ public class ProofScreenshot
 
 			File outFile = outDir.resolve(filename).toFile();
 			ImageIO.write(screenshot, "png", outFile);
-
-			return outFile;
 		}
 		catch (Exception e)
 		{
-			log.error("Failed to capture proof screenshot: {}", e.getMessage());
-			return null;
+			log.error("Failed to save proof screenshot: {}", e.getMessage());
 		}
 	}
 
-	/**
-	 * Capture the game window
-	 */
-	private BufferedImage captureGameWindow()
+	private BufferedImage toBufferedImage(Image image)
 	{
-		try
+		if (image == null)
 		{
-			Rectangle rect = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize());
-			return new Robot().createScreenCapture(rect);
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to capture screen: {}", e.getMessage());
 			return null;
 		}
+		BufferedImage buffered = new BufferedImage(
+			image.getWidth(null), image.getHeight(null), BufferedImage.TYPE_INT_ARGB);
+		Graphics graphics = buffered.getGraphics();
+		graphics.drawImage(image, 0, 0, null);
+		graphics.dispose();
+		return buffered;
 	}
 
 	/**

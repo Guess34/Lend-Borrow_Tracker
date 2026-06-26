@@ -7,6 +7,7 @@ import com.guess34.lendingtracker.model.LendingGroup;
 import com.guess34.lendingtracker.services.GroupService;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
+import net.runelite.client.util.LinkBrowser;
 
 import javax.swing.*;
 import javax.swing.border.CompoundBorder;
@@ -14,7 +15,6 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.border.LineBorder;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.net.URI;
 import java.util.List;
 
 @Slf4j
@@ -190,7 +190,7 @@ public class SettingsPanel extends JPanel
 		btn.addActionListener(e -> {
 			try
 			{
-				Desktop.getDesktop().browse(new URI("https://github.com/Guess34/Lend-Borrow_Tracker/issues"));
+				LinkBrowser.browse("https://github.com/Guess34/Lend-Borrow_Tracker/issues");
 			}
 			catch (Exception ex)
 			{
