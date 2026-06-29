@@ -91,6 +91,8 @@ public class RelaySyncService
 
 	private void doConnect(String url)
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		try
 		{
 			log.debug("Connecting to relay: {}", url);
@@ -139,6 +141,8 @@ public class RelaySyncService
 	 */
 	public void joinRoom(String groupId, String playerName, String syncSecret)
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		this.currentGroupId = groupId;
 		this.currentPlayerName = playerName;
 		this.currentSyncSecret = syncSecret;
@@ -160,6 +164,8 @@ public class RelaySyncService
 
 	private void sendJoinMessage(String groupId, String playerName)
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		WebSocket ws = webSocket;
 		if (ws == null) return;
 
@@ -172,6 +178,8 @@ public class RelaySyncService
 
 	public void leaveRoom(String groupId)
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		if (connected && webSocket != null && groupId != null)
 		{
 			JsonObject msg = new JsonObject();
@@ -195,6 +203,7 @@ public class RelaySyncService
 	 */
 	public void sendEvent(String groupId, GroupService.SyncEvent event)
 	{
+		if (config == null || !config.enableRelaySync()) return;
 		if (!connected || webSocket == null || groupId == null) return;
 
 		JsonObject eventJson = gson.toJsonTree(event).getAsJsonObject();
@@ -343,6 +352,8 @@ public class RelaySyncService
 
 	public void publishInviteCode(String code, String groupId, String groupJson)
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		String baseUrl = getRestBaseUrl();
 		if (baseUrl == null)
 		{
@@ -399,6 +410,8 @@ public class RelaySyncService
 	 */
 	public boolean publishInviteBlocking(String code, String groupId, String groupJson)
 	{
+		if (config == null || !config.enableRelaySync()) return false;
+
 		String baseUrl = getRestBaseUrl();
 		if (baseUrl == null)
 		{
@@ -467,6 +480,8 @@ public class RelaySyncService
 	 */
 	public InviteLookupResult lookupInvite(String code)
 	{
+		if (config == null || !config.enableRelaySync()) return new InviteLookupResult(InviteStatus.UNREACHABLE, null);
+
 		String baseUrl = getRestBaseUrl();
 		if (baseUrl == null)
 		{
@@ -520,6 +535,8 @@ public class RelaySyncService
 
 	public void consumeInviteCode(String code)
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		String baseUrl = getRestBaseUrl();
 		if (baseUrl == null) return;
 
@@ -551,6 +568,7 @@ public class RelaySyncService
 	 */
 	public void publishState(String groupId, String groupJson, String dataJson)
 	{
+		if (config == null || !config.enableRelaySync()) return;
 		if (!connected || webSocket == null || groupId == null) return;
 
 		JsonObject msg = new JsonObject();
@@ -611,6 +629,8 @@ public class RelaySyncService
 
 	private void sendKeepalive()
 	{
+		if (config == null || !config.enableRelaySync()) return;
+
 		String baseUrl = getRestBaseUrl();
 		if (baseUrl == null) return;
 
