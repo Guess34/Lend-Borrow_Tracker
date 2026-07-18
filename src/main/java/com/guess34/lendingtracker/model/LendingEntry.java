@@ -39,6 +39,10 @@ public class LendingEntry {
     private long dueTime;
     private long returnedAt;
 
+    // Last time this row was mutated, epoch millis. Drives last-write-wins
+    // reconciliation when the same entry arrives from another client via sync.
+    private long updatedAt;
+
     // Misc
     private String notes;
 
@@ -69,6 +73,7 @@ public class LendingEntry {
         this.lendTime = other.lendTime;
         this.dueTime = other.dueTime;
         this.returnedAt = other.returnedAt;
+        this.updatedAt = other.updatedAt;
         this.notes = other.notes;
     }
 

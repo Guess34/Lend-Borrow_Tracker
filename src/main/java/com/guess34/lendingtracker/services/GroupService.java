@@ -61,7 +61,7 @@ public class GroupService
 	@Inject private LendingTrackerConfig config;
 
 	// --- Group State ---
-	private final Map<String, LendingGroup> groups = new LinkedHashMap<>();
+	private final Map<String, LendingGroup> groups = new java.util.concurrent.ConcurrentHashMap<>();
 	private String activeGroupId;
 	private String currentAccountName = null;
 
@@ -194,6 +194,7 @@ public class GroupService
 
 		GroupMember owner = new GroupMember(ownerName, "owner");
 		g.addMember(owner);
+		touchRoster(g);
 
 		groups.put(id, g);
 		activeGroupId = id;
@@ -266,6 +267,81 @@ public class GroupService
 
 	// --- Members & Roles ---
 
+	/**
+	 * Advance the roster version stamp. Call on any real change to the members
+	 * list so {@link #handleRelayState} adopts it over peers' older rosters.
+	 */
+	private void touchRoster(LendingGroup g)
+	{
+		if (g != null)
+		{
+			g.setMembersUpdatedAt(System.currentTimeMillis());
+		}
+	}
+
+	/**
+	 * Wrap a group's member list in a CopyOnWriteArrayList before it enters the
+	 * shared {@code groups} map. Gson deserializes members as a plain ArrayList,
+	 * which is not safe against the concurrent roster reads/writes sync performs.
+	 */
+	private LendingGroup ensureCowMembers(LendingGroup g)
+	{
+		if (g != null)
+		{
+			g.setMembers(new java.util.concurrent.CopyOnWriteArrayList<>(
+				g.getMembers() != null ? g.getMembers() : new ArrayList<>()));
+		}
+		return g;
+	}
+
+	/**
+	 * Union-merge a remote roster into the local group. Members present remotely
+	 * but not locally are added; when the remote roster is at least as new as the
+	 * local one, role and permission changes are adopted. Members are never
+	 * removed here — kicks propagate through the normal removeMember path, not by
+	 * letting a stale peer's roster overwrite ours.
+	 *
+	 * Builds a fresh member list and swaps it in atomically so a reader iterating
+	 * the roster on another thread never sees a torn list.
+	 */
+	private void mergeRoster(LendingGroup local, LendingGroup remote)
+	{
+		List<GroupMember> merged = new java.util.concurrent.CopyOnWriteArrayList<>(
+			local.getMembers() != null ? local.getMembers() : new ArrayList<>());
+		boolean remoteIsNewer = remote.getMembersUpdatedAt() >= local.getMembersUpdatedAt();
+
+		if (remote.getMembers() != null)
+		{
+			for (GroupMember rm : remote.getMembers())
+			{
+				GroupMember existing = merged.stream()
+					.filter(m -> m.getName().equalsIgnoreCase(rm.getName()))
+					.findFirst().orElse(null);
+				if (existing == null)
+				{
+					merged.add(rm);
+				}
+				else if (remoteIsNewer && rm.getRole() != null)
+				{
+					existing.setRole(rm.getRole());
+				}
+			}
+		}
+
+		local.setMembers(merged);
+		local.setMembersUpdatedAt(Math.max(local.getMembersUpdatedAt(), remote.getMembersUpdatedAt()));
+
+		if (remoteIsNewer)
+		{
+			local.setCoOwnerCanKick(remote.isCoOwnerCanKick());
+			local.setAdminCanKick(remote.isAdminCanKick());
+			local.setModCanKick(remote.isModCanKick());
+			local.setCoOwnerCanInvite(remote.isCoOwnerCanInvite());
+			local.setAdminCanInvite(remote.isAdminCanInvite());
+			local.setModCanInvite(remote.isModCanInvite());
+		}
+	}
+
 	public void addMember(String groupId, String name, String role)
 	{
 		LendingGroup g = groups.get(groupId);
@@ -275,6 +351,7 @@ public class GroupService
 		if (!exists)
 		{
 			g.getMembers().add(new GroupMember(name, role));
+			touchRoster(g);
 			saveGroups();
 			publishEvent(SyncEventType.MEMBER_JOINED, groupId + ":" + name, null);
 		}
@@ -285,6 +362,7 @@ public class GroupService
 		LendingGroup g = groups.get(groupId);
 		if (g == null || g.getMembers() == null) return;
 		g.getMembers().removeIf(m -> m.getName().equalsIgnoreCase(name));
+		touchRoster(g);
 		saveGroups();
 		publishEvent(SyncEventType.MEMBER_LEFT, groupId + ":" + name, null);
 	}
@@ -303,6 +381,7 @@ public class GroupService
 		boolean removed = group.getMembers().removeIf(m -> m.getName().equalsIgnoreCase(targetName));
 		if (removed)
 		{
+			touchRoster(group);
 			saveGroups();
 			publishEvent(SyncEventType.MEMBER_LEFT, groupId + ":" + targetName, null);
 		}
@@ -323,6 +402,7 @@ public class GroupService
 			if (member.getName().equalsIgnoreCase(targetName))
 			{
 				member.setRole(newRole.toLowerCase());
+				touchRoster(group);
 				saveGroups();
 				publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
 				return true;
@@ -353,6 +433,7 @@ public class GroupService
 		newOwnerMember.setRole("owner");
 		currentOwnerMember.setRole("co-owner");
 
+		touchRoster(group);
 		saveGroups();
 		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
 		return true;
@@ -596,6 +677,7 @@ public class GroupService
 				if (!group.hasMember(playerName))
 				{
 					group.addMember(new GroupMember(playerName, "member"));
+					touchRoster(group);
 				}
 
 				group.markGroupCodeUsed(playerName);
@@ -609,6 +691,7 @@ public class GroupService
 				if (!group.hasMember(playerName))
 				{
 					group.addMember(new GroupMember(playerName, "member"));
+					touchRoster(group);
 				}
 
 				group.setClanCodeUseCount(group.getClanCodeUseCount() + 1);
@@ -631,13 +714,14 @@ public class GroupService
 					if (!sharedGroup.hasMember(playerName))
 					{
 						sharedGroup.addMember(new GroupMember(playerName, "member"));
+						touchRoster(sharedGroup);
 					}
 
 					// Void the single-use code
 					sharedGroup.markGroupCodeUsed(playerName);
 
 					// Store in this player's local groups
-					groups.put(sharedGroup.getId(), sharedGroup);
+					groups.put(sharedGroup.getId(), ensureCowMembers(sharedGroup));
 					setCurrentGroupId(sharedGroup.getId());
 					saveGroups();
 
@@ -697,10 +781,11 @@ public class GroupService
 						if (!relayGroup.hasMember(playerName))
 						{
 							relayGroup.addMember(new GroupMember(playerName, "member"));
+							touchRoster(relayGroup);
 						}
 						relayGroup.markGroupCodeUsed(playerName);
 
-						groups.put(relayGroup.getId(), relayGroup);
+						groups.put(relayGroup.getId(), ensureCowMembers(relayGroup));
 						setCurrentGroupId(relayGroup.getId());
 						saveGroups();
 
@@ -796,7 +881,16 @@ public class GroupService
 
 		this.currentSyncGroupId = groupId;
 		this.currentSyncPlayerName = playerName;
-		this.lastSyncTimestamp = System.currentTimeMillis();
+		// Start from 0 so the first poll also applies events published before this
+		// session began — previously anything from before login was silently
+		// skipped, so same-machine accounts needed a relog to see each other's items.
+		this.lastSyncTimestamp = 0;
+
+		// Load this group's data from local config into memory BEFORE the catch-up
+		// fetch runs. The catch-up preserves the local player's own rows, but only
+		// ones already in memory — without this, offline additions that live only in
+		// config would be absent and get overwritten by the relay snapshot.
+		dataService.loadGroupData(groupId);
 
 		syncExecutor = Executors.newSingleThreadScheduledExecutor();
 		syncExecutor.scheduleAtFixedRate(this::pollForUpdates, SYNC_INTERVAL_MS, SYNC_INTERVAL_MS, TimeUnit.MILLISECONDS);
@@ -808,6 +902,12 @@ public class GroupService
 			LendingGroup group = groups.get(groupId);
 			String syncSecret = group != null ? group.getSyncSecret() : null;
 			relaySyncService.joinRoom(groupId, playerName, syncSecret);
+
+			// Pull the authoritative catch-up snapshot once, off the caller's thread
+			// (blocking REST call that can ride out a relay cold-start). This replaces
+			// the old ws join-catch-up push and reflects deletions made while offline.
+			final String fetchGroupId = groupId;
+			syncExecutor.execute(() -> relaySyncService.fetchStateSnapshot(fetchGroupId));
 		}
 	}
 
@@ -867,6 +967,7 @@ public class GroupService
 		event.setType(type);
 		event.setTimestamp(System.currentTimeMillis());
 		event.setPublisher(currentSyncPlayerName);
+		event.setDataId(dataId);
 
 		addEventToQueue(event);
 
@@ -912,14 +1013,19 @@ public class GroupService
 
 		String groupJson = gson.toJson(group);
 		String dataJson = dataService.getGroupDataSnapshot(groupId);
-		relaySyncService.publishState(groupId, groupJson, dataJson);
+		relaySyncService.publishState(groupId, groupJson, dataJson, currentSyncPlayerName);
 	}
 
 	/**
-	 * Handle catch-up state received from the relay when joining a room.
-	 * Merges remote group roster and data into local state.
+	 * Handle state received from the relay — either the authoritative catch-up
+	 * snapshot the joining client fetched over REST (publisher == null), or a live
+	 * broadcast pushed when another member's data changed (publisher != null).
+	 *
+	 * @param publisher player who pushed this state, or null for authoritative
+	 *                  catch-up — the data merge treats a non-null publisher as
+	 *                  authoritative for their own rows only.
 	 */
-	public void handleRelayState(String groupJson, String dataJson)
+	public void handleRelayState(String groupJson, String dataJson, String publisher)
 	{
 		if (groupJson == null) return;
 
@@ -930,26 +1036,22 @@ public class GroupService
 
 			String groupId = remoteGroup.getId();
 
-			// Merge group roster/settings
+			// Union-merge the roster: add members present remotely but not locally,
+			// and adopt role/permission changes when the remote roster is newer.
+			// We never DROP a member on sync — a wholesale replace let a peer with a
+			// stale roster erase someone who had just joined on another client.
 			LendingGroup localGroup = groups.get(groupId);
 			if (localGroup != null)
 			{
-				localGroup.setMembers(remoteGroup.getMembers());
-				localGroup.setCoOwnerCanKick(remoteGroup.isCoOwnerCanKick());
-				localGroup.setAdminCanKick(remoteGroup.isAdminCanKick());
-				localGroup.setModCanKick(remoteGroup.isModCanKick());
-				localGroup.setCoOwnerCanInvite(remoteGroup.isCoOwnerCanInvite());
-				localGroup.setAdminCanInvite(remoteGroup.isAdminCanInvite());
-				localGroup.setModCanInvite(remoteGroup.isModCanInvite());
+				mergeRoster(localGroup, remoteGroup);
 				saveGroups();
-				log.info("Merged relay group state for group {}", groupId);
 			}
 
-			// Merge data (marketplace, loans)
+			// Reconcile data (marketplace, loans, requests). Pass this player's name
+			// so catch-up preserves their own rows.
 			if (dataJson != null && !dataJson.isEmpty())
 			{
-				dataService.loadGroupDataFromSnapshot(groupId, dataJson);
-				log.info("Merged relay data state for group {}", groupId);
+				dataService.loadGroupDataFromSnapshot(groupId, dataJson, publisher, currentSyncPlayerName);
 			}
 
 			// Refresh UI
@@ -978,10 +1080,10 @@ public class GroupService
 		if (entries == null || entries.isEmpty()) return;
 		String previousGroupId = currentSyncGroupId;
 		currentSyncGroupId = groupId;
-		for (LendingEntry entry : entries)
-		{
-			publishEvent(SyncEventType.ITEM_UPDATED, entry.getId(), entry);
-		}
+		// One consolidated event + state push. Publishing per entry would
+		// broadcast a full state snapshot for every active loan every time
+		// the 5-minute periodic sync runs.
+		publishEvent(SyncEventType.ITEM_UPDATED, null, null);
 		currentSyncGroupId = previousGroupId;
 	}
 
@@ -1071,11 +1173,24 @@ public class GroupService
 		{
 			switch (event.getType())
 			{
+				case ITEM_RETURNED:
+					// Apply the return directly by entry id — cross-machine, our own
+					// config doesn't contain the change, so reloading isn't enough
+					if (event.getDataId() != null)
+					{
+						dataService.applyReturnedFromSync(event.getDataId());
+					}
+					if (currentSyncGroupId != null)
+					{
+						dataService.loadGroupData(currentSyncGroupId);
+					}
+					break;
 				case ITEM_ADDED:
 				case ITEM_REMOVED:
 				case ITEM_UPDATED:
-				case ITEM_RETURNED:
 				case ITEM_SET_DELETED:
+				case REQUEST_CREATED:
+				case REQUEST_UPDATED:
 					if (currentSyncGroupId != null)
 					{
 						dataService.loadGroupData(currentSyncGroupId);
@@ -1117,19 +1232,14 @@ public class GroupService
 			LendingGroup localGroup = groups.get(groupId);
 			if (localGroup != null)
 			{
-				// Update members and settings from remote, keep the group in local store
-				localGroup.setMembers(remoteGroup.getMembers());
-				localGroup.setCoOwnerCanKick(remoteGroup.isCoOwnerCanKick());
-				localGroup.setAdminCanKick(remoteGroup.isAdminCanKick());
-				localGroup.setModCanKick(remoteGroup.isModCanKick());
-				localGroup.setCoOwnerCanInvite(remoteGroup.isCoOwnerCanInvite());
-				localGroup.setAdminCanInvite(remoteGroup.isAdminCanInvite());
-				localGroup.setModCanInvite(remoteGroup.isModCanInvite());
+				// Same union-merge path as relay state: never drop a member, and
+				// keep the roster in a thread-safe (COW) list.
+				mergeRoster(localGroup, remoteGroup);
 			}
 			else
 			{
 				// Group doesn't exist locally yet — add it
-				groups.put(remoteGroup.getId(), remoteGroup);
+				groups.put(remoteGroup.getId(), ensureCowMembers(remoteGroup));
 			}
 			saveGroups();
 		}
@@ -1179,6 +1289,10 @@ public class GroupService
 							g.ensureSyncSecret();
 							needsSave = true;
 						}
+						// Gson deserializes members as a plain ArrayList; wrap it so
+						// concurrent roster reads/writes are CME-safe like new groups.
+						g.setMembers(new java.util.concurrent.CopyOnWriteArrayList<>(
+							g.getMembers() != null ? g.getMembers() : new ArrayList<>()));
 						groups.put(g.getId(), g);
 					}
 					// Save back if any groups needed a secret generated
@@ -1278,7 +1392,9 @@ public class GroupService
 		MEMBER_JOINED,
 		MEMBER_LEFT,
 		SETTINGS_CHANGED,
-		ITEM_SET_DELETED
+		ITEM_SET_DELETED,
+		REQUEST_CREATED,
+		REQUEST_UPDATED
 	}
 
 	public static class SyncEvent
@@ -1286,6 +1402,11 @@ public class GroupService
 		private SyncEventType type;
 		private long timestamp;
 		private String publisher;
+		// Id of the entry/request the event refers to, so receivers can apply
+		// targeted changes (e.g. mark a specific loan returned). It IS included in
+		// the HMAC payload (see RelaySyncService.buildSignaturePayload) because it
+		// drives destructive mutations and must not be tamperable.
+		private String dataId;
 
 		public SyncEventType getType() { return type; }
 		public void setType(SyncEventType type) { this.type = type; }
@@ -1293,5 +1414,7 @@ public class GroupService
 		public void setTimestamp(long timestamp) { this.timestamp = timestamp; }
 		public String getPublisher() { return publisher; }
 		public void setPublisher(String publisher) { this.publisher = publisher; }
+		public String getDataId() { return dataId; }
+		public void setDataId(String dataId) { this.dataId = dataId; }
 	}
 }

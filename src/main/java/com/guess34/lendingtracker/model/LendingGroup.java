@@ -6,6 +6,7 @@ import lombok.NoArgsConstructor;
 
 import java.security.SecureRandom;
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @Data
 @NoArgsConstructor
@@ -19,7 +20,14 @@ public class LendingGroup {
     private boolean clanCodeEnabled = true;
     private Set<String> usedGroupCodes = new HashSet<>(); // Track who used group codes
     private int clanCodeUseCount = 0; // Track clan code usage
-    private List<GroupMember> members = new ArrayList<>();
+    // CopyOnWriteArrayList: the roster is read on the EDT while sync threads may
+    // add members, so reads must never throw ConcurrentModificationException.
+    private List<GroupMember> members = new CopyOnWriteArrayList<>();
+
+    // Version stamp for the roster, epoch millis. A relayed group state only
+    // replaces the local roster when its stamp is newer, so a member with a
+    // stale roster can't erase someone who just joined on another client.
+    private long membersUpdatedAt;
 
     // ADDED: Shared secret for HMAC-SHA256 message signing on relay sync
     private String syncSecret;
@@ -46,7 +54,7 @@ public class LendingGroup {
         this.clanCodeEnabled = false;
         this.usedGroupCodes = new HashSet<>();
         this.clanCodeUseCount = 0;
-        this.members = new ArrayList<>();
+        this.members = new CopyOnWriteArrayList<>();
         // ADDED: Generate sync secret for HMAC message signing
         this.syncSecret = generateSyncSecret();
         // Default kick permissions - all staff can kick

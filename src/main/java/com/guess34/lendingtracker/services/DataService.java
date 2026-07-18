@@ -6,6 +6,7 @@ import java.lang.reflect.Type;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -13,6 +14,7 @@ import net.runelite.client.config.ConfigManager;
 
 import com.guess34.lendingtracker.model.ItemSet;
 import com.guess34.lendingtracker.model.LendingEntry;
+import com.guess34.lendingtracker.model.LendingRequest;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -43,7 +45,10 @@ public class DataService
 
 	// Global entries storage (all entries regardless of group)
 	private final Map<String, LendingEntry> allEntries = new ConcurrentHashMap<>();
-	private final List<LendingEntry> historyEntries = Collections.synchronizedList(new ArrayList<>());
+	private final List<LendingEntry> historyEntries = new CopyOnWriteArrayList<>();
+
+	// Direct lending requests (borrow requests / lend offers): groupId -> requests
+	private final Map<String, List<LendingRequest>> groupRequests = new ConcurrentHashMap<>();
 
 	// Item sets: groupId -> setId -> ItemSet
 	private final Map<String, Map<String, ItemSet>> groupItemSets = new ConcurrentHashMap<>();
@@ -95,10 +100,11 @@ public class DataService
 	{
 		entry.setGroupId(groupId);
 		entry.setLender(owner);
+		entry.setUpdatedAt(System.currentTimeMillis());
 
 		List<LendingEntry> ownerList = groupAvailable
 			.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
-			.computeIfAbsent(owner, k -> new ArrayList<>());
+			.computeIfAbsent(owner, k -> new CopyOnWriteArrayList<>());
 
 		boolean alreadyExists = ownerList.stream()
 			.anyMatch(e -> e.getItemId() == entry.getItemId());
@@ -142,7 +148,7 @@ public class DataService
 
 		List<LendingEntry> ownerList = groupAvailable
 			.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
-			.computeIfAbsent(owner, k -> new ArrayList<>());
+			.computeIfAbsent(owner, k -> new CopyOnWriteArrayList<>());
 
 		boolean alreadyExists = ownerList.stream()
 			.anyMatch(e ->
@@ -199,6 +205,7 @@ public class DataService
 					{
 						updatedEntry.setGroupId(groupId);
 						updatedEntry.setLender(owner);
+						updatedEntry.setUpdatedAt(System.currentTimeMillis());
 						ownerItems.set(i, new LendingEntry(updatedEntry));
 						persist(groupId, "available");
 
@@ -298,7 +305,7 @@ public class DataService
 
 		List<LendingEntry> borrowerList = groupBorrowed
 			.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
-			.computeIfAbsent(borrower, k -> new ArrayList<>());
+			.computeIfAbsent(borrower, k -> new CopyOnWriteArrayList<>());
 
 		boolean alreadyExists = borrowerList.stream()
 			.anyMatch(e ->
@@ -327,7 +334,7 @@ public class DataService
 
 		List<LendingEntry> lenderList = groupLent
 			.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
-			.computeIfAbsent(lender, k -> new ArrayList<>());
+			.computeIfAbsent(lender, k -> new CopyOnWriteArrayList<>());
 
 		boolean alreadyExists = lenderList.stream()
 			.anyMatch(e ->
@@ -360,20 +367,153 @@ public class DataService
 		entry.setLendTime(System.currentTimeMillis());
 		entry.setDueTime(dueTime);
 		entry.setReturnedAt(0);
+		entry.setUpdatedAt(System.currentTimeMillis());
 
 		allEntries.put(entry.getId(), entry);
 
 		groupLent.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
-			.computeIfAbsent(lender, k -> Collections.synchronizedList(new ArrayList<>()))
+			.computeIfAbsent(lender, k -> new CopyOnWriteArrayList<>())
 			.add(entry);
 
 		groupBorrowed.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
-			.computeIfAbsent(borrower, k -> Collections.synchronizedList(new ArrayList<>()))
+			.computeIfAbsent(borrower, k -> new CopyOnWriteArrayList<>())
 			.add(entry);
 
 		saveEntries();
-		persist(groupId, "lent");
-		persist(groupId, "borrowed");
+		// persist() writes the whole group snapshot regardless of category, so a
+		// single call covers both the lent and borrowed changes.
+		persist(groupId, "loan");
+
+		if (groupService != null)
+		{
+			groupService.publishEvent(
+				GroupService.SyncEventType.ITEM_ADDED,
+				entry.getId(),
+				entry
+			);
+		}
+	}
+
+	// Direct lending requests (borrow requests / lend offers)
+
+	/** Add a new request and sync it to the group. */
+	public void addRequest(String groupId, LendingRequest request)
+	{
+		if (groupId == null || request == null || request.getId() == null)
+		{
+			return;
+		}
+
+		request.setGroupId(groupId);
+		List<LendingRequest> requests = groupRequests
+			.computeIfAbsent(groupId, k -> new CopyOnWriteArrayList<>());
+		requests.removeIf(r -> request.getId().equals(r.getId()));
+		requests.add(request);
+
+		persist(groupId, "requests");
+
+		if (groupService != null)
+		{
+			groupService.publishEvent(
+				GroupService.SyncEventType.REQUEST_CREATED,
+				request.getId(),
+				request
+			);
+		}
+	}
+
+	/** Update a request's status (accept/decline/cancel) and sync the change. */
+	public void updateRequestStatus(String groupId, String requestId, String status)
+	{
+		List<LendingRequest> requests = groupRequests.get(groupId);
+		if (requests == null || requestId == null)
+		{
+			return;
+		}
+
+		for (LendingRequest r : requests)
+		{
+			if (requestId.equals(r.getId()))
+			{
+				r.setStatus(status);
+				r.setUpdatedAt(System.currentTimeMillis());
+				persist(groupId, "requests");
+
+				if (groupService != null)
+				{
+					groupService.publishEvent(
+						GroupService.SyncEventType.REQUEST_UPDATED,
+						requestId,
+						r
+					);
+				}
+				return;
+			}
+		}
+	}
+
+	/** All requests for a group (any status). */
+	public List<LendingRequest> getRequests(String groupId)
+	{
+		List<LendingRequest> requests = groupRequests.get(groupId);
+		if (requests == null)
+		{
+			return new ArrayList<>();
+		}
+		synchronized (requests)
+		{
+			return new ArrayList<>(requests);
+		}
+	}
+
+	/** Pending requests addressed TO the given player. */
+	public List<LendingRequest> getPendingRequestsFor(String groupId, String playerName)
+	{
+		if (playerName == null)
+		{
+			return new ArrayList<>();
+		}
+		return getRequests(groupId).stream()
+			.filter(r -> r.isPending() && playerName.equalsIgnoreCase(r.getTo()))
+			.collect(Collectors.toList());
+	}
+
+	/** Requests created BY the given player. */
+	public List<LendingRequest> getRequestsFrom(String groupId, String playerName)
+	{
+		if (playerName == null)
+		{
+			return new ArrayList<>();
+		}
+		return getRequests(groupId).stream()
+			.filter(r -> playerName.equalsIgnoreCase(r.getFrom()))
+			.collect(Collectors.toList());
+	}
+
+	/**
+	 * Drop resolved (non-pending) requests last updated before the cutoff across
+	 * all groups, so the synced snapshot doesn't grow without bound. Returns the
+	 * number removed.
+	 */
+	public int pruneResolvedRequests(long cutoffTime)
+	{
+		int removed = 0;
+		for (Map.Entry<String, List<LendingRequest>> entry : groupRequests.entrySet())
+		{
+			List<LendingRequest> list = entry.getValue();
+			synchronized (list)
+			{
+				int before = list.size();
+				list.removeIf(r -> !r.isPending() && r.getUpdatedAt() < cutoffTime);
+				int delta = before - list.size();
+				if (delta > 0)
+				{
+					removed += delta;
+					persist(entry.getKey(), "requests");
+				}
+			}
+		}
+		return removed;
 	}
 
 	// Getters for lent/borrowed/available lists
@@ -397,6 +537,7 @@ public class DataService
 			return;
 		}
 
+		entry.setUpdatedAt(System.currentTimeMillis());
 		allEntries.put(entry.getId(), new LendingEntry(entry));
 		saveEntries();
 		if (groupService != null && entry.getGroupId() != null)
@@ -466,6 +607,7 @@ public class DataService
 			{
 				entry.setReturnedAt(Instant.now().toEpochMilli());
 			}
+			entry.setUpdatedAt(System.currentTimeMillis());
 			historyEntries.add(new LendingEntry(entry));
 			if (returned)
 			{
@@ -611,12 +753,44 @@ public class DataService
 
 	private void persist(String groupId, String kind)
 	{
+		configManager.setConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId, buildGroupSnapshotJson(groupId));
+	}
+
+	/**
+	 * Build the full snapshot for a group: marketplace categories, direct requests,
+	 * and active loan entries for the group. One format shared by local config
+	 * persistence and relay state sync, so both paths carry the same data.
+	 */
+	// How long a returned-loan tombstone stays in the snapshot so members who were
+	// offline at return time still learn the loan was returned when they catch up.
+	private static final long RETURNED_TOMBSTONE_MS = 30L * 86400000L;
+
+	private String buildGroupSnapshotJson(String groupId)
+	{
 		Map<String, Object> snapshot = new LinkedHashMap<>();
 		snapshot.put("lent", groupLent.getOrDefault(groupId, new HashMap<>()));
 		snapshot.put("borrowed", groupBorrowed.getOrDefault(groupId, new HashMap<>()));
 		snapshot.put("available", groupAvailable.getOrDefault(groupId, new HashMap<>()));
-		String json = gson.toJson(snapshot);
-		configManager.setConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId, json);
+		snapshot.put("requests", getRequests(groupId));
+		// Active loans live in the global allEntries map, which never crossed
+		// machines before — include this group's entries so loans sync too.
+		snapshot.put("entries", allEntries.values().stream()
+			.filter(e -> groupId.equals(e.getGroupId()))
+			.collect(Collectors.toList()));
+		// Tombstones of recently-returned loans. A return removes the entry from
+		// allEntries, so without this a member offline at return time would never
+		// see it leave their Active Loans on catch-up.
+		long cutoff = System.currentTimeMillis() - RETURNED_TOMBSTONE_MS;
+		List<String> returnedIds = new ArrayList<>();
+		for (LendingEntry h : historyEntries)
+		{
+			if (groupId.equals(h.getGroupId()) && h.getReturnedAt() > cutoff && h.getId() != null)
+			{
+				returnedIds.add(h.getId());
+			}
+		}
+		snapshot.put("returnedIds", returnedIds);
+		return gson.toJson(snapshot);
 	}
 
 	/**
@@ -626,34 +800,335 @@ public class DataService
 	public String getGroupDataSnapshot(String groupId)
 	{
 		if (groupId == null) return null;
-		Map<String, Object> snapshot = new LinkedHashMap<>();
-		snapshot.put("lent", groupLent.getOrDefault(groupId, new HashMap<>()));
-		snapshot.put("borrowed", groupBorrowed.getOrDefault(groupId, new HashMap<>()));
-		snapshot.put("available", groupAvailable.getOrDefault(groupId, new HashMap<>()));
-		return gson.toJson(snapshot);
+		return buildGroupSnapshotJson(groupId);
 	}
 
 	/**
-	 * Load group data from a JSON snapshot string (from relay state sync).
-	 * Merges remote data into local state.
+	 * Apply a group snapshot received over the relay.
+	 *
+	 * Two very different cases, distinguished by {@code publisher}:
+	 *
+	 * <b>Catch-up (publisher == null)</b> — the authoritative stored snapshot the
+	 * joining client fetched over REST. Adopt it wholesale so deletions made while
+	 * this client was offline take effect (no resurrection).
+	 *
+	 * <b>Live (publisher != null)</b> — a single member's push. That member is
+	 * authoritative ONLY for their own rows, so we replace just their owner-key in
+	 * each category and leave everyone else untouched. This avoids both the
+	 * resurrection bug (a stale peer can't re-add another owner's deleted rows) and
+	 * data loss (concurrent edits by different members never clobber each other).
+	 * Loans and requests, which aren't cleanly owned by one member, reconcile by a
+	 * per-record last-write-wins on {@code updatedAt}.
+	 *
+	 * All writes replace list/map references rather than mutating live lists, so a
+	 * reader iterating on another thread never sees a torn collection.
 	 */
 	public void loadGroupDataFromSnapshot(String groupId, String snapshotJson)
+	{
+		loadGroupDataFromSnapshot(groupId, snapshotJson, null, null);
+	}
+
+	/**
+	 * @param publisher non-null for a live push (authoritative for their own rows
+	 *                  only); null for an authoritative catch-up snapshot.
+	 * @param selfOwner this client's player name, whose own rows are preserved on
+	 *                  catch-up so offline additions aren't clobbered.
+	 */
+	public void loadGroupDataFromSnapshot(String groupId, String snapshotJson, String publisher, String selfOwner)
 	{
 		if (groupId == null || snapshotJson == null || snapshotJson.isEmpty()) return;
 		try
 		{
 			@SuppressWarnings("unchecked")
-			Map<String, Map<String, List<Map<String, Object>>>> snapshot = gson.fromJson(snapshotJson, Map.class);
-			loadGroupEntries(snapshot.get("available"), groupId, groupAvailable);
-			loadGroupEntries(snapshot.get("lent"), groupId, groupLent);
-			loadGroupEntries(snapshot.get("borrowed"), groupId, groupBorrowed);
-			// Also persist locally so data survives restarts
-			persist(groupId, "relay-sync");
-			log.info("Loaded group data from relay snapshot for group {}", groupId);
+			Map<String, Object> snapshot = gson.fromJson(snapshotJson, Map.class);
+
+			if (publisher == null)
+			{
+				// Authoritative catch-up: adopt the stored marketplace wholesale so
+				// deletions made while offline take effect, but keep the local
+				// player's own rows (they're authoritative for their own listings).
+				// Loans and requests merge by last-write-wins instead of a wholesale
+				// replace, so a snapshot from a member with an incomplete view can't
+				// drop live records.
+				loadGroupEntries(getCategory(snapshot, "available"), groupId, groupAvailable, selfOwner);
+				loadGroupEntries(getCategory(snapshot, "lent"), groupId, groupLent, selfOwner);
+				loadGroupEntries(getCategory(snapshot, "borrowed"), groupId, groupBorrowed, selfOwner);
+				mergeRequests(groupId, snapshot.get("requests"));
+				mergeActiveEntries(groupId, snapshot.get("entries"));
+			}
+			else
+			{
+				// Live update: publisher is authoritative only for their own rows.
+				applyPublisherRows(getCategory(snapshot, "available"), groupId, groupAvailable, publisher);
+				applyPublisherRows(getCategory(snapshot, "lent"), groupId, groupLent, publisher);
+				mergeRequests(groupId, snapshot.get("requests"));
+				mergeActiveEntries(groupId, snapshot.get("entries"));
+			}
+
+			// Apply returned-loan tombstones (both paths) so returns propagate to
+			// members who were offline when the loan came back.
+			applyReturnedTombstones(snapshot.get("returnedIds"));
+
+			// Persist the reconciled state locally so it survives a restart.
+			persist(groupId, "sync");
+			log.info("Applied group snapshot for group {} (publisher: {})", groupId,
+				publisher != null ? publisher : "catch-up");
 		}
 		catch (Exception e)
 		{
-			log.error("Failed to load group data from relay snapshot: {}", e.getMessage(), e);
+			log.error("Failed to load group data from snapshot: {}", e.getMessage(), e);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private Map<String, List<Map<String, Object>>> getCategory(Map<String, Object> snapshot, String key)
+	{
+		Object raw = snapshot.get(key);
+		return raw instanceof Map ? (Map<String, List<Map<String, Object>>>) raw : null;
+	}
+
+	/**
+	 * Live merge for one category: replace ONLY the publisher's own owner-key with
+	 * their rows from the snapshot; leave every other owner untouched. The
+	 * publisher's key is replaced (not merged) so their own deletions propagate.
+	 */
+	private void applyPublisherRows(Map<String, List<Map<String, Object>>> rawData, String groupId,
+		Map<String, Map<String, List<LendingEntry>>> target, String publisher)
+	{
+		if (rawData == null || publisher == null) return;
+
+		Map<String, List<LendingEntry>> ownerMap = target
+			.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>());
+
+		// Find the publisher's rows in the snapshot (owner keys are player names)
+		String matchedKey = null;
+		List<Map<String, Object>> rows = null;
+		for (Map.Entry<String, List<Map<String, Object>>> e : rawData.entrySet())
+		{
+			if (e.getKey().equalsIgnoreCase(publisher))
+			{
+				matchedKey = e.getKey();
+				rows = e.getValue();
+				break;
+			}
+		}
+
+		// Drop any stale entries filed under the publisher's key(s) first, so a
+		// removal (they now have no rows) propagates.
+		for (String owner : new ArrayList<>(ownerMap.keySet()))
+		{
+			if (owner.equalsIgnoreCase(publisher))
+			{
+				ownerMap.remove(owner);
+			}
+		}
+
+		if (rows == null || rows.isEmpty())
+		{
+			return;
+		}
+
+		List<LendingEntry> fresh = new CopyOnWriteArrayList<>();
+		for (Map<String, Object> row : rows)
+		{
+			LendingEntry entry = gson.fromJson(gson.toJson(row), LendingEntry.class);
+			if (entry != null)
+			{
+				fresh.add(entry);
+			}
+		}
+		ownerMap.put(matchedKey, fresh);
+	}
+
+	/** Merge direct requests from a remote snapshot (union by id, newest update wins). */
+	private void mergeRequests(String groupId, Object rawRequests)
+	{
+		if (!(rawRequests instanceof List))
+		{
+			return;
+		}
+
+		List<LendingRequest> localRequests = groupRequests
+			.computeIfAbsent(groupId, k -> new CopyOnWriteArrayList<>());
+
+		for (Object raw : (List<?>) rawRequests)
+		{
+			LendingRequest remote = gson.fromJson(gson.toJson(raw), LendingRequest.class);
+			if (remote == null || remote.getId() == null)
+			{
+				continue;
+			}
+
+			synchronized (localRequests)
+			{
+				LendingRequest local = localRequests.stream()
+					.filter(r -> remote.getId().equals(r.getId()))
+					.findFirst().orElse(null);
+				if (local == null)
+				{
+					localRequests.add(remote);
+				}
+				else if (remote.getUpdatedAt() > local.getUpdatedAt()
+					|| (remote.getUpdatedAt() == local.getUpdatedAt() && local.isPending() && !remote.isPending()))
+				{
+					local.setStatus(remote.getStatus());
+					local.setUpdatedAt(remote.getUpdatedAt());
+				}
+			}
+		}
+	}
+
+	/** Live merge of loan entries: last-write-wins by updatedAt, archive returns. */
+	private void mergeActiveEntries(String groupId, Object rawEntries)
+	{
+		if (!(rawEntries instanceof List))
+		{
+			return;
+		}
+
+		boolean changed = false;
+		for (Object raw : (List<?>) rawEntries)
+		{
+			LendingEntry remote = gson.fromJson(gson.toJson(raw), LendingEntry.class);
+			if (remote == null || remote.getId() == null)
+			{
+				continue;
+			}
+			if (applyRemoteEntry(remote))
+			{
+				changed = true;
+			}
+		}
+
+		if (changed)
+		{
+			saveEntries();
+		}
+	}
+
+	/**
+	 * Apply one remote loan entry to allEntries. Returns true if anything changed.
+	 * A returned entry is archived (not kept active); an active entry is upserted
+	 * when it is newer than the local copy, and never resurrected if this client
+	 * has already archived it.
+	 */
+	private boolean applyRemoteEntry(LendingEntry remote)
+	{
+		boolean alreadyInHistory;
+		synchronized (historyEntries)
+		{
+			alreadyInHistory = historyEntries.stream()
+				.anyMatch(h -> remote.getId().equals(h.getId()));
+		}
+
+		if (remote.isReturned())
+		{
+			boolean changed = false;
+			if (!alreadyInHistory)
+			{
+				historyEntries.add(remote);
+				changed = true;
+			}
+			if (allEntries.remove(remote.getId()) != null)
+			{
+				changed = true;
+			}
+			return changed;
+		}
+
+		if (alreadyInHistory)
+		{
+			return false; // returned locally already — don't resurrect
+		}
+
+		LendingEntry local = allEntries.get(remote.getId());
+		if (local == null || remote.getUpdatedAt() > local.getUpdatedAt())
+		{
+			allEntries.put(remote.getId(), remote);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Mark a loan returned because a sync event from another client said so.
+	 * Same effect as {@link #completeEntry} but does NOT publish a sync event,
+	 * so two clients can't bounce the same return back and forth.
+	 */
+	public void applyReturnedFromSync(String entryId)
+	{
+		if (archiveReturnedById(entryId))
+		{
+			saveEntries();
+		}
+	}
+
+	/**
+	 * Apply a batch of returned-loan tombstones from a snapshot: archive each id
+	 * that's still active locally so returns reach members who were offline.
+	 */
+	private void applyReturnedTombstones(Object rawIds)
+	{
+		if (!(rawIds instanceof List))
+		{
+			return;
+		}
+		boolean changed = false;
+		for (Object raw : (List<?>) rawIds)
+		{
+			if (raw != null && archiveReturnedById(raw.toString()))
+			{
+				changed = true;
+			}
+		}
+		if (changed)
+		{
+			saveEntries();
+		}
+	}
+
+	/**
+	 * Archive a loan by id: move it from the active map to history and drop it
+	 * from the lent/borrowed maps. Idempotent — a no-op if already archived or
+	 * unknown. Returns true if anything changed. Caller persists.
+	 */
+	private boolean archiveReturnedById(String entryId)
+	{
+		if (entryId == null)
+		{
+			return false;
+		}
+
+		LendingEntry entry = allEntries.remove(entryId);
+		removeEntryFromCategory(groupLent, entryId);
+		removeEntryFromCategory(groupBorrowed, entryId);
+
+		if (entry == null)
+		{
+			return false; // wasn't active here; nothing to archive
+		}
+
+		boolean inHistory = historyEntries.stream().anyMatch(h -> entryId.equals(h.getId()));
+		if (!inHistory)
+		{
+			if (!entry.isReturned())
+			{
+				entry.setReturnedAt(Instant.now().toEpochMilli());
+			}
+			historyEntries.add(new LendingEntry(entry));
+		}
+		return true;
+	}
+
+	/** Remove an entry by id from every owner list in a category map. */
+	private void removeEntryFromCategory(Map<String, Map<String, List<LendingEntry>>> category, String entryId)
+	{
+		for (Map<String, List<LendingEntry>> ownerMap : category.values())
+		{
+			for (List<LendingEntry> list : ownerMap.values())
+			{
+				list.removeIf(e -> entryId.equals(e.getId()));
+			}
 		}
 	}
 
@@ -675,11 +1150,13 @@ public class DataService
 			try
 			{
 				@SuppressWarnings("unchecked")
-				Map<String, Map<String, List<Map<String, Object>>>> snapshot = gson.fromJson(json, Map.class);
+				Map<String, Object> snapshot = gson.fromJson(json, Map.class);
 
-				loadGroupEntries(snapshot.get("available"), groupId, groupAvailable);
-				loadGroupEntries(snapshot.get("lent"), groupId, groupLent);
-				loadGroupEntries(snapshot.get("borrowed"), groupId, groupBorrowed);
+				loadGroupEntries(getCategory(snapshot, "available"), groupId, groupAvailable);
+				loadGroupEntries(getCategory(snapshot, "lent"), groupId, groupLent);
+				loadGroupEntries(getCategory(snapshot, "borrowed"), groupId, groupBorrowed);
+				mergeRequests(groupId, snapshot.get("requests"));
+				mergeActiveEntries(groupId, snapshot.get("entries"));
 			}
 			catch (Exception e)
 			{
@@ -696,29 +1173,67 @@ public class DataService
 	private void loadGroupEntries(Map<String, List<Map<String, Object>>> rawData, String groupId,
 		Map<String, Map<String, List<LendingEntry>>> target)
 	{
-		if (rawData == null || rawData.isEmpty())
+		loadGroupEntries(rawData, groupId, target, null);
+	}
+
+	/**
+	 * Wholesale-load one category from a snapshot, atomically swapping in a fresh
+	 * owner-map so readers on other threads never see a torn collection.
+	 *
+	 * When {@code selfOwner} is set (authoritative catch-up), that owner's local
+	 * rows are preserved rather than overwritten — the local player is always
+	 * authoritative for their own listings, so a stale relay snapshot can't drop
+	 * items they added while disconnected.
+	 */
+	private void loadGroupEntries(Map<String, List<Map<String, Object>>> rawData, String groupId,
+		Map<String, Map<String, List<LendingEntry>>> target, String selfOwner)
+	{
+		// A null category means the snapshot didn't carry this section at all (old
+		// or foreign format); preserve local data rather than wiping it. An EMPTY
+		// map is different — it means "no rows", so deletions still propagate.
+		if (rawData == null)
 		{
 			return;
 		}
 
+		Map<String, List<LendingEntry>> existing = target.get(groupId);
+
 		Map<String, List<LendingEntry>> entryMap = new ConcurrentHashMap<>();
-		for (Map.Entry<String, List<Map<String, Object>>> ownerEntry : rawData.entrySet())
 		{
-			List<LendingEntry> entries = new ArrayList<>();
-			for (Map<String, Object> entryData : ownerEntry.getValue())
+			for (Map.Entry<String, List<Map<String, Object>>> ownerEntry : rawData.entrySet())
 			{
-				String entryJson = gson.toJson(entryData);
-				LendingEntry entry = gson.fromJson(entryJson, LendingEntry.class);
-				if (entry != null)
+				if (selfOwner != null && ownerEntry.getKey().equalsIgnoreCase(selfOwner))
 				{
-					entries.add(entry);
+					continue; // preserve local self rows below
+				}
+				List<LendingEntry> entries = new CopyOnWriteArrayList<>();
+				for (Map<String, Object> entryData : ownerEntry.getValue())
+				{
+					LendingEntry entry = gson.fromJson(gson.toJson(entryData), LendingEntry.class);
+					if (entry != null)
+					{
+						entries.add(entry);
+					}
+				}
+				if (!entries.isEmpty())
+				{
+					entryMap.put(ownerEntry.getKey(), entries);
 				}
 			}
-			if (!entries.isEmpty())
+		}
+
+		// Carry over the local player's own rows untouched
+		if (selfOwner != null && existing != null)
+		{
+			for (Map.Entry<String, List<LendingEntry>> e : existing.entrySet())
 			{
-				entryMap.put(ownerEntry.getKey(), entries);
+				if (e.getKey().equalsIgnoreCase(selfOwner))
+				{
+					entryMap.put(e.getKey(), e.getValue());
+				}
 			}
 		}
+
 		target.put(groupId, entryMap);
 	}
 

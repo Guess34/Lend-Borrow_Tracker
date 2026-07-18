@@ -37,6 +37,7 @@ import java.awt.image.BufferedImage;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
@@ -105,11 +106,11 @@ public class LendingTrackerPlugin extends Plugin
 		if (clientToolbar != null) { clientToolbar.addNavigation(navButton); }
 		else { log.error("ClientToolbar is null - UI will not appear"); }
 
-		groupService.setOnSyncCallback(() -> { if (newPanel != null) { newPanel.refresh(); } });
+		groupService.setOnSyncCallback(this::onGroupDataSynced);
 
 		// Register relay sync callbacks for cross-machine sync
 		relaySyncService.setOnEventReceived(event -> groupService.handleRelayEvent(event));
-		relaySyncService.setOnStateReceived((groupJson, dataJson) -> groupService.handleRelayState(groupJson, dataJson));
+		relaySyncService.setOnStateReceived((groupJson, dataJson, publisher) -> groupService.handleRelayState(groupJson, dataJson, publisher));
 		relaySyncService.setOnConnectionChanged(status ->
 		{
 			if (newPanel != null) { newPanel.updateConnectionStatus(status); }
@@ -159,6 +160,14 @@ public class LendingTrackerPlugin extends Plugin
 		LendingGroup activeGroup = groupService.getActiveGroup();
 		if (activeGroup != null) { groupService.startSync(activeGroup.getId(), playerName); }
 		if (newPanel != null) { newPanel.refresh(); }
+		checkForRequestNotifications();
+	}
+
+	/** Runs whenever group data changes via sync (local poll or relay). */
+	private void onGroupDataSynced()
+	{
+		if (newPanel != null) { newPanel.refresh(); }
+		checkForRequestNotifications();
 	}
 
 	// --- Event Handlers ---
@@ -235,7 +244,7 @@ public class LendingTrackerPlugin extends Plugin
 			{
 				if (client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null) { return false; }
 				String playerName = client.getLocalPlayer().getName();
-				groupService.setOnSyncCallback(() -> { if (newPanel != null) { newPanel.refresh(); } });
+				groupService.setOnSyncCallback(this::onGroupDataSynced);
 				triggerLoginFlow(playerName);
 				return true;
 			});
@@ -416,11 +425,18 @@ public class LendingTrackerPlugin extends Plugin
 		if (g != null) { groupService.syncAllEntries(g.getId(), dataService.getActiveEntries()); }
 	}
 
+	// Resolved requests linger so both parties can observe the outcome; keep them at
+	// least this long regardless of dataRetentionDays, so a low retention setting
+	// can't prune a request before an offline requester ever syncs the result.
+	private static final long REQUEST_RETENTION_MS = 14L * 86400000L;
+
 	private void cleanupOldRecords()
 	{
 		int days = config.dataRetentionDays();
 		if (days <= 0) { return; }
-		dataService.deleteOldReturnedEntries(System.currentTimeMillis() - (days * 86400000L));
+		long now = System.currentTimeMillis();
+		dataService.deleteOldReturnedEntries(now - (days * 86400000L));
+		dataService.pruneResolvedRequests(now - Math.max(days * 86400000L, REQUEST_RETENTION_MS));
 	}
 
 	private void updateMarketplacePrices()
@@ -806,13 +822,11 @@ public class LendingTrackerPlugin extends Plugin
 		String me = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null;
 		if (me == null) { return; }
 
-		List<LendingEntry> borrowed = new ArrayList<>();
-		for (LendingGroup g : groupService.getAllGroups())
-		{
-			borrowed.addAll(dataService.getBorrowed(g.getId()).stream()
-				.filter(e -> me.equals(e.getBorrower()) && !e.isReturned())
-				.collect(Collectors.toList()));
-		}
+		// Read from the active-entries map (kept current by live sync), not the
+		// per-group borrowed map, which a live loan push doesn't populate.
+		List<LendingEntry> borrowed = dataService.getActiveEntries().stream()
+			.filter(e -> me.equalsIgnoreCase(e.getBorrower()) && !e.isReturned())
+			.collect(Collectors.toList());
 		if (!borrowed.isEmpty())
 		{
 			long total = borrowed.stream().mapToLong(LendingEntry::getValue).sum();
@@ -853,18 +867,176 @@ public class LendingTrackerPlugin extends Plugin
 			JOptionPane.showMessageDialog(null, message, title, JOptionPane.INFORMATION_MESSAGE));
 	}
 
-	// --- Public API for UI Panels ---
+	// --- Direct Requests (borrow requests / lend offers) ---
 
-	/** Stub: borrow request (called by DashboardPanel) */
-	public void sendBorrowRequest(String borrower, String lender, String itemName, int itemId, int quantity, int durationDays)
+	// Config key prefix for the per-account set of already-notified request keys.
+	// Persisted so restarts don't replay notifications; a set (not a timestamp
+	// cursor) so an out-of-order or offline-merged request is never skipped.
+	private static final String REQUEST_NOTIFY_SET_PREFIX = "notifiedRequests.";
+	private static final int REQUEST_NOTIFY_SET_CAP = 2000;
+	private final Object requestNotifyLock = new Object();
+
+	/**
+	 * Send a borrow request to a lender. The request is stored in the group's
+	 * synced data, so it reaches the lender live if they're online (relay
+	 * broadcast / same-machine poll) or on their next login (join catch-up).
+	 *
+	 * @return true if the request was created, false if there's no active group
+	 */
+	public boolean sendBorrowRequest(String borrower, String lender, String itemName, int itemId, int quantity, int durationDays)
 	{
-		// TODO: Implement
+		return createRequest(LendingRequest.TYPE_BORROW_REQUEST, borrower, lender,
+			itemName, itemId, quantity, durationDays, null);
 	}
 
-	/** Stub: lend offer (called by DashboardPanel) */
-	public void sendLendOffer(String lender, String borrower, String itemName, int quantity, int durationDays, String message, String durationDisplay)
+	/**
+	 * Send a lend offer to a player who posted a "Looking For" request.
+	 *
+	 * @return true if the offer was created, false if there's no active group
+	 */
+	public boolean sendLendOffer(String lender, String borrower, String itemName, int quantity, int durationDays, String message, String durationDisplay)
 	{
-		// TODO: Implement
+		return createRequest(LendingRequest.TYPE_LEND_OFFER, lender, borrower,
+			itemName, -1, quantity, durationDays, message);
+	}
+
+	private boolean createRequest(String type, String from, String to,
+		String itemName, int itemId, int quantity, int durationDays, String message)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		if (groupId == null || groupId.isEmpty() || from == null || to == null)
+		{
+			return false;
+		}
+
+		LendingRequest request = new LendingRequest();
+		request.setId(UUID.randomUUID().toString());
+		request.setGroupId(groupId);
+		request.setType(type);
+		request.setFrom(from);
+		request.setTo(to);
+		request.setItemName(itemName);
+		request.setItemId(itemId);
+		request.setQuantity(quantity);
+		request.setDurationDays(durationDays);
+		request.setMessage(message);
+		request.setStatus(LendingRequest.STATUS_PENDING);
+		long now = System.currentTimeMillis();
+		request.setCreatedAt(now);
+		request.setUpdatedAt(now);
+
+		dataService.addRequest(groupId, request);
+		refreshPanel();
+		return true;
+	}
+
+	/**
+	 * Notify about newly arrived requests addressed to this player, and about
+	 * responses to requests this player sent. Called after every data sync.
+	 *
+	 * De-duplication uses a persisted per-account set of "requestId:kind" keys, so
+	 * each request notifies exactly once — even across restarts, even though
+	 * resolved requests linger in the synced snapshot, and regardless of the order
+	 * in which requests arrive through the union merge. Synchronized so two sync
+	 * threads can't both notify for the same request.
+	 */
+	private void checkForRequestNotifications()
+	{
+		if (!config.enableNotifications()) { return; }
+
+		synchronized (requestNotifyLock)
+		{
+			String me = getCurrentPlayerName();
+			LendingGroup activeGroup = groupService.getActiveGroup();
+			if (me == null || activeGroup == null) { return; }
+
+			String groupId = activeGroup.getId();
+			String setKey = REQUEST_NOTIFY_SET_PREFIX + me.toLowerCase();
+			LinkedHashSet<String> notified = loadNotifiedSet(setKey);
+			// Keys for requests still visible this round, so the size cap evicts only
+			// long-gone requests and never re-notifies one that's still around.
+			LinkedHashSet<String> seen = new LinkedHashSet<>();
+			boolean changed = false;
+			boolean playSound = false;
+
+			for (LendingRequest r : dataService.getPendingRequestsFor(groupId, me))
+			{
+				String key = r.getId() + ":IN";
+				seen.add(key);
+				if (notified.add(key))
+				{
+					String what = r.isBorrowRequest()
+						? r.getFrom() + " wants to borrow: " + r.getItemName()
+							+ (r.getQuantity() > 1 ? " x" + r.getQuantity() : "")
+							+ " (" + r.getDurationDays() + " days)"
+						: r.getFrom() + " offers to lend you: " + r.getItemName()
+							+ (r.getQuantity() > 1 ? " x" + r.getQuantity() : "");
+					notifier.notify("[Lending Tracker] " + what);
+					playSound = true;
+					changed = true;
+				}
+			}
+
+			for (LendingRequest r : dataService.getRequestsFrom(groupId, me))
+			{
+				if (r.isPending() || LendingRequest.STATUS_CANCELLED.equals(r.getStatus())) { continue; }
+				String key = r.getId() + ":" + r.getStatus();
+				seen.add(key);
+				if (notified.add(key))
+				{
+					String verb = LendingRequest.STATUS_ACCEPTED.equals(r.getStatus()) ? "accepted" : "declined";
+					notifier.notify("[Lending Tracker] " + r.getTo() + " " + verb
+						+ " your request for " + r.getItemName());
+					changed = true;
+				}
+			}
+
+			if (playSound && config.enableSoundAlerts())
+			{
+				// playSoundEffect must run on the client thread; this method is called
+				// from sync callbacks that run on the relay/poll executor threads.
+				clientThread.invokeLater(() -> client.playSoundEffect(SoundEffectID.UI_BOOP));
+			}
+			if (changed)
+			{
+				saveNotifiedSet(setKey, notified, seen);
+			}
+		}
+	}
+
+	private LinkedHashSet<String> loadNotifiedSet(String key)
+	{
+		LinkedHashSet<String> set = new LinkedHashSet<>();
+		String csv = configManager.getConfiguration("lendingtracker", key);
+		if (csv != null && !csv.isEmpty())
+		{
+			for (String k : csv.split(","))
+			{
+				if (!k.isEmpty()) { set.add(k); }
+			}
+		}
+		return set;
+	}
+
+	private void saveNotifiedSet(String key, LinkedHashSet<String> set, LinkedHashSet<String> keepAtEnd)
+	{
+		// Reorder so currently-visible request keys sit at the most-recent end,
+		// then bound growth by keeping the last CAP. This guarantees a still-active
+		// request is never evicted (which would let it re-notify) — only keys for
+		// requests that have disappeared can fall off.
+		LinkedHashSet<String> ordered = new LinkedHashSet<>();
+		for (String k : set)
+		{
+			if (!keepAtEnd.contains(k)) { ordered.add(k); }
+		}
+		ordered.addAll(keepAtEnd);
+
+		List<String> keys = new ArrayList<>(ordered);
+		if (keys.size() > REQUEST_NOTIFY_SET_CAP)
+		{
+			keys = keys.subList(keys.size() - REQUEST_NOTIFY_SET_CAP, keys.size());
+		}
+		configManager.setConfiguration("lendingtracker", key, String.join(",", keys));
 	}
 
 	public void refreshPanel()

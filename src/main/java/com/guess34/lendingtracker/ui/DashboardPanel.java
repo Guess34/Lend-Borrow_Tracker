@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.game.ItemManager;
 import com.guess34.lendingtracker.LendingTrackerPlugin;
 import com.guess34.lendingtracker.model.LendingEntry;
+import com.guess34.lendingtracker.model.LendingRequest;
 import com.guess34.lendingtracker.services.DataService;
 import com.guess34.lendingtracker.services.GroupService;
 import net.runelite.client.ui.ColorScheme;
@@ -271,6 +272,39 @@ public class DashboardPanel extends JPanel
 				}
 			}
 
+			// Show direct requests (borrow requests / lend offers) involving me
+			String me = getCurrentPlayerName();
+			List<LendingRequest> incomingRequests = new java.util.ArrayList<>();
+			List<LendingRequest> outgoingRequests = new java.util.ArrayList<>();
+			if (groupId != null && !groupId.isEmpty() && me != null && !me.equals("Not logged in"))
+			{
+				incomingRequests.addAll(dataService.getPendingRequestsFor(groupId, me));
+				outgoingRequests.addAll(dataService.getRequestsFrom(groupId, me).stream()
+					.filter(LendingRequest::isPending)
+					.collect(java.util.stream.Collectors.toList()));
+			}
+
+			if (!incomingRequests.isEmpty() || !outgoingRequests.isEmpty())
+			{
+				boolean requestsCollapsed = collapsedSections.contains("requests");
+				JPanel requestsHeader = createCollapsibleHeader(
+					"Requests (" + (incomingRequests.size() + outgoingRequests.size()) + ")",
+					new Color(0x64, 0xC8, 0x64), "requests", requestsCollapsed);
+				loanListPanel.add(requestsHeader);
+
+				if (!requestsCollapsed)
+				{
+					for (LendingRequest request : incomingRequests)
+					{
+						loanListPanel.add(new RequestCard(request, true));
+					}
+					for (LendingRequest request : outgoingRequests)
+					{
+						loanListPanel.add(new RequestCard(request, false));
+					}
+				}
+			}
+
 			// Show "Looking For" requests section
 			List<LookingForRequest> lookingForRequests = getLookingForRequests(groupId);
 			if (!lookingForRequests.isEmpty())
@@ -313,7 +347,8 @@ public class DashboardPanel extends JPanel
 			}
 
 			// If all sections are empty, show empty state
-			if (displayItems.isEmpty() && lookingForRequests.isEmpty() && activeLoans.isEmpty())
+			if (displayItems.isEmpty() && lookingForRequests.isEmpty() && activeLoans.isEmpty()
+				&& incomingRequests.isEmpty() && outgoingRequests.isEmpty())
 			{
 				String message = (groupId == null || groupId.isEmpty())
 					? "<html><center>No group selected<br><br>Select or create a group to start</center></html>"
@@ -585,10 +620,22 @@ public class DashboardPanel extends JPanel
 					if (duration <= 0 || duration > maxValue) throw new NumberFormatException();
 					int durationDays = isHours ? Math.max(1, duration / 24) : duration;
 					String durationDisplay = isHours ? duration + " hours" : duration + " days";
-					plugin.sendBorrowRequest(borrower, lender, itemName, itemId, quantity, durationDays);
-					JOptionPane.showMessageDialog(DashboardPanel.this,
-						"Borrow request sent to " + lender + "!\nDuration: " + durationDisplay,
-						"Request Sent", JOptionPane.INFORMATION_MESSAGE);
+					boolean sent = plugin.sendBorrowRequest(borrower, lender, itemName, itemId, quantity, durationDays);
+					if (sent)
+					{
+						String deliveryNote = plugin.isRelaySyncConnected()
+							? "They'll see it in their Lending Tracker panel."
+							: "Cloud Sync is offline — it will be delivered when they next sync.";
+						JOptionPane.showMessageDialog(DashboardPanel.this,
+							"Borrow request sent to " + lender + "!\nDuration: " + durationDisplay + "\n" + deliveryNote,
+							"Request Sent", JOptionPane.INFORMATION_MESSAGE);
+					}
+					else
+					{
+						JOptionPane.showMessageDialog(DashboardPanel.this,
+							"Could not send the request — no active group.",
+							"Request Not Sent", JOptionPane.ERROR_MESSAGE);
+					}
 				}
 				catch (NumberFormatException e)
 				{
@@ -1526,6 +1573,211 @@ public class DashboardPanel extends JPanel
 		if (cached != null) cached.removeIf(r -> r.id != null && r.id.equals(requestId));
 	}
 
+	/**
+	 * Card for a direct request (borrow request or lend offer).
+	 * Incoming requests can be accepted or declined; outgoing ones cancelled.
+	 */
+	private class RequestCard extends JPanel
+	{
+		private final LendingRequest request;
+		private final boolean incoming;
+
+		public RequestCard(LendingRequest request, boolean incoming)
+		{
+			this.request = request;
+			this.incoming = incoming;
+
+			setLayout(new BorderLayout(5, 0));
+			Color bgColor = incoming ? new Color(45, 60, 45) : new Color(55, 55, 45); // Green tint in, amber tint out
+			setBackground(bgColor);
+			setBorder(BorderFactory.createCompoundBorder(
+				BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.DARK_GRAY_COLOR),
+				new EmptyBorder(8, 8, 8, 8)
+			));
+			setMaximumSize(new Dimension(Integer.MAX_VALUE, 65));
+			setPreferredSize(new Dimension(200, 60));
+
+			String title;
+			if (incoming)
+			{
+				title = request.isBorrowRequest()
+					? request.getFrom() + " wants to borrow"
+					: request.getFrom() + " offers to lend you";
+			}
+			else
+			{
+				title = request.isBorrowRequest()
+					? "You asked " + request.getTo() + " for"
+					: "You offered " + request.getTo();
+			}
+
+			JPanel detailsPanel = new JPanel();
+			detailsPanel.setLayout(new BoxLayout(detailsPanel, BoxLayout.Y_AXIS));
+			detailsPanel.setBackground(bgColor);
+
+			JLabel titleLabel = new JLabel(title);
+			titleLabel.setFont(FontManager.getRunescapeSmallFont());
+			titleLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+			detailsPanel.add(titleLabel);
+
+			JLabel itemLabel = new JLabel(request.getItemName()
+				+ (request.getQuantity() > 1 ? " x" + request.getQuantity() : "")
+				+ "  • " + request.getDurationDays() + " days");
+			itemLabel.setFont(FontManager.getRunescapeBoldFont());
+			itemLabel.setForeground(Color.WHITE);
+			detailsPanel.add(itemLabel);
+
+			if (request.getMessage() != null && !request.getMessage().isEmpty())
+			{
+				setToolTipText("Message: " + request.getMessage());
+			}
+
+			add(detailsPanel, BorderLayout.CENTER);
+
+			JLabel hintLabel = new JLabel(incoming ? "<html><center>Right-click<br>to respond</center></html>" : "Pending");
+			hintLabel.setFont(FontManager.getRunescapeSmallFont());
+			hintLabel.setForeground(Color.GRAY);
+			add(hintLabel, BorderLayout.EAST);
+
+			setComponentPopupMenu(createRequestPopupMenu());
+		}
+
+		private JPopupMenu createRequestPopupMenu()
+		{
+			JPopupMenu menu = new JPopupMenu();
+			if (incoming)
+			{
+				JMenuItem acceptItem = new JMenuItem("Accept");
+				acceptItem.addActionListener(e -> acceptRequest(request));
+				menu.add(acceptItem);
+
+				JMenuItem declineItem = new JMenuItem("Decline");
+				declineItem.addActionListener(e -> respondToRequest(request, LendingRequest.STATUS_DECLINED));
+				menu.add(declineItem);
+			}
+			else
+			{
+				JMenuItem cancelItem = new JMenuItem("Cancel Request");
+				cancelItem.addActionListener(e -> respondToRequest(request, LendingRequest.STATUS_CANCELLED));
+				menu.add(cancelItem);
+			}
+
+			if (request.getMessage() != null && !request.getMessage().isEmpty())
+			{
+				menu.addSeparator();
+				JMenuItem msgItem = new JMenuItem("Message: " + request.getMessage());
+				msgItem.setEnabled(false);
+				menu.add(msgItem);
+			}
+			return menu;
+		}
+	}
+
+	/** Accept an incoming request: create the loan and mark the request accepted. */
+	private void acceptRequest(LendingRequest request)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		String me = getCurrentPlayerName();
+		if (groupId == null || me == null || me.equals("Not logged in"))
+		{
+			JOptionPane.showMessageDialog(this, "You must be logged in with an active group.",
+				"Error", JOptionPane.ERROR_MESSAGE);
+			return;
+		}
+
+		// Re-check the live status: the request may have been accepted/declined on
+		// another client and merged in since this card was drawn. Acting on a stale
+		// card would create a duplicate loan and flip the status back to accepted.
+		LendingRequest current = dataService.getRequests(groupId).stream()
+			.filter(r -> request.getId().equals(r.getId()))
+			.findFirst().orElse(null);
+		if (current == null || !current.isPending())
+		{
+			JOptionPane.showMessageDialog(this,
+				"This request has already been handled.", "Already Handled",
+				JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+
+		// Borrow request: I'm the lender. Lend offer: I'm the borrower.
+		String lender = request.isBorrowRequest() ? me : request.getFrom();
+		String borrower = request.isBorrowRequest() ? request.getFrom() : me;
+		int quantity = Math.max(1, request.getQuantity());
+
+		String summary = String.format("%s\nLender: %s\nBorrower: %s\nDuration: %d days\n\nRecord this loan?",
+			request.getItemName() + (quantity > 1 ? " x" + quantity : ""),
+			lender, borrower, request.getDurationDays());
+		if (JOptionPane.showConfirmDialog(this, summary, "Accept Request",
+			JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION)
+		{
+			return;
+		}
+
+		LendingEntry entry = new LendingEntry();
+		entry.setId(java.util.UUID.randomUUID().toString());
+		entry.setItem(request.getItemName());
+		entry.setItemId(request.getItemId());
+		entry.setQuantity(quantity);
+		entry.setNotes(request.getMessage());
+		long value = 0;
+		try
+		{
+			if (request.getItemId() > 0)
+			{
+				value = (long) itemManager.getItemPrice(request.getItemId()) * quantity;
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("Could not look up item price for {}", request.getItemId());
+		}
+		entry.setValue(value);
+
+		long dueTime = System.currentTimeMillis() + request.getDurationDays() * 86400000L;
+		dataService.addLoan(groupId, lender, borrower, entry, dueTime);
+		dataService.updateRequestStatus(groupId, request.getId(), LendingRequest.STATUS_ACCEPTED);
+
+		// If I lent from my marketplace listing, reduce or remove it. Use the
+		// offering's own lender key (not `me`) so a case difference in the stored
+		// owner key doesn't leave the item still showing as available.
+		if (request.isBorrowRequest() && request.getItemId() > 0)
+		{
+			for (LendingEntry offering : dataService.getOfferingsByOwner(groupId, me))
+			{
+				if (offering.getItemId() == request.getItemId())
+				{
+					String ownerKey = offering.getLender() != null ? offering.getLender() : me;
+					if (offering.getQuantity() > quantity)
+					{
+						LendingEntry updated = new LendingEntry(offering);
+						updated.setQuantity(offering.getQuantity() - quantity);
+						dataService.updateAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId(), updated);
+					}
+					else
+					{
+						dataService.removeAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId());
+					}
+					break;
+				}
+			}
+		}
+
+		refresh();
+	}
+
+	/** Decline an incoming request or cancel an outgoing one. */
+	private void respondToRequest(LendingRequest request, String status)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		if (groupId == null)
+		{
+			return;
+		}
+		dataService.updateRequestStatus(groupId, request.getId(), status);
+		refresh();
+	}
+
 	private static class LookingForRequest
 	{
 		String id;
@@ -1887,10 +2139,22 @@ public class DashboardPanel extends JPanel
 					if (hoursRadio.isSelected()) duration = -duration; // Negative = hours
 					String durationDisplay = duration < 0 ? Math.abs(duration) + " hours" : duration + " days";
 					int durationDays = duration < 0 ? Math.max(1, Math.abs(duration) / 24) : duration;
-					plugin.sendLendOffer(lender, request.requesterName, request.itemName, offerQty, durationDays, msgField.getText().trim(), durationDisplay);
-					JOptionPane.showMessageDialog(DashboardPanel.this,
-						"Offer sent to " + request.requesterName + "!\nItem: " + request.itemName + " x" + offerQty + "\nDuration: " + durationDisplay,
-						"Offer Sent", JOptionPane.INFORMATION_MESSAGE);
+					boolean sent = plugin.sendLendOffer(lender, request.requesterName, request.itemName, offerQty, durationDays, msgField.getText().trim(), durationDisplay);
+					if (sent)
+					{
+						String deliveryNote = plugin.isRelaySyncConnected()
+							? "They'll see it in their Lending Tracker panel."
+							: "Cloud Sync is offline — it will be delivered when they next sync.";
+						JOptionPane.showMessageDialog(DashboardPanel.this,
+							"Offer sent to " + request.requesterName + "!\nItem: " + request.itemName + " x" + offerQty + "\nDuration: " + durationDisplay + "\n" + deliveryNote,
+							"Offer Sent", JOptionPane.INFORMATION_MESSAGE);
+					}
+					else
+					{
+						JOptionPane.showMessageDialog(DashboardPanel.this,
+							"Could not send the offer — no active group.",
+							"Offer Not Sent", JOptionPane.ERROR_MESSAGE);
+					}
 				}
 				catch (NumberFormatException e)
 				{

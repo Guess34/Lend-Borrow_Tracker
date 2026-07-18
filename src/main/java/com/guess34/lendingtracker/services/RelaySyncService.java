@@ -32,8 +32,17 @@ public class RelaySyncService
 	private static final long MAX_RECONNECT_DELAY_MS = 30000;
 	private static final MediaType JSON_MEDIA = MediaType.parse("application/json; charset=utf-8");
 	private static final String HMAC_ALGORITHM = "HmacSHA256";
-	// ADDED: Max age for sync messages to prevent replay attacks (5 minutes)
-	private static final long MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
+	// Max age for sync messages, a coarse replay/ancient-message bound. Kept
+	// generous (24h) because timestamps are the sender's wall clock: a tight
+	// window silently dropped ALL live sync between members whose clocks differed
+	// by more than a few minutes. Fine-grained replay of state is additionally
+	// blocked by the per-publisher monotonic timestamp gate below.
+	private static final long MAX_MESSAGE_AGE_MS = 24L * 60 * 60 * 1000;
+
+	// Highest state timestamp applied per "groupId:publisher", so a replayed
+	// (older-or-equal) state broadcast can't revert a member's rows.
+	private final java.util.concurrent.ConcurrentHashMap<String, Long> lastStateTs =
+		new java.util.concurrent.ConcurrentHashMap<>();
 	// Keepalive cadence: ping ~every 12 min, never sooner than 2 min apart
 	private static final long KEEPALIVE_INTERVAL_MS = 12 * 60 * 1000;
 	private static final long KEEPALIVE_MIN_DELAY_MS = 2 * 60 * 1000;
@@ -60,7 +69,14 @@ public class RelaySyncService
 	private volatile OkHttpClient restClient;
 	private Consumer<GroupService.SyncEvent> onEventReceived;
 	private Consumer<Boolean> onConnectionChanged;
-	private java.util.function.BiConsumer<String, String> onStateReceived; // (groupJson, dataJson)
+	private StateHandler onStateReceived;
+
+	/** Callback for relay state messages (join catch-up or live broadcast). */
+	@FunctionalInterface
+	public interface StateHandler
+	{
+		void accept(String groupJson, String dataJson, String publisher);
+	}
 
 	// --- Connection Lifecycle ---
 
@@ -242,8 +258,13 @@ public class RelaySyncService
 	{
 		String type = eventJson.has("type") ? eventJson.get("type").getAsString() : "";
 		String timestamp = eventJson.has("timestamp") ? eventJson.get("timestamp").getAsString() : "0";
-		String publisher = eventJson.has("publisher") ? eventJson.get("publisher").getAsString() : "";
-		return groupId + ":" + type + ":" + timestamp + ":" + publisher;
+		String publisher = eventJson.has("publisher") && !eventJson.get("publisher").isJsonNull()
+			? eventJson.get("publisher").getAsString() : "";
+		// dataId drives targeted mutations (e.g. archiving a loan by id), so it must
+		// be signed too — otherwise a tampered id would pass verification.
+		String dataId = eventJson.has("dataId") && !eventJson.get("dataId").isJsonNull()
+			? eventJson.get("dataId").getAsString() : "";
+		return groupId + ":" + type + ":" + timestamp + ":" + publisher + ":" + dataId;
 	}
 
 	/**
@@ -561,15 +582,25 @@ public class RelaySyncService
 		});
 	}
 
-	// --- REST: Group State (catch-up sync) ---
+	// --- Group State (catch-up sync) ---
 
 	/**
-	 * Push the latest group + data state to the relay so offline members can catch up.
+	 * Push the latest group + data state to the relay. The relay stores it for
+	 * catch-up (served by GET /api/state) AND broadcasts it live to other members.
+	 *
+	 * The live broadcast is HMAC-signed with the group secret so peers can verify
+	 * it really came from a member before applying it — without this a client that
+	 * only knows the groupId could push a forged state and wipe everyone's data.
+	 *
+	 * @param publisher this client's player name; receivers treat the publisher as
+	 *                  authoritative for their own rows when merging the snapshot
 	 */
-	public void publishState(String groupId, String groupJson, String dataJson)
+	public void publishState(String groupId, String groupJson, String dataJson, String publisher)
 	{
 		if (config == null || !config.enableRelaySync()) return;
 		if (!connected || webSocket == null || groupId == null) return;
+
+		long timestamp = System.currentTimeMillis();
 
 		JsonObject msg = new JsonObject();
 		msg.addProperty("type", "state");
@@ -579,8 +610,139 @@ public class RelaySyncService
 		{
 			msg.addProperty("dataJson", dataJson);
 		}
+		if (publisher != null)
+		{
+			msg.addProperty("publisher", publisher);
+		}
+		msg.addProperty("timestamp", timestamp);
+
+		if (currentSyncSecret != null && !currentSyncSecret.isEmpty())
+		{
+			String signature = computeHmac(
+				buildStateSignaturePayload(groupId, publisher, timestamp, groupJson, dataJson),
+				currentSyncSecret);
+			if (signature != null)
+			{
+				msg.addProperty("signature", signature);
+			}
+		}
+
 		webSocket.send(gson.toJson(msg));
 		log.debug("Published group state to relay for group {}", groupId);
+	}
+
+	/**
+	 * Fetch the stored catch-up snapshot for a group over REST and hand it to the
+	 * state handler with a null publisher (authoritative full-state catch-up).
+	 * This is a request the client initiates to the configured relay, so the
+	 * response is trusted without a per-message signature. Blocking — run off the EDT.
+	 */
+	public void fetchStateSnapshot(String groupId)
+	{
+		if (config == null || !config.enableRelaySync() || groupId == null) return;
+
+		String baseUrl = getRestBaseUrl();
+		if (baseUrl == null) return;
+
+		Request request = new Request.Builder()
+			.url(baseUrl + "/api/state/" + groupId)
+			.get()
+			.build();
+
+		try (Response response = getRestClient().newCall(request).execute())
+		{
+			if (!response.isSuccessful() || response.body() == null)
+			{
+				return;
+			}
+			JsonObject json = gson.fromJson(response.body().string(), JsonObject.class);
+			if (json == null) return;
+
+			// Verify the stored snapshot was signed by a member holding the group
+			// secret. The relay stores whatever it's sent (and anyone who knows the
+			// groupId could try to seed a forged snapshot), so we must not apply an
+			// unsigned or tampered catch-up. Freshness is NOT enforced here — stored
+			// catch-up state is legitimately old — but the signature and the merge's
+			// last-write-wins still prevent forgery and stale-data damage.
+			JsonObject stateMsg = new JsonObject();
+			stateMsg.addProperty("groupId", groupId);
+			copyIfPresent(json, stateMsg, "groupJson");
+			copyIfPresent(json, stateMsg, "dataJson");
+			copyIfPresent(json, stateMsg, "publisher");
+			copyIfPresent(json, stateMsg, "timestamp");
+			copyIfPresent(json, stateMsg, "signature");
+			if (!verifyStateSignature(stateMsg))
+			{
+				log.warn("Dropping catch-up state for group {}: invalid or missing signature", groupId);
+				return;
+			}
+
+			String groupJson = json.has("groupJson") && !json.get("groupJson").isJsonNull()
+				? json.get("groupJson").getAsString() : null;
+			String dataJson = json.has("dataJson") && !json.get("dataJson").isJsonNull()
+				? json.get("dataJson").getAsString() : null;
+			if (groupJson != null && onStateReceived != null)
+			{
+				onStateReceived.accept(groupJson, dataJson, null);
+			}
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to fetch catch-up state from relay: {}", e.getMessage());
+		}
+	}
+
+	private void copyIfPresent(JsonObject from, JsonObject to, String key)
+	{
+		if (from.has(key) && !from.get(key).isJsonNull())
+		{
+			to.add(key, from.get(key));
+		}
+	}
+
+	/**
+	 * Canonical string signed for a state message. Includes the full group and
+	 * data JSON so neither can be tampered with in transit.
+	 */
+	private String buildStateSignaturePayload(String groupId, String publisher, long timestamp,
+		String groupJson, String dataJson)
+	{
+		return groupId + ":" + (publisher == null ? "" : publisher) + ":" + timestamp
+			+ ":" + (groupJson == null ? "" : groupJson)
+			+ ":" + (dataJson == null ? "" : dataJson);
+	}
+
+	/**
+	 * Verify the HMAC signature on an incoming live state broadcast.
+	 */
+	private boolean verifyStateSignature(JsonObject msg)
+	{
+		if (currentSyncSecret == null || currentSyncSecret.isEmpty())
+		{
+			log.warn("Rejecting relay state: no sync secret configured for current group");
+			return false;
+		}
+		if (!msg.has("signature") || msg.get("signature").isJsonNull())
+		{
+			log.warn("Rejecting relay state: missing HMAC signature");
+			return false;
+		}
+
+		String groupId = msg.has("groupId") ? msg.get("groupId").getAsString() : "";
+		String publisher = msg.has("publisher") && !msg.get("publisher").isJsonNull()
+			? msg.get("publisher").getAsString() : null;
+		long timestamp = msg.has("timestamp") && !msg.get("timestamp").isJsonNull()
+			? msg.get("timestamp").getAsLong() : 0;
+		String groupJson = msg.has("groupJson") && !msg.get("groupJson").isJsonNull()
+			? msg.get("groupJson").getAsString() : null;
+		String dataJson = msg.has("dataJson") && !msg.get("dataJson").isJsonNull()
+			? msg.get("dataJson").getAsString() : null;
+
+		String expected = computeHmac(
+			buildStateSignaturePayload(groupId, publisher, timestamp, groupJson, dataJson),
+			currentSyncSecret);
+		if (expected == null) return false;
+		return constantTimeEquals(expected, msg.get("signature").getAsString());
 	}
 
 	// --- Callbacks ---
@@ -595,7 +757,7 @@ public class RelaySyncService
 		this.onConnectionChanged = callback;
 	}
 
-	public void setOnStateReceived(java.util.function.BiConsumer<String, String> callback)
+	public void setOnStateReceived(StateHandler callback)
 	{
 		this.onStateReceived = callback;
 	}
@@ -817,15 +979,51 @@ public class RelaySyncService
 				}
 				else if ("state".equals(type))
 				{
-					// Catch-up state from relay (sent when joining a room)
+					// Live state broadcast pushed when another member's data changed.
+					// (Join catch-up is fetched over REST via fetchStateSnapshot, not here.)
+					// Verify the HMAC and freshness before applying — an unsigned or
+					// forged push must never be able to overwrite local data.
+					if (!verifyStateSignature(msg))
+					{
+						log.warn("Dropping relay state with invalid signature");
+						return;
+					}
+					if (!isTimestampValid(msg))
+					{
+						return;
+					}
+
 					String groupJson = msg.has("groupJson") ? msg.get("groupJson").getAsString() : null;
 					String dataJson = msg.has("dataJson") && !msg.get("dataJson").isJsonNull()
 						? msg.get("dataJson").getAsString() : null;
-					if (groupJson != null && onStateReceived != null)
+					String publisher = msg.has("publisher") && !msg.get("publisher").isJsonNull()
+						? msg.get("publisher").getAsString() : null;
+					String groupId = msg.has("groupId") ? msg.get("groupId").getAsString() : null;
+					long timestamp = msg.has("timestamp") && !msg.get("timestamp").isJsonNull()
+						? msg.get("timestamp").getAsLong() : 0;
+
+					// Drop a replayed or duplicate state: only apply strictly newer
+					// timestamps per publisher.
+					if (groupId != null && publisher != null)
 					{
-						log.info("Received catch-up state from relay for group {}",
-							msg.has("groupId") ? msg.get("groupId").getAsString() : "unknown");
-						onStateReceived.accept(groupJson, dataJson);
+						String key = groupId + ":" + publisher;
+						Long prev = lastStateTs.get(key);
+						// Drop only STRICTLY older states (definitely superseded). Equal
+						// timestamps are allowed through: two pushes can share a
+						// millisecond, and re-applying the same full snapshot is
+						// idempotent, so this can't lose the more recent of the two.
+						if (prev != null && timestamp < prev)
+						{
+							return;
+						}
+						lastStateTs.put(key, Math.max(timestamp, prev != null ? prev : timestamp));
+					}
+
+					if (groupJson != null && publisher != null && onStateReceived != null)
+					{
+						log.info("Received live state from relay for group {} (publisher: {})",
+							groupId != null ? groupId : "unknown", publisher);
+						onStateReceived.accept(groupJson, dataJson, publisher);
 					}
 				}
 			}
