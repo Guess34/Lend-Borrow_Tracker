@@ -8,6 +8,14 @@ import net.runelite.client.config.ConfigSection;
 @ConfigGroup("lendingtracker")
 public interface LendingTrackerConfig extends Config
 {
+	/** How a guard reacts when a borrowed item is at risk. */
+	enum GuardMode
+	{
+		OFF,
+		WARN,
+		BLOCK
+	}
+
 	// Sections
 
 	@ConfigSection(
@@ -33,6 +41,14 @@ public interface LendingTrackerConfig extends Config
 		closedByDefault = true
 	)
 	String screenshotSection = "screenshots";
+
+	@ConfigSection(
+		name = "Borrowed Item Guards",
+		description = "Warn or block risky actions while you hold someone else's items",
+		position = 55,
+		closedByDefault = false
+	)
+	String guardSection = "guards";
 
 	@ConfigSection(
 		name = "Sync",
@@ -107,14 +123,14 @@ public interface LendingTrackerConfig extends Config
 
 	@ConfigItem(
 		keyName = "enableTradeScreenshots",
-		name = "Trade Screenshots",
-		description = "Automatically capture screenshots during lending and return trades",
+		name = "Loan Trade Screenshots",
+		description = "Save a proof screenshot when a trade you marked as a loan (or a return of a loan) completes. Saved locally under .runelite/lending-tracker/proof",
 		position = 0,
 		section = screenshotSection
 	)
 	default boolean enableTradeScreenshots()
 	{
-		return false;
+		return true;
 	}
 
 	@ConfigItem(
@@ -125,6 +141,68 @@ public interface LendingTrackerConfig extends Config
 		section = screenshotSection
 	)
 	default boolean screenshotIncludeOverlay()
+	{
+		return true;
+	}
+
+	// Borrowed Item Guards
+
+	@ConfigItem(
+		keyName = "tradeGuard",
+		name = "Trade Guard",
+		description = "Warn or block when you try to offer an item you're borrowing in a trade. Hold Shift to override a block. Guards only know about loans recorded on (or synced to) this client.",
+		position = 0,
+		section = guardSection
+	)
+	default GuardMode tradeGuard()
+	{
+		return GuardMode.WARN;
+	}
+
+	@ConfigItem(
+		keyName = "allowLendBorrowedToGroup",
+		name = "Allow Trading to Group Members",
+		description = "Only warn (never block) when offering a borrowed item to a member of your lending group, e.g. handing it back or passing it on",
+		position = 1,
+		section = guardSection
+	)
+	default boolean allowLendBorrowedToGroup()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "wildernessGuard",
+		name = "Wilderness Guard",
+		description = "Warn when entering the Wilderness carrying borrowed items. BLOCK also stops the Wilderness ditch 'Cross' click (hold Shift to override). Teleports and other entrances can't be blocked - you still get the warning.",
+		position = 2,
+		section = guardSection
+	)
+	default GuardMode wildernessGuard()
+	{
+		return GuardMode.WARN;
+	}
+
+	@ConfigItem(
+		keyName = "alertLenderWilderness",
+		name = "Lender Wilderness Alerts",
+		description = "Notify you when someone borrowing YOUR item has been in the Wilderness for 45+ seconds (requires the borrower to be online with the plugin)",
+		position = 3,
+		section = guardSection
+	)
+	default boolean alertLenderWilderness()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "promptListedLoans",
+		name = "Detect Loans from Marketplace",
+		description = "When an item you have listed for lending appears in your trade offer, ask once per trade whether to record the trade as a loan - no right-click marking needed",
+		position = 4,
+		section = guardSection
+	)
+	default boolean promptListedLoans()
 	{
 		return true;
 	}

@@ -576,20 +576,6 @@ public class DataService
 		return removed;
 	}
 
-	public List<LendingEntry> getEntriesForPlayer(String playerName)
-	{
-		if (playerName == null)
-		{
-			return new ArrayList<>();
-		}
-
-		return allEntries.values().stream()
-			.filter(entry -> playerName.equalsIgnoreCase(entry.getPlayerName()) ||
-				playerName.equalsIgnoreCase(entry.getBorrower()) ||
-				playerName.equalsIgnoreCase(entry.getLender()))
-			.collect(Collectors.toList());
-	}
-
 	public List<LendingEntry> getOverdueEntries()
 	{
 		long currentTime = Instant.now().toEpochMilli();
@@ -623,6 +609,146 @@ public class DataService
 				);
 			}
 		}
+	}
+
+	/**
+	 * Remove an active loan and archive it to history as "forgiven by the lender".
+	 * The lender is the creditor, so dropping their own claim harms no one — this
+	 * is only offered for loans with NO collateral (a collateralised loan is a real
+	 * exchange that could be disputed, so it needs the two-party / staff paths).
+	 *
+	 * Propagates like a return (the lender is authoritative for their own loans, so
+	 * peers archive it and it won't be resurrected). Returns false if not found.
+	 */
+	public boolean forgiveLoan(String entryId, String actingLender)
+	{
+		LendingEntry entry = allEntries.get(entryId);
+		if (entry == null)
+		{
+			return false;
+		}
+		// Only the lender may forgive, and only when no collateral is held
+		if (actingLender == null || !actingLender.equalsIgnoreCase(entry.getLender()) || hasCollateral(entry))
+		{
+			return false;
+		}
+
+		long now = System.currentTimeMillis();
+		entry.setReturnedAt(now); // close it out for history/overdue purposes
+		entry.setUpdatedAt(now);
+		String stamp = "[Forgiven by lender " + actingLender + "]";
+		entry.setNotes(entry.getNotes() == null || entry.getNotes().isEmpty()
+			? stamp : entry.getNotes() + " " + stamp);
+
+		historyEntries.add(new LendingEntry(entry));
+		allEntries.remove(entryId);
+		removeEntryFromCategory(groupLent, entryId);
+		removeEntryFromCategory(groupBorrowed, entryId);
+		saveEntries();
+
+		if (groupService != null && entry.getGroupId() != null)
+		{
+			groupService.publishEvent(GroupService.SyncEventType.ITEM_RETURNED, entryId, entry);
+		}
+		return true;
+	}
+
+	/** True if this loan has GP or item collateral recorded against it. */
+	public static boolean hasCollateral(LendingEntry entry)
+	{
+		return (entry.getCollateralValue() != null && entry.getCollateralValue() > 0)
+			|| (entry.getCollateralItems() != null && !entry.getCollateralItems().isEmpty());
+	}
+
+	/**
+	 * Remove an active loan because its removal request was APPROVED (by the
+	 * counterparty, or by uninvolved staff). Archives to history with an audit
+	 * stamp naming the approval, so a removal is never silent. Propagates like a
+	 * return. The caller enforces WHO may trigger this; returns false if the loan
+	 * is already gone (idempotent).
+	 */
+	public boolean removeLoanApproved(String entryId, String auditStamp)
+	{
+		LendingEntry entry = allEntries.get(entryId);
+		if (entry == null)
+		{
+			return false;
+		}
+
+		long now = System.currentTimeMillis();
+		entry.setReturnedAt(now);
+		entry.setUpdatedAt(now);
+		entry.setNotes(entry.getNotes() == null || entry.getNotes().isEmpty()
+			? auditStamp : entry.getNotes() + " " + auditStamp);
+
+		historyEntries.add(new LendingEntry(entry));
+		allEntries.remove(entryId);
+		removeEntryFromCategory(groupLent, entryId);
+		removeEntryFromCategory(groupBorrowed, entryId);
+		saveEntries();
+
+		if (groupService != null && entry.getGroupId() != null)
+		{
+			groupService.publishEvent(GroupService.SyncEventType.ITEM_RETURNED, entryId, entry);
+		}
+		return true;
+	}
+
+	/** Look up an active loan by id, or null. */
+	public LendingEntry getActiveEntry(String entryId)
+	{
+		return entryId != null ? allEntries.get(entryId) : null;
+	}
+
+	/** Is there already an unresolved removal request for this loan? */
+	public boolean hasPendingRemovalFor(String groupId, String entryId)
+	{
+		return getRequests(groupId).stream()
+			.anyMatch(r -> r.isRemoval() && r.isPending() && entryId != null && entryId.equals(r.getEntryId()));
+	}
+
+	/** Was a MUTUAL removal request for this loan already declined (escalation grounds)? */
+	public boolean hasDeclinedMutualRemovalFor(String groupId, String entryId)
+	{
+		return getRequests(groupId).stream()
+			.anyMatch(r -> LendingRequest.TYPE_REMOVAL_MUTUAL.equals(r.getType())
+				&& LendingRequest.STATUS_DECLINED.equals(r.getStatus())
+				&& entryId != null && entryId.equals(r.getEntryId()));
+	}
+
+	/**
+	 * Pending staff-review removals this viewer may adjudicate: viewer must be an
+	 * owner or co-owner of the group, must not be the requester, and must not be a
+	 * party (lender/borrower) to the loan — nobody clears their own loan.
+	 */
+	public List<LendingRequest> getPendingStaffRemovalsFor(String groupId, String viewer,
+		com.guess34.lendingtracker.model.LendingGroup group)
+	{
+		List<LendingRequest> result = new ArrayList<>();
+		if (viewer == null || group == null || groupService == null)
+		{
+			return result;
+		}
+		boolean isStaff = groupService.isOwner(groupId, viewer) || groupService.isCoOwner(groupId, viewer);
+		if (!isStaff)
+		{
+			return result;
+		}
+		for (LendingRequest r : getRequests(groupId))
+		{
+			if (!r.isStaffRemoval() || !r.isPending() || viewer.equalsIgnoreCase(r.getFrom()))
+			{
+				continue;
+			}
+			LendingEntry entry = getActiveEntry(r.getEntryId());
+			if (entry != null
+				&& (viewer.equalsIgnoreCase(entry.getLender()) || viewer.equalsIgnoreCase(entry.getBorrower())))
+			{
+				continue; // party to the loan — conflict of interest
+			}
+			result.add(r);
+		}
+		return result;
 	}
 
 	// Data retention / cleanup

@@ -72,31 +72,86 @@ public class ProofScreenshot
 		}
 	}
 
+	/** Screenshot phases captured across a loan trade's lifecycle. */
+	public static final String PHASE_FIRST_SCREEN = "first_screen";
+	public static final String PHASE_CONFIRM_SCREEN = "confirm_screen";
+	public static final String PHASE_COMPLETED = "completed";
+
+	// Frames captured while the trade screens were visible (keyed by phase),
+	// waiting for the trade to complete. Written to disk only when the trade is
+	// accepted, so a declined trade never leaves files behind. Re-caching a phase
+	// overwrites it, so the saved first-screen shot reflects the FINAL offers.
+	// The generation counter is bumped by commit/discard so an in-flight capture
+	// from an already-ended trade can't store its frame late and get committed as
+	// "proof" of a DIFFERENT trade; all access goes through cacheLock so the
+	// generation check and the store/take are atomic.
+	private final Object cacheLock = new Object();
+	private final java.util.Map<String, BufferedImage> cachedFrames = new java.util.HashMap<>();
+	private int cacheGeneration;
+
 	/**
-	 * Capture screenshot during second accept screen
+	 * Capture the next rendered frame and hold it in memory under the given
+	 * phase. Call while the relevant trade screen is open — the "Accepted trade."
+	 * message only arrives after the windows close, so capturing at that point
+	 * would miss the evidence.
 	 */
-	public void captureSecondAcceptScreen(String username, String groupName, String tradePartner,
-										   String eventType, LendingEntry entry)
+	public void cacheTradeFrame(String phase)
 	{
-		captureTradeScreenshot(username, groupName, tradePartner, eventType, "second_accept", entry);
+		final int generation;
+		synchronized (cacheLock)
+		{
+			generation = cacheGeneration;
+		}
+		drawManager.requestNextFrameListener(image ->
+			executor.submit(() ->
+			{
+				BufferedImage frame = toBufferedImage(image);
+				synchronized (cacheLock)
+				{
+					if (cacheGeneration == generation)
+					{
+						cachedFrames.put(phase, frame);
+					}
+				}
+			}));
 	}
 
 	/**
-	 * Capture screenshot after trade completion
+	 * Save every cached trade frame (first screen, confirm screen) as proof
+	 * screenshots for a completed trade, plus a fresh post-completion frame that
+	 * catches the "Accepted trade." and loan-recorded chat lines — up to three
+	 * shots documenting the whole hand-over.
 	 */
-	public void captureTradeCompletion(String username, String groupName, String tradePartner,
-										String eventType, LendingEntry entry)
+	public void commitCachedTrade(String username, String groupName, String tradePartner,
+		String eventType, LendingEntry entry)
 	{
-		captureTradeScreenshot(username, groupName, tradePartner, eventType, "completed", entry);
+		java.util.Map<String, BufferedImage> frames;
+		synchronized (cacheLock)
+		{
+			cacheGeneration++;
+			frames = new java.util.HashMap<>(cachedFrames);
+			cachedFrames.clear();
+		}
+		for (java.util.Map.Entry<String, BufferedImage> cached : frames.entrySet())
+		{
+			final String phase = cached.getKey();
+			final BufferedImage toSave = cached.getValue();
+			executor.submit(() ->
+				saveScreenshot(toSave, username, groupName, tradePartner, eventType, phase, entry));
+		}
+		// Fresh frame after completion — the chat now shows the acceptance and the
+		// recorded items in text
+		captureTradeScreenshot(username, groupName, tradePartner, eventType, PHASE_COMPLETED, entry);
 	}
 
-	/**
-	 * Capture screenshot for return transaction
-	 */
-	public void captureReturnScreenshot(String username, String groupName, String returnedBy,
-										 String phase, LendingEntry entry)
+	/** Drop all cached frames (trade declined or cancelled). */
+	public void discardCachedFrame()
 	{
-		captureTradeScreenshot(username, groupName, returnedBy, "RETURN", phase, entry);
+		synchronized (cacheLock)
+		{
+			cacheGeneration++;
+			cachedFrames.clear();
+		}
 	}
 
 	// Capture the game canvas with DrawManager, then overlay + save off-thread
@@ -248,7 +303,9 @@ public class ProofScreenshot
 		if (phase == null) return "";
 		switch (phase.toLowerCase())
 		{
+			case "first_screen": return "First Trade Screen";
 			case "second_accept": return "Second Accept Screen";
+			case "confirm_screen": return "Confirm Screen";
 			case "completed": return "Trade Completed";
 			default: return phase;
 		}

@@ -71,6 +71,7 @@ public class GroupService
 	private String currentSyncPlayerName;
 	private long lastSyncTimestamp = 0;
 	private Runnable onSyncCallback;
+	private java.util.function.Consumer<SyncEvent> onWildernessAlert;
 
 	// --- Initialization & Account Lifecycle ---
 
@@ -938,6 +939,11 @@ public class GroupService
 		currentSyncPlayerName = null;
 	}
 
+	public void setOnWildernessAlert(java.util.function.Consumer<SyncEvent> callback)
+	{
+		this.onWildernessAlert = callback;
+	}
+
 	public void setOnSyncCallback(Runnable callback)
 	{
 		this.onSyncCallback = callback;
@@ -1064,15 +1070,6 @@ public class GroupService
 		{
 			log.error("Failed to handle relay state: {}", e.getMessage(), e);
 		}
-	}
-
-	public void syncLending(String groupId, LendingEntry entry)
-	{
-		if (entry == null) return;
-		String previousGroupId = currentSyncGroupId;
-		currentSyncGroupId = groupId;
-		publishEvent(SyncEventType.ITEM_ADDED, entry.getId(), entry);
-		currentSyncGroupId = previousGroupId;
 	}
 
 	public void syncAllEntries(String groupId, List<LendingEntry> entries)
@@ -1202,6 +1199,15 @@ public class GroupService
 					if (currentSyncGroupId != null)
 					{
 						loadSharedGroupState(currentSyncGroupId);
+					}
+					break;
+				case WILDERNESS_ALERT:
+				case WILDERNESS_ALERT_COLLATERAL:
+					// Surface to the plugin, which decides whether the local player is
+					// the affected party (lender or borrower) and whether to notify
+					if (onWildernessAlert != null && event.getDataId() != null)
+					{
+						onWildernessAlert.accept(event);
 					}
 					break;
 				default:
@@ -1394,7 +1400,15 @@ public class GroupService
 		SETTINGS_CHANGED,
 		ITEM_SET_DELETED,
 		REQUEST_CREATED,
-		REQUEST_UPDATED
+		REQUEST_UPDATED,
+		// Borrower has been in the wilderness 45+ seconds carrying a borrowed item;
+		// dataId = the loan entry id, publisher = the borrower. Real-time alarm for
+		// the lender — not persisted in snapshots.
+		WILDERNESS_ALERT,
+		// The LENDER has been in the wilderness 45+ seconds carrying the item
+		// collateral they hold for a loan; dataId = the loan entry id, publisher =
+		// the lender. Real-time alarm for the borrower, whose collateral is at risk.
+		WILDERNESS_ALERT_COLLATERAL
 	}
 
 	public static class SyncEvent

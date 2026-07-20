@@ -29,6 +29,11 @@ public class LendingEntry {
     private Integer collateralValue;
     private String collateralType;
     private String collateralItems;
+    // Machine-readable collateral: "itemId:qty,itemId:qty". Lets the guards treat
+    // collateral the lender is holding like borrowed items (the lender is
+    // responsible for it until the loan settles). collateralItems above is the
+    // human-readable label only.
+    private String collateralItemIds;
     private boolean agreedNoCollateral;
 
     // Group / party
@@ -68,6 +73,7 @@ public class LendingEntry {
         this.collateralValue = other.collateralValue;
         this.collateralType = other.collateralType;
         this.collateralItems = other.collateralItems;
+        this.collateralItemIds = other.collateralItemIds;
         this.agreedNoCollateral = other.agreedNoCollateral;
         this.groupId = other.groupId;
         this.lendTime = other.lendTime;

@@ -18,6 +18,12 @@ public class LendingRequest
 {
 	public static final String TYPE_BORROW_REQUEST = "BORROW_REQUEST";
 	public static final String TYPE_LEND_OFFER = "LEND_OFFER";
+	// Loan-removal governance: MUTUAL = the loan's counterparty must approve
+	// (first course of action); STAFF = an uninvolved owner/co-owner adjudicates,
+	// only for loans whose counterparty was never a group member (mobile/no-plugin
+	// borrowers) or as escalation after a mutual request failed.
+	public static final String TYPE_REMOVAL_MUTUAL = "REMOVAL_MUTUAL";
+	public static final String TYPE_REMOVAL_STAFF = "REMOVAL_STAFF";
 
 	public static final String STATUS_PENDING = "PENDING";
 	public static final String STATUS_ACCEPTED = "ACCEPTED";
@@ -26,9 +32,10 @@ public class LendingRequest
 
 	private String id;
 	private String groupId;
-	private String type;         // TYPE_BORROW_REQUEST or TYPE_LEND_OFFER
+	private String type;         // one of the TYPE_* constants
 	private String from;         // player who created the request
-	private String to;           // player the request is addressed to
+	private String to;           // player the request is addressed to ("" for staff review)
+	private String entryId;      // the loan this request refers to (removal types)
 	private String itemName;
 	private int itemId;
 	private int quantity;
@@ -46,5 +53,15 @@ public class LendingRequest
 	public boolean isBorrowRequest()
 	{
 		return TYPE_BORROW_REQUEST.equals(type);
+	}
+
+	public boolean isRemoval()
+	{
+		return TYPE_REMOVAL_MUTUAL.equals(type) || TYPE_REMOVAL_STAFF.equals(type);
+	}
+
+	public boolean isStaffRemoval()
+	{
+		return TYPE_REMOVAL_STAFF.equals(type);
 	}
 }

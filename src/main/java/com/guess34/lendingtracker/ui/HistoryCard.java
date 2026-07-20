@@ -95,6 +95,11 @@ public class HistoryCard extends JPanel
 		rightPanel.add(statusBadge);
 
 		add(rightPanel, BorderLayout.EAST);
+
+		// Hover anywhere on the card shows the full deal: borrower, dates,
+		// collateral, notes (tooltips don't inherit, so set on every component)
+		LoanTooltip.apply(entry, this, iconLabel, centerPanel, itemNameLabel,
+			participantLabel, rightPanel, dateLabel, statusBadge);
 	}
 
 	/**

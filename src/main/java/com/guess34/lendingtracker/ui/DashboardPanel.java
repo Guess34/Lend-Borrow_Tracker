@@ -279,6 +279,9 @@ public class DashboardPanel extends JPanel
 			if (groupId != null && !groupId.isEmpty() && me != null && !me.equals("Not logged in"))
 			{
 				incomingRequests.addAll(dataService.getPendingRequestsFor(groupId, me));
+				// Staff-review removals visible to eligible uninvolved owners/co-owners
+				incomingRequests.addAll(dataService.getPendingStaffRemovalsFor(groupId, me,
+					groupService.getGroup(groupId)));
 				outgoingRequests.addAll(dataService.getRequestsFrom(groupId, me).stream()
 					.filter(LendingRequest::isPending)
 					.collect(java.util.stream.Collectors.toList()));
@@ -789,7 +792,119 @@ public class DashboardPanel extends JPanel
 
 			add(valuePanel, BorderLayout.EAST);
 
+			// Hover anywhere on the card shows the full deal: borrower, dates,
+			// collateral, notes (tooltips don't inherit, so set on every component)
+			LoanTooltip.apply(loan, this, iconLabel, detailsPanel, itemLabel,
+				borrowerLabel, dueTimeLabel, valuePanel, valueLabel);
+
+			setComponentPopupMenu(buildLoanMenu());
 			addHoverEffect(this, ColorScheme.DARKER_GRAY_HOVER_COLOR, ColorScheme.DARKER_GRAY_COLOR, detailsPanel, valuePanel);
+		}
+
+		private JPopupMenu buildLoanMenu()
+		{
+			String me = getCurrentPlayerName();
+			boolean iAmLender = me != null && me.equalsIgnoreCase(loan.getLender());
+			boolean iAmBorrower = me != null && me.equalsIgnoreCase(loan.getBorrower());
+			boolean noCollateral = !DataService.hasCollateral(loan);
+			String groupId = groupService.getCurrentGroupIdUnchecked();
+
+			JPopupMenu menu = new JPopupMenu();
+
+			// The lender can forgive their OWN loan, but only when no collateral was
+			// taken (a collateralised loan is a real exchange — that needs the
+			// two-party or staff removal path, not a one-click drop).
+			if (iAmLender && noCollateral)
+			{
+				JMenuItem forgive = new JMenuItem("Forgive loan (no collateral)");
+				forgive.addActionListener(e ->
+				{
+					int confirm = JOptionPane.showConfirmDialog(DashboardPanel.this,
+						"Forgive this loan of " + loan.getItem() + " to " + loan.getBorrower() + "?\n"
+							+ "It will be removed from active tracking for the whole group\n"
+							+ "and archived in your history as forgiven.",
+						"Forgive Loan", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+					if (confirm == JOptionPane.YES_OPTION)
+					{
+						if (dataService.forgiveLoan(loan.getId(), me))
+						{
+							refresh();
+						}
+						else
+						{
+							JOptionPane.showMessageDialog(DashboardPanel.this,
+								"Couldn't forgive this loan (it may have collateral or already be settled).",
+								"Not Removed", JOptionPane.ERROR_MESSAGE);
+						}
+					}
+				});
+				menu.add(forgive);
+			}
+
+			// Any party to the loan can propose removal. Routing is decided by the
+			// plugin: the counterparty approves when they're a group member (first
+			// course of action, even if offline); staff review only when the
+			// counterparty was never in the group, or as escalation after a decline.
+			if ((iAmLender || iAmBorrower) && groupId != null)
+			{
+				if (dataService.hasPendingRemovalFor(groupId, loan.getId()))
+				{
+					JMenuItem pending = new JMenuItem("Removal already requested — awaiting approval");
+					pending.setEnabled(false);
+					menu.add(pending);
+				}
+				else
+				{
+					boolean canEscalate = dataService.hasDeclinedMutualRemovalFor(groupId, loan.getId());
+					JMenuItem remove = new JMenuItem(canEscalate
+						? "Escalate removal to staff…" : "Request loan removal…");
+					final boolean escalate = canEscalate;
+					remove.addActionListener(e -> proposeRemoval(loan, escalate));
+					menu.add(remove);
+				}
+			}
+
+			return menu.getComponentCount() > 0 ? menu : null;
+		}
+
+		private void proposeRemoval(LendingEntry loan, boolean escalate)
+		{
+			String reason = (String) JOptionPane.showInputDialog(DashboardPanel.this,
+				"Why should this loan be removed?\n(e.g. \"Loan mode was on by accident — this was a gift\")",
+				"Request Loan Removal", JOptionPane.QUESTION_MESSAGE, null, null, "");
+			if (reason == null)
+			{
+				return; // cancelled
+			}
+
+			LendingTrackerPlugin.RemovalRoute route = plugin.requestLoanRemoval(loan, reason.trim(), escalate);
+			switch (route)
+			{
+				case MUTUAL:
+					JOptionPane.showMessageDialog(DashboardPanel.this,
+						"Removal requested. The other party ("
+							+ (getCurrentPlayerName().equalsIgnoreCase(loan.getLender())
+								? loan.getBorrower() : loan.getLender())
+							+ ") must approve it — they'll be notified, even if they're offline right now.",
+						"Awaiting Approval", JOptionPane.INFORMATION_MESSAGE);
+					break;
+				case STAFF:
+					JOptionPane.showMessageDialog(DashboardPanel.this,
+						"Removal sent to staff review — an owner or co-owner who isn't part of\n"
+							+ "this loan will look into it and approve or decline.",
+						"Awaiting Staff Review", JOptionPane.INFORMATION_MESSAGE);
+					break;
+				case ALREADY_PENDING:
+					JOptionPane.showMessageDialog(DashboardPanel.this,
+						"A removal request for this loan is already awaiting approval.",
+						"Already Requested", JOptionPane.INFORMATION_MESSAGE);
+					break;
+				default:
+					JOptionPane.showMessageDialog(DashboardPanel.this,
+						"Only the lender or borrower of a loan can request its removal.",
+						"Not Allowed", JOptionPane.ERROR_MESSAGE);
+			}
+			refresh();
 		}
 
 		private String formatDueTime(long dueTime)
@@ -1598,7 +1713,22 @@ public class DashboardPanel extends JPanel
 			setPreferredSize(new Dimension(200, 60));
 
 			String title;
-			if (incoming)
+			if (request.isRemoval())
+			{
+				if (incoming)
+				{
+					title = request.isStaffRemoval()
+						? "STAFF REVIEW: " + request.getFrom() + " asks to remove loan"
+						: request.getFrom() + " asks to remove the loan of";
+				}
+				else
+				{
+					title = request.isStaffRemoval()
+						? "You asked staff to remove loan"
+						: "You asked " + request.getTo() + " to remove loan";
+				}
+			}
+			else if (incoming)
 			{
 				title = request.isBorrowRequest()
 					? request.getFrom() + " wants to borrow"
@@ -1622,7 +1752,7 @@ public class DashboardPanel extends JPanel
 
 			JLabel itemLabel = new JLabel(request.getItemName()
 				+ (request.getQuantity() > 1 ? " x" + request.getQuantity() : "")
-				+ "  • " + request.getDurationDays() + " days");
+				+ (request.isRemoval() ? "" : "  • " + request.getDurationDays() + " days"));
 			itemLabel.setFont(FontManager.getRunescapeBoldFont());
 			itemLabel.setForeground(Color.WHITE);
 			detailsPanel.add(itemLabel);
@@ -1696,6 +1826,33 @@ public class DashboardPanel extends JPanel
 			JOptionPane.showMessageDialog(this,
 				"This request has already been handled.", "Already Handled",
 				JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+
+		// Removal requests: approving doesn't create anything — it authorizes the
+		// lender's client to retire the loan (audit-stamped, archived to history)
+		if (request.isRemoval())
+		{
+			LendingEntry target = dataService.getActiveEntry(request.getEntryId());
+			String what = target != null
+				? target.getItem() + " (" + target.getLender() + " -> " + target.getBorrower() + ")"
+				: request.getItemName();
+			String role = request.isStaffRemoval() ? "As uninvolved staff, approve" : "Approve";
+			int ok = JOptionPane.showConfirmDialog(this,
+				role + " removing this loan from active tracking?\n" + what
+					+ (request.getMessage() != null && !request.getMessage().isEmpty()
+						? "\nReason: " + request.getMessage() : "")
+					+ "\nIt will be archived to history with an approval record.",
+				"Approve Removal", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+			if (ok != JOptionPane.YES_OPTION)
+			{
+				return;
+			}
+			dataService.updateRequestStatus(groupId, request.getId(), LendingRequest.STATUS_ACCEPTED);
+			// If I'm the lender (or eligible fallback), execute immediately;
+			// otherwise the lender's client executes when the approval syncs
+			plugin.applyApprovedRemovals();
 			refresh();
 			return;
 		}

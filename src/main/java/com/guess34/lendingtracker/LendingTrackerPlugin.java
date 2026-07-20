@@ -4,7 +4,6 @@ import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.events.*;
-import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -23,6 +22,7 @@ import com.guess34.lendingtracker.services.LocalDataSyncService;
 import com.guess34.lendingtracker.services.ProofScreenshot;
 import com.guess34.lendingtracker.services.GroupService;
 import com.guess34.lendingtracker.services.RelaySyncService;
+import com.guess34.lendingtracker.services.TradeLoanTracker;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.NavigationButton;
@@ -53,9 +53,6 @@ import java.util.stream.Collectors;
 // This plugin has been trimmed more times than rune armor at the GE. ~Guess34
 public class LendingTrackerPlugin extends Plugin
 {
-	private static final int LENDING_WIDGET_GROUP = 334;
-	private static final int ACCEPT_BUTTON = 13;
-
 	@Inject private Client client;
 	@Inject private ClientThread clientThread;
 	@Inject private ConfigManager configManager;
@@ -70,11 +67,10 @@ public class LendingTrackerPlugin extends Plugin
 	@Inject private LocalDataSyncService localDataSyncService;
 	@Inject private ProofScreenshot proofScreenshot;
 	@Inject private RelaySyncService relaySyncService;
+	@Inject private TradeLoanTracker tradeLoanTracker;
 
 	private LendingPanel newPanel;
 	private NavigationButton navButton;
-	private volatile LendingEntry pendingLending = null;
-	private volatile String lastLendingTarget = null;
 
 	@Override
 	protected void startUp() throws Exception
@@ -107,6 +103,8 @@ public class LendingTrackerPlugin extends Plugin
 		else { log.error("ClientToolbar is null - UI will not appear"); }
 
 		groupService.setOnSyncCallback(this::onGroupDataSynced);
+		groupService.setOnWildernessAlert(this::handleWildernessAlert);
+		tradeLoanTracker.setOnLoanRecorded(this::refreshPanel);
 
 		// Register relay sync callbacks for cross-machine sync
 		relaySyncService.setOnEventReceived(event -> groupService.handleRelayEvent(event));
@@ -149,7 +147,8 @@ public class LendingTrackerPlugin extends Plugin
 		}
 		newPanel = null;
 		navButton = null;
-		pendingLending = null;
+		tradeLoanTracker.reset();
+		tradeLoanTracker.clearPendingDecisions();
 	}
 
 	private void triggerLoginFlow(String playerName)
@@ -161,6 +160,7 @@ public class LendingTrackerPlugin extends Plugin
 		if (activeGroup != null) { groupService.startSync(activeGroup.getId(), playerName); }
 		if (newPanel != null) { newPanel.refresh(); }
 		checkForRequestNotifications();
+		applyApprovedRemovals();
 	}
 
 	/** Runs whenever group data changes via sync (local poll or relay). */
@@ -168,6 +168,7 @@ public class LendingTrackerPlugin extends Plugin
 	{
 		if (newPanel != null) { newPanel.refresh(); }
 		checkForRequestNotifications();
+		applyApprovedRemovals();
 	}
 
 	// --- Event Handlers ---
@@ -175,25 +176,79 @@ public class LendingTrackerPlugin extends Plugin
 	@Subscribe
 	public void onWidgetLoaded(WidgetLoaded event)
 	{
-		if (event.getGroupId() == LENDING_WIDGET_GROUP)
+		// Player-to-player trade screens: the loan capture flow lives in TradeLoanTracker
+		if (event.getGroupId() == net.runelite.api.gameval.InterfaceID.TRADEMAIN)
 		{
-			clientThread.invokeLater(this::processLendingInterface);
+			tradeLoanTracker.onTradeMainLoaded();
+		}
+		else if (event.getGroupId() == net.runelite.api.gameval.InterfaceID.TRADECONFIRM)
+		{
+			tradeLoanTracker.onTradeConfirmLoaded();
+		}
+	}
+
+	@Subscribe
+	public void onScriptPostFired(ScriptPostFired event)
+	{
+		// The trade screen 1 build script — fires when the interface is fully drawn
+		// and after any rebuild, so it's the reliable moment to (re)add the button
+		if (event.getScriptId() == ScriptID.TRADE_MAIN_INIT)
+		{
+			tradeLoanTracker.onTradeMainBuilt();
+		}
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged event)
+	{
+		// My side of the trade offer changed — drives the "is this a loan?" popup
+		// for items listed on the marketplace
+		if (event.getContainerId() == net.runelite.api.gameval.InventoryID.TRADEOFFER
+			&& event.getItemContainer() != null)
+		{
+			tradeLoanTracker.onMyOfferChanged(event.getItemContainer().getItems());
+		}
+		// Either side changed — keeps the first-screen proof shot current so the
+		// saved frame shows the final offers (partner's container is id | 0x8000)
+		if (event.getContainerId() == net.runelite.api.gameval.InventoryID.TRADEOFFER
+			|| event.getContainerId() == (net.runelite.api.gameval.InventoryID.TRADEOFFER | 0x8000))
+		{
+			tradeLoanTracker.onTradeOfferUpdated();
+		}
+	}
+
+	@Subscribe
+	public void onWidgetClosed(WidgetClosed event)
+	{
+		// Cleans up sessions ended by walking away / Esc, which produce neither a
+		// Decline click nor a chat message
+		if (event.getGroupId() == net.runelite.api.gameval.InterfaceID.TRADEMAIN
+			|| event.getGroupId() == net.runelite.api.gameval.InterfaceID.TRADECONFIRM)
+		{
+			tradeLoanTracker.onTradeWidgetClosed(event.getGroupId());
 		}
 	}
 
 	@Subscribe
 	public void onMenuEntryAdded(MenuEntryAdded event)
 	{
+		// "Mark as Loan" on the player's offered items in the trade window
+		tradeLoanTracker.onMenuEntryAdded(event);
+
 		String target = event.getTarget();
 		if (target == null || target.isEmpty()) { return; }
 
+		// Only offer to lend/list tradeable items — you can't lend what you can't
+		// trade. Checked here (not just on click) so the option never appears on an
+		// untradeable item in the first place.
 		if (event.getOption().equals("Examine")
-			&& event.getType() == MenuAction.EXAMINE_ITEM.getId())
+			&& event.getType() == MenuAction.EXAMINE_ITEM.getId()
+			&& isTradeable(event.getItemId()))
 		{
 			addMenuEntry("Add to Lending List", event);
 		}
 
-		if (event.getOption().equals("Drop"))
+		if (event.getOption().equals("Drop") && isTradeable(event.getItemId()))
 		{
 			addMenuEntry("Lend to Group", event);
 		}
@@ -204,22 +259,95 @@ public class LendingTrackerPlugin extends Plugin
 		}
 	}
 
+	private boolean isTradeable(int itemId)
+	{
+		if (itemId <= 0)
+		{
+			return true; // can't identify the item — don't hide the option
+		}
+		try
+		{
+			return itemManager.getItemComposition(itemId).isTradeable();
+		}
+		catch (Exception e)
+		{
+			return true;
+		}
+	}
+
 	private void addMenuEntry(String option, MenuEntryAdded event)
 	{
 		client.createMenuEntry(-1)
 			.setOption(option).setTarget(event.getTarget()).setType(MenuAction.RUNELITE)
 			.setParam0(event.getActionParam0()).setParam1(event.getActionParam1())
-			.setIdentifier(event.getIdentifier());
+			.setIdentifier(event.getIdentifier())
+			// Never the left-click default (deprioritized); actual on-screen
+			// position is fixed in onMenuOpened, which moves our entries to the
+			// very bottom of the menu
+			.setDeprioritized(true);
+	}
+
+	/** Options this plugin adds to item/player menus (not the trade-window ones). */
+	private static final java.util.Set<String> OWN_MENU_OPTIONS = new java.util.HashSet<>(java.util.Arrays.asList(
+		"Add to Lending List", "Lend to Group", "Invite to Lending Group"));
+
+	@Subscribe
+	public void onPostMenuSort(PostMenuSort event)
+	{
+		// Move OUR entries to the very bottom of the menu — below Examine, just
+		// above Cancel — so they never sit next to Drop where a misclick drops a
+		// valuable item. This must run in PostMenuSort: the client sorts the menu
+		// AFTER events like MenuOpened, which would clobber any earlier reorder
+		// (the same reason the core Menu Entry Swapper hooks this event). Only
+		// this plugin's own entries are moved (matched by their distinctive
+		// option text); vanilla options keep their exact order.
+		MenuEntry[] entries = client.getMenuEntries();
+		if (entries == null || entries.length < 3)
+		{
+			return;
+		}
+
+		java.util.List<MenuEntry> ours = new ArrayList<>();
+		java.util.List<MenuEntry> rest = new ArrayList<>();
+		for (MenuEntry entry : entries)
+		{
+			// Match by option name only — the deprioritized flag shifts the
+			// reported type, so a type check can miss our own entries
+			if (OWN_MENU_OPTIONS.contains(entry.getOption()))
+			{
+				ours.add(entry);
+			}
+			else
+			{
+				rest.add(entry);
+			}
+		}
+		if (ours.isEmpty())
+		{
+			return;
+		}
+
+		// Index 0 renders at the BOTTOM of the menu ("Cancel" when it's open);
+		// keep it there and slot our entries directly above it
+		java.util.List<MenuEntry> reordered = new ArrayList<>(entries.length);
+		int insertAfter = !rest.isEmpty() && "Cancel".equals(rest.get(0).getOption()) ? 1 : 0;
+		reordered.addAll(rest.subList(0, insertAfter));
+		reordered.addAll(ours);
+		reordered.addAll(rest.subList(insertAfter, rest.size()));
+		client.setMenuEntries(reordered.toArray(new MenuEntry[0]));
 	}
 
 	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
+		// Loan marking, decline detection, and the borrowed-item guards.
+		// Returns true when the click was consumed.
+		if (tradeLoanTracker.onMenuOptionClicked(event)) { return; }
+
 		String option = event.getMenuOption();
 		if (option.equals("Add to Lending List")) { handleAddToAvailableList(event); }
 		else if (option.equals("Lend to Group")) { handleLendToGroup(event); }
 		else if (option.equals("Invite to Lending Group")) { handlePlayerInvite(event); }
-		else if (option.contains("Lend")) { lastLendingTarget = event.getMenuTarget(); }
 	}
 
 	@Subscribe
@@ -230,9 +358,11 @@ public class LendingTrackerPlugin extends Plugin
 		{
 			handlePrivateMessage(event.getName(), message);
 		}
-		if (event.getType() != ChatMessageType.GAMEMESSAGE) { return; }
-		if (message.contains("You lend") && message.contains("to")) { handleLendingConfirmation(); }
-		if (message.contains("returned your") || message.contains("gives you back")) { handleReturnConfirmation(message); }
+		// Trade completion / partner decline arrive as TRADE-type messages
+		if (event.getType() == ChatMessageType.TRADE)
+		{
+			tradeLoanTracker.onTradeMessage(message);
+		}
 	}
 
 	@Subscribe
@@ -252,6 +382,8 @@ public class LendingTrackerPlugin extends Plugin
 		else if (event.getGameState() == GameState.LOGIN_SCREEN)
 		{
 			groupService.stopSync();
+			tradeLoanTracker.reset();
+			tradeLoanTracker.clearPendingDecisions();
 			if (newPanel != null) { newPanel.refresh(); }
 		}
 	}
@@ -271,10 +403,19 @@ public class LendingTrackerPlugin extends Plugin
 	@Subscribe
 	public void onVarbitChanged(VarbitChanged event)
 	{
-		if (event.getVarbitId() == Varbits.IN_WILDERNESS
-			&& client.getVarbitValue(Varbits.IN_WILDERNESS) == 1)
+		if (event.getVarbitId() != Varbits.IN_WILDERNESS)
+		{
+			return;
+		}
+
+		// Every enter/exit starts a new episode, invalidating any armed 45s check
+		wildernessEpisode++;
+		lenderAlertSentThisEpisode = false;
+
+		if (client.getVarbitValue(Varbits.IN_WILDERNESS) == 1)
 		{
 			checkBorrowedItemsInWilderness();
+			armLenderWildernessAlert();
 		}
 	}
 
@@ -316,91 +457,11 @@ public class LendingTrackerPlugin extends Plugin
 		}
 	}
 
-	// --- Lending Interface ---
-
-	private void processLendingInterface()
-	{
-		if (client == null) { return; }
-		Widget acceptButton = client.getWidget(LENDING_WIDGET_GROUP, ACCEPT_BUTTON);
-		if (acceptButton == null) { return; }
-
-		String itemName = getWidgetText(2);
-		int itemId = getWidgetItemId(3);
-		int quantity = getWidgetItemQuantity(4);
-		String playerName = getWidgetText(5);
-		if (playerName == null) { playerName = lastLendingTarget; }
-
-		if (itemName != null && !itemName.isEmpty() && playerName != null && !playerName.isEmpty())
-		{
-			pendingLending = new LendingEntry();
-			pendingLending.setId(UUID.randomUUID().toString());
-			pendingLending.setBorrower(playerName);
-			pendingLending.setItem(itemName);
-			pendingLending.setItemId(itemId);
-			pendingLending.setQuantity(quantity);
-			pendingLending.setValue(calculateItemValue(itemId, quantity));
-			pendingLending.setLendTime(Instant.now().toEpochMilli());
-			pendingLending.setDueTime(Instant.now().plus(config.defaultLoanDuration(), ChronoUnit.DAYS).toEpochMilli());
-		}
-	}
-
-	private String getWidgetText(int child)
-	{
-		try { Widget w = client.getWidget(LENDING_WIDGET_GROUP, child); return w != null ? w.getText() : null; }
-		catch (Exception e) { return null; }
-	}
-
-	private int getWidgetItemId(int child)
-	{
-		try { Widget w = client.getWidget(LENDING_WIDGET_GROUP, child); return w != null ? w.getItemId() : -1; }
-		catch (Exception e) { return -1; }
-	}
-
-	private int getWidgetItemQuantity(int child)
-	{
-		try { Widget w = client.getWidget(LENDING_WIDGET_GROUP, child); return w != null ? w.getItemQuantity() : 1; }
-		catch (Exception e) { return 1; }
-	}
-
-	// --- Chat Handlers ---
-
-	private void handleLendingConfirmation()
-	{
-		if (pendingLending == null) { return; }
-		dataService.addEntry(pendingLending);
-		LendingGroup activeGroup = groupService.getActiveGroup();
-		if (activeGroup != null) { groupService.syncLending(activeGroup.getId(), pendingLending); }
-		pendingLending = null;
-		if (newPanel != null) { newPanel.refresh(); }
-	}
-
-	private void handleReturnConfirmation(String message)
-	{
-		String playerName = null;
-		String itemName = null;
-		if (message.contains(" returned your "))
-		{
-			playerName = message.substring(0, message.indexOf(" returned your ")).trim();
-			itemName = message.substring(message.indexOf(" returned your ") + 15).replaceAll("[.]", "").trim();
-		}
-		else if (message.contains(" gives you back "))
-		{
-			playerName = message.substring(0, message.indexOf(" gives you back ")).trim();
-			itemName = message.substring(message.indexOf(" gives you back ") + 16).replaceAll("[.]", "").trim();
-		}
-		if (playerName == null || itemName == null) { return; }
-
-		final String pName = playerName;
-		final String iName = itemName;
-		List<LendingEntry> entries = dataService.getEntriesForPlayer(pName).stream()
-			.filter(e -> e.getItemName().equals(iName) && !e.isReturned())
-			.collect(Collectors.toList());
-		if (!entries.isEmpty())
-		{
-			dataService.completeEntry(entries.get(0).getId(), true);
-			if (newPanel != null) { newPanel.refresh(); }
-		}
-	}
+	// NOTE: the old "lending interface" parser (widget group 334, RS2's item-lend
+	// screen) was removed — group 334 is actually the OSRS trade CONFIRM screen,
+	// so that flow never fired correctly. Loans are now recorded from the real
+	// trade window by TradeLoanTracker, which also detects returns when the
+	// borrower hands the item back in a trade.
 
 	// --- Scheduled Tasks ---
 
@@ -817,21 +878,140 @@ public class LendingTrackerPlugin extends Plugin
 
 	// --- Wilderness ---
 
+	// Cooldown so repeatedly hopping the ditch (banking between trips) doesn't
+	// fire a notification storm
+	private static final long WILDERNESS_WARN_COOLDOWN_MS = 60_000L;
+	// How long the borrower must stay in the wilderness before their lenders are
+	// alerted — a quick ditch-hop shouldn't page anyone
+	private static final long LENDER_ALERT_AFTER_MS = 45_000L;
+	// Ignore alert events older than this (the local sync queue replays history)
+	private static final long LENDER_ALERT_MAX_AGE_MS = 5 * 60_000L;
+	private long lastWildernessWarnAt;
+	// Bumped on every wilderness enter/exit so a scheduled 45s check can tell
+	// whether the visit it was armed for is still the current one
+	private volatile int wildernessEpisode;
+	private volatile boolean lenderAlertSentThisEpisode;
+
 	private void checkBorrowedItemsInWilderness()
 	{
-		String me = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null;
-		if (me == null) { return; }
+		if (config.wildernessGuard() == LendingTrackerConfig.GuardMode.OFF) { return; }
+		if (System.currentTimeMillis() - lastWildernessWarnAt < WILDERNESS_WARN_COOLDOWN_MS) { return; }
 
-		// Read from the active-entries map (kept current by live sync), not the
-		// per-group borrowed map, which a live loan push doesn't populate.
-		List<LendingEntry> borrowed = dataService.getActiveEntries().stream()
-			.filter(e -> me.equalsIgnoreCase(e.getBorrower()) && !e.isReturned())
-			.collect(Collectors.toList());
+		// Only items actually being carried (inventory or equipment) are at risk —
+		// borrowed gear AND collateral held as the lender both count.
+		List<LendingEntry> borrowed = tradeLoanTracker.carriedBorrowedEntries();
+		List<LendingEntry> collateral = tradeLoanTracker.carriedCollateralEntries();
+		if (borrowed.isEmpty() && collateral.isEmpty()) { return; }
+
+		lastWildernessWarnAt = System.currentTimeMillis();
+		StringBuilder summary = new StringBuilder();
 		if (!borrowed.isEmpty())
 		{
 			long total = borrowed.stream().mapToLong(LendingEntry::getValue).sum();
-			log.warn("Wilderness with {} borrowed items, value: {} GP",
-				borrowed.size(), QuantityFormatter.quantityToStackSize(total));
+			summary.append(borrowed.size()).append(" borrowed item(s) worth ")
+				.append(QuantityFormatter.quantityToStackSize(total)).append(" GP");
+		}
+		if (!collateral.isEmpty())
+		{
+			if (summary.length() > 0) { summary.append(" and "); }
+			summary.append("collateral you hold for ").append(collateral.size()).append(" loan(s)");
+		}
+
+		if (config.enableNotifications())
+		{
+			notifier.notify("[Lending Tracker] You entered the Wilderness carrying " + summary + "!");
+		}
+		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+			"[Lending Tracker] WARNING: you are in the Wilderness carrying " + summary
+				+ ". Losing these still leaves you responsible for them!", "");
+	}
+
+	/**
+	 * Arm the 45-second sustained-stay check for the current wilderness visit.
+	 * If the borrower is still in level 1+ wilderness carrying borrowed items when
+	 * it fires, each affected lender is alerted through the signed sync channel.
+	 */
+	private void armLenderWildernessAlert()
+	{
+		final int episode = wildernessEpisode;
+		executor.schedule(() -> clientThread.invokeLater(() ->
+		{
+			if (episode != wildernessEpisode || lenderAlertSentThisEpisode)
+			{
+				return; // left the wilderness (or already alerted) — stand down
+			}
+			if (client.getVarbitValue(Varbits.IN_WILDERNESS) != 1)
+			{
+				return;
+			}
+			List<LendingEntry> borrowed = tradeLoanTracker.carriedBorrowedEntries();
+			List<LendingEntry> collateral = tradeLoanTracker.carriedCollateralEntries();
+			if (borrowed.isEmpty() && collateral.isEmpty())
+			{
+				return;
+			}
+
+			lenderAlertSentThisEpisode = true;
+			// One event per distinct counterparty (not per item): the receiver only
+			// needs one ping, and every publishEvent pushes a full state snapshot
+			java.util.Set<String> alerted = new java.util.HashSet<>();
+			for (LendingEntry e : borrowed)
+			{
+				String lender = e.getLender() != null ? e.getLender().toLowerCase() : "";
+				if (alerted.add("L:" + lender))
+				{
+					groupService.publishEvent(GroupService.SyncEventType.WILDERNESS_ALERT, e.getId(), null);
+				}
+			}
+			// I'm the lender carrying the borrower's collateral — their property is
+			// at risk, so THEY get the ping
+			for (LendingEntry e : collateral)
+			{
+				String borrower = e.getBorrower() != null ? e.getBorrower().toLowerCase() : "";
+				if (alerted.add("B:" + borrower))
+				{
+					groupService.publishEvent(GroupService.SyncEventType.WILDERNESS_ALERT_COLLATERAL, e.getId(), null);
+				}
+			}
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+				"[Lending Tracker] You've been in the Wilderness over 45 seconds with loaned property — the other party has been notified.", "");
+		}), LENDER_ALERT_AFTER_MS, TimeUnit.MILLISECONDS);
+	}
+
+	/**
+	 * A wilderness alert sync event arrived — notify the affected party:
+	 * WILDERNESS_ALERT → I'm the lender, my lent item is at risk with the borrower.
+	 * WILDERNESS_ALERT_COLLATERAL → I'm the borrower, the collateral I gave the
+	 * lender is at risk with them.
+	 */
+	private void handleWildernessAlert(GroupService.SyncEvent event)
+	{
+		if (!config.alertLenderWilderness() || !config.enableNotifications()) { return; }
+		// The local sync queue replays recent history on login — never re-alert
+		// for a stale event
+		if (System.currentTimeMillis() - event.getTimestamp() > LENDER_ALERT_MAX_AGE_MS) { return; }
+
+		String me = getCurrentPlayerName();
+		if (me == null) { return; }
+
+		LendingEntry entry = dataService.getActiveEntries().stream()
+			.filter(e -> event.getDataId().equals(e.getId()))
+			.findFirst().orElse(null);
+		if (entry == null) { return; }
+
+		if (event.getType() == GroupService.SyncEventType.WILDERNESS_ALERT
+			&& me.equalsIgnoreCase(entry.getLender()))
+		{
+			String borrower = event.getPublisher() != null ? event.getPublisher() : entry.getBorrower();
+			notifier.notify("[Lending Tracker] " + borrower + " has been in the Wilderness for 45+ seconds carrying your "
+				+ entry.getItemName() + "!");
+		}
+		else if (event.getType() == GroupService.SyncEventType.WILDERNESS_ALERT_COLLATERAL
+			&& me.equalsIgnoreCase(entry.getBorrower()))
+		{
+			String lender = event.getPublisher() != null ? event.getPublisher() : entry.getLender();
+			notifier.notify("[Lending Tracker] " + lender + " has been in the Wilderness for 45+ seconds carrying the collateral you put up for "
+				+ entry.getItemName() + "!");
 		}
 	}
 
@@ -900,6 +1080,133 @@ public class LendingTrackerPlugin extends Plugin
 			itemName, -1, quantity, durationDays, message);
 	}
 
+	/**
+	 * Outcome of proposing a loan removal, so the UI can explain the routing.
+	 */
+	public enum RemovalRoute { MUTUAL, STAFF, ALREADY_PENDING, NOT_ALLOWED }
+
+	/**
+	 * Propose removing an active loan (accidental Loan-mode, mis-recorded trade…).
+	 *
+	 * Routing, per group policy: the loan's counterparty approving is ALWAYS the
+	 * first course of action when possible — i.e. when the counterparty is (still)
+	 * a member of the group, online or not (the request syncs and they answer on
+	 * their next login). Staff review is reserved for loans whose counterparty was
+	 * never a group member (mobile / no-plugin borrowers can't approve anything),
+	 * or as escalation after a mutual request was declined.
+	 */
+	public RemovalRoute requestLoanRemoval(LendingEntry loan, String reason, boolean escalateToStaff)
+	{
+		String me = getCurrentPlayerName();
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		LendingGroup group = groupService.getActiveGroup();
+		if (me == null || groupId == null || group == null || loan == null)
+		{
+			return RemovalRoute.NOT_ALLOWED;
+		}
+
+		// Only a party to the loan may propose its removal
+		boolean iAmLender = me.equalsIgnoreCase(loan.getLender());
+		boolean iAmBorrower = me.equalsIgnoreCase(loan.getBorrower());
+		if (!iAmLender && !iAmBorrower)
+		{
+			return RemovalRoute.NOT_ALLOWED;
+		}
+		if (dataService.hasPendingRemovalFor(groupId, loan.getId()))
+		{
+			return RemovalRoute.ALREADY_PENDING;
+		}
+
+		String counterparty = iAmLender ? loan.getBorrower() : loan.getLender();
+		boolean counterpartyInGroup = counterparty != null && group.hasMember(counterparty);
+		// Escalation to staff is only valid when mutual consent is impossible
+		// (counterparty never in the group) or already failed (declined)
+		boolean canEscalate = !counterpartyInGroup
+			|| dataService.hasDeclinedMutualRemovalFor(groupId, loan.getId());
+
+		String type;
+		String to;
+		if (counterpartyInGroup && !(escalateToStaff && canEscalate))
+		{
+			type = LendingRequest.TYPE_REMOVAL_MUTUAL;
+			to = counterparty;
+		}
+		else
+		{
+			type = LendingRequest.TYPE_REMOVAL_STAFF;
+			to = ""; // adjudicated by any eligible (uninvolved) owner/co-owner
+		}
+
+		LendingRequest request = new LendingRequest();
+		request.setId(UUID.randomUUID().toString());
+		request.setGroupId(groupId);
+		request.setType(type);
+		request.setFrom(me);
+		request.setTo(to);
+		request.setEntryId(loan.getId());
+		request.setItemName(loan.getItem());
+		request.setItemId(loan.getItemId());
+		request.setQuantity(loan.getQuantity());
+		request.setMessage(reason);
+		request.setStatus(LendingRequest.STATUS_PENDING);
+		long now = System.currentTimeMillis();
+		request.setCreatedAt(now);
+		request.setUpdatedAt(now);
+
+		dataService.addRequest(groupId, request);
+		refreshPanel();
+		return LendingRequest.TYPE_REMOVAL_MUTUAL.equals(type) ? RemovalRoute.MUTUAL : RemovalRoute.STAFF;
+	}
+
+	/**
+	 * Execute removals whose requests have been APPROVED. Runs after every sync
+	 * and at login. Only the LENDER's client actually removes the loan (it is
+	 * authoritative for its own loans — an approval executed anywhere else would
+	 * just be resurrected by the lender's next push). Fallback: if the lender has
+	 * left the group, the requester's client may execute a staff-approved removal.
+	 */
+	public void applyApprovedRemovals()
+	{
+		String me = getCurrentPlayerName();
+		LendingGroup group = groupService.getActiveGroup();
+		if (me == null || group == null)
+		{
+			return;
+		}
+
+		for (LendingRequest r : dataService.getRequests(group.getId()))
+		{
+			if (!r.isRemoval() || !LendingRequest.STATUS_ACCEPTED.equals(r.getStatus()))
+			{
+				continue;
+			}
+			LendingEntry entry = dataService.getActiveEntry(r.getEntryId());
+			if (entry == null)
+			{
+				continue; // already executed — idempotent
+			}
+
+			boolean iAmLender = me.equalsIgnoreCase(entry.getLender());
+			boolean lenderGone = entry.getLender() == null || !group.hasMember(entry.getLender());
+			boolean requesterFallback = r.isStaffRemoval() && lenderGone && me.equalsIgnoreCase(r.getFrom());
+			if (!iAmLender && !requesterFallback)
+			{
+				continue;
+			}
+
+			String stamp = r.isStaffRemoval()
+				? "[Removed by staff approval, requested by " + r.getFrom() + "]"
+				: "[Removed by mutual consent of " + r.getFrom() + " and " + r.getTo() + "]";
+			if (dataService.removeLoanApproved(entry.getId(), stamp))
+			{
+				clientThread.invokeLater(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+					"[Lending Tracker] Loan removed after approval: " + entry.getItemName()
+						+ " (" + entry.getLender() + " -> " + entry.getBorrower() + ").", ""));
+				refreshPanel();
+			}
+		}
+	}
+
 	private boolean createRequest(String type, String from, String to,
 		String itemName, int itemId, int quantity, int durationDays, String message)
 	{
@@ -965,13 +1272,39 @@ public class LendingTrackerPlugin extends Plugin
 				seen.add(key);
 				if (notified.add(key))
 				{
-					String what = r.isBorrowRequest()
-						? r.getFrom() + " wants to borrow: " + r.getItemName()
+					String what;
+					if (r.isRemoval())
+					{
+						what = r.getFrom() + " asks to remove the loan of " + r.getItemName()
+							+ " — approve or decline in the panel";
+					}
+					else if (r.isBorrowRequest())
+					{
+						what = r.getFrom() + " wants to borrow: " + r.getItemName()
 							+ (r.getQuantity() > 1 ? " x" + r.getQuantity() : "")
-							+ " (" + r.getDurationDays() + " days)"
-						: r.getFrom() + " offers to lend you: " + r.getItemName()
+							+ " (" + r.getDurationDays() + " days)";
+					}
+					else
+					{
+						what = r.getFrom() + " offers to lend you: " + r.getItemName()
 							+ (r.getQuantity() > 1 ? " x" + r.getQuantity() : "");
+					}
 					notifier.notify("[Lending Tracker] " + what);
+					playSound = true;
+					changed = true;
+				}
+			}
+
+			// Staff-review removals aren't addressed to a single player — notify every
+			// eligible (uninvolved owner/co-owner) staff member once
+			for (LendingRequest r : dataService.getPendingStaffRemovalsFor(groupId, me, activeGroup))
+			{
+				String key = r.getId() + ":STAFF";
+				seen.add(key);
+				if (notified.add(key))
+				{
+					notifier.notify("[Lending Tracker] Staff review: " + r.getFrom()
+						+ " asks to remove the loan of " + r.getItemName() + " — see the panel.");
 					playSound = true;
 					changed = true;
 				}
