@@ -711,6 +711,10 @@ public class GroupService
 				LendingGroup sharedGroup = gson.fromJson(sharedJson, LendingGroup.class);
 				if (sharedGroup != null && sharedGroup.getId() != null)
 				{
+					// Multi-use group code? It stays valid for the next joiner.
+					boolean multiUse = sharedGroup.isClanCodeEnabled()
+						&& trimmedCode.equalsIgnoreCase(sharedGroup.getClanCode());
+
 					// Add joining player as member
 					if (!sharedGroup.hasMember(playerName))
 					{
@@ -718,8 +722,15 @@ public class GroupService
 						touchRoster(sharedGroup);
 					}
 
-					// Void the single-use code
-					sharedGroup.markGroupCodeUsed(playerName);
+					if (multiUse)
+					{
+						sharedGroup.setClanCodeUseCount(sharedGroup.getClanCodeUseCount() + 1);
+					}
+					else
+					{
+						// Void the single-use code
+						sharedGroup.markGroupCodeUsed(playerName);
+					}
 
 					// Store in this player's local groups
 					groups.put(sharedGroup.getId(), ensureCowMembers(sharedGroup));
@@ -729,8 +740,11 @@ public class GroupService
 					// Publish updated group state so the creator sees the new member
 					publishGroupState(sharedGroup.getId());
 
-					// Remove the shared invite key (single-use, now consumed)
-					configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + trimmedCode);
+					// Single-use codes are consumed; a multi-use code stays for others
+					if (!multiUse)
+					{
+						configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + trimmedCode);
+					}
 
 					// Notify via sync events
 					SyncEvent joinEvent = new SyncEvent();
@@ -779,19 +793,33 @@ public class GroupService
 					LendingGroup relayGroup = gson.fromJson(lookup.groupJson, LendingGroup.class);
 					if (relayGroup != null && relayGroup.getId() != null)
 					{
+						// Multi-use group code? It stays on the relay for the next joiner.
+						boolean multiUse = relayGroup.isClanCodeEnabled()
+							&& trimmedCode.equalsIgnoreCase(relayGroup.getClanCode());
+
 						if (!relayGroup.hasMember(playerName))
 						{
 							relayGroup.addMember(new GroupMember(playerName, "member"));
 							touchRoster(relayGroup);
 						}
-						relayGroup.markGroupCodeUsed(playerName);
+						if (multiUse)
+						{
+							relayGroup.setClanCodeUseCount(relayGroup.getClanCodeUseCount() + 1);
+						}
+						else
+						{
+							relayGroup.markGroupCodeUsed(playerName);
+						}
 
 						groups.put(relayGroup.getId(), ensureCowMembers(relayGroup));
 						setCurrentGroupId(relayGroup.getId());
 						saveGroups();
 
-						// Consume the code on the relay server (single-use)
-						relaySyncService.consumeInviteCode(trimmedCode);
+						// Single-use codes are consumed; a multi-use code stays for others
+						if (!multiUse)
+						{
+							relaySyncService.consumeInviteCode(trimmedCode);
+						}
 
 						// Publish group state and member joined event via relay
 						publishGroupState(relayGroup.getId());
@@ -856,6 +884,150 @@ public class GroupService
 			published = relaySyncService.publishInviteBlocking(code, groupId, groupJson);
 		}
 		return new InviteCodeResult(code, syncEnabled, published);
+	}
+
+	// --- Multi-use Group Code (open/close joins) ---
+	//
+	// Unlike the single-use invite code, the group code can be used by ANY number
+	// of joiners while it is OPEN. Closing joins keeps the code but removes it
+	// from the relay and shared config, so it stops working until reopened. The
+	// permission gate is the same one that governs single-use codes.
+
+	/** Result of opening a group code: the code, or an error the UI can show. */
+	public static final class GroupCodeResult
+	{
+		public final String code;       // null on failure
+		public final String error;      // null on success
+		public final boolean syncEnabled;
+		public final boolean publishedToRelay;
+
+		GroupCodeResult(String code, String error, boolean syncEnabled, boolean publishedToRelay)
+		{
+			this.code = code;
+			this.error = error;
+			this.syncEnabled = syncEnabled;
+			this.publishedToRelay = publishedToRelay;
+		}
+	}
+
+	/**
+	 * Open joins on the group code. Pass a custom code to set one, or null to
+	 * reuse the existing code (generating a fresh one if none exists yet).
+	 * Blocking network call — run off the EDT.
+	 */
+	public GroupCodeResult openGroupCode(String groupId, String requesterName, String customCode)
+	{
+		LendingGroup group = groups.get(groupId);
+		if (group == null)
+		{
+			return new GroupCodeResult(null, "Group not found.", false, false);
+		}
+		if (!canGenerateInviteCode(groupId, requesterName))
+		{
+			return new GroupCodeResult(null, "You don't have permission to manage invite codes.", false, false);
+		}
+
+		String code;
+		if (customCode != null)
+		{
+			code = normalizeCustomCode(customCode);
+			if (code == null)
+			{
+				return new GroupCodeResult(null,
+					"Codes must be 6-20 characters: letters, numbers and dashes only.", false, false);
+			}
+		}
+		else if (group.getClanCode() != null && !group.getClanCode().isEmpty())
+		{
+			code = group.getClanCode(); // reopen with the kept code
+		}
+		else
+		{
+			code = UUID.randomUUID().toString().replace("-", "").toUpperCase().substring(0, 9);
+			code = code.substring(0, 3) + "-" + code.substring(3, 6) + "-" + code.substring(6, 9);
+		}
+
+		group.setClanCode(code);
+		group.setClanCodeEnabled(true);
+		saveGroups();
+
+		String groupJson = gson.toJson(group);
+		// Same-machine joiners look the code up in shared config
+		configManager.setConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + code, groupJson);
+
+		boolean syncEnabled = config.enableRelaySync();
+		boolean published = false;
+		if (syncEnabled && relaySyncService != null)
+		{
+			published = relaySyncService.publishInviteBlocking(code, groupId, groupJson);
+		}
+		return new GroupCodeResult(code, null, syncEnabled, published);
+	}
+
+	/**
+	 * Close joins: the code stops working everywhere but is KEPT on the group, so
+	 * it can be reopened later. Returns an error string, or null on success.
+	 */
+	public String closeGroupCode(String groupId, String requesterName)
+	{
+		LendingGroup group = groups.get(groupId);
+		if (group == null)
+		{
+			return "Group not found.";
+		}
+		if (!canGenerateInviteCode(groupId, requesterName))
+		{
+			return "You don't have permission to manage invite codes.";
+		}
+
+		group.setClanCodeEnabled(false);
+		saveGroups();
+
+		if (group.getClanCode() != null)
+		{
+			configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + group.getClanCode());
+			if (relaySyncService != null)
+			{
+				relaySyncService.consumeInviteCode(group.getClanCode()); // removes it from the relay
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Re-publish an OPEN group code so it doesn't age out of the relay (stored
+	 * codes expire after 24h). Called from the plugin's periodic sync task; only
+	 * members with invite permission refresh it.
+	 */
+	public void refreshGroupCodePresence()
+	{
+		if (!config.enableRelaySync() || relaySyncService == null)
+		{
+			return;
+		}
+		LendingGroup group = getActiveGroupUnchecked();
+		if (group == null || !group.isClanCodeEnabled()
+			|| group.getClanCode() == null || group.getClanCode().isEmpty())
+		{
+			return;
+		}
+		String me = currentSyncPlayerName;
+		if (me == null || !canGenerateInviteCode(group.getId(), me))
+		{
+			return;
+		}
+		relaySyncService.publishInviteCode(group.getClanCode(), group.getId(), gson.toJson(group));
+	}
+
+	/** Uppercase and validate a custom code: 6-20 chars, A-Z 0-9 and dashes. */
+	private static String normalizeCustomCode(String raw)
+	{
+		if (raw == null)
+		{
+			return null;
+		}
+		String code = raw.trim().toUpperCase().replace(' ', '-');
+		return code.matches("[A-Z0-9-]{6,20}") ? code : null;
 	}
 
 	/**

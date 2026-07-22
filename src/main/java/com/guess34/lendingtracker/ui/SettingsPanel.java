@@ -29,6 +29,9 @@ public class SettingsPanel extends JPanel
 
 	private JLabel groupNameLabel, memberCountLabel, roleLabel, inviteCodeLabel;
 	private JButton generateCodeButton, copyCodeButton;
+	private JLabel groupCodeLabel, groupCodeStatusLabel;
+	private JButton openCloseJoinsButton, copyGroupCodeButton, customGroupCodeButton;
+	private JPanel groupCodePanel;
 	private JButton deleteGroupButton, leaveGroupButton, transferOwnershipButton;
 	private JPanel membersListPanel, permissionsPanel, dangerZonePanel;
 	private JPanel contentPanel, notLoggedInPanel, inviteCodePanel, membersSection;
@@ -69,6 +72,9 @@ public class SettingsPanel extends JPanel
 		contentPanel.add(Box.createVerticalStrut(10));
 		inviteCodePanel = buildInviteCodeSection();
 		contentPanel.add(inviteCodePanel);
+
+		groupCodePanel = buildGroupCodeSection();
+		contentPanel.add(groupCodePanel);
 		contentPanel.add(Box.createVerticalStrut(10));
 		contentPanel.add(buildScreenshotSection());
 		contentPanel.add(Box.createVerticalStrut(10));
@@ -155,6 +161,144 @@ public class SettingsPanel extends JPanel
 
 		section.add(content, BorderLayout.CENTER);
 		return section;
+	}
+
+	/**
+	 * Multi-use "Group Code" section: one code many people can join with while
+	 * joins are OPEN. Closing joins keeps the code (it just stops working) so it
+	 * can be reopened later — built for onboarding a batch of members at once.
+	 */
+	private JPanel buildGroupCodeSection()
+	{
+		JPanel section = sectionPanel("Group Code (multi-use)");
+		JPanel content = boxPanel();
+
+		content.add(smallLabel("One code for many joiners while joins are open"));
+		content.add(Box.createVerticalStrut(5));
+
+		groupCodeLabel = new JLabel("No group code");
+		groupCodeLabel.setFont(FontManager.getRunescapeFont());
+		groupCodeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		groupCodeLabel.setAlignmentX(LEFT_ALIGNMENT);
+		groupCodeLabel.setBorder(new CompoundBorder(
+			new LineBorder(ColorScheme.MEDIUM_GRAY_COLOR, 1), new EmptyBorder(5, 8, 5, 8)));
+		content.add(groupCodeLabel);
+		content.add(Box.createVerticalStrut(3));
+
+		groupCodeStatusLabel = smallLabel("Joins: closed");
+		content.add(groupCodeStatusLabel);
+		content.add(Box.createVerticalStrut(5));
+
+		JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 3, 0));
+		btns.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		btns.setAlignmentX(LEFT_ALIGNMENT);
+		openCloseJoinsButton = smallButton("Open Joins", ColorScheme.BRAND_ORANGE);
+		openCloseJoinsButton.addActionListener(e -> toggleGroupCode(null));
+		btns.add(openCloseJoinsButton);
+		customGroupCodeButton = smallButton("Custom...", ColorScheme.DARK_GRAY_COLOR);
+		customGroupCodeButton.addActionListener(e -> promptCustomGroupCode());
+		btns.add(customGroupCodeButton);
+		copyGroupCodeButton = smallButton("Copy", ColorScheme.DARK_GRAY_COLOR);
+		copyGroupCodeButton.setEnabled(false);
+		copyGroupCodeButton.addActionListener(e -> copyGroupCode());
+		btns.add(copyGroupCodeButton);
+		content.add(btns);
+
+		section.add(content, BorderLayout.CENTER);
+		return section;
+	}
+
+	private void promptCustomGroupCode()
+	{
+		String input = JOptionPane.showInputDialog(this,
+			"Set a custom group code (6-20 characters, letters/numbers/dashes).\n\n"
+				+ "Careful: an easy-to-guess code can be used by ANYONE while joins\n"
+				+ "are open — prefer something not obvious, and close joins when done.",
+			"Custom Group Code", JOptionPane.PLAIN_MESSAGE);
+		if (input != null && !input.trim().isEmpty())
+		{
+			toggleGroupCode(input.trim());
+		}
+	}
+
+	/** Open (optionally with a custom code) or close joins, off the EDT. */
+	private void toggleGroupCode(String customCode)
+	{
+		LendingGroup g = groupService.getActiveGroup();
+		String user = getCurrentUsername();
+		if (g == null || user == null)
+		{
+			return;
+		}
+		final String groupId = g.getId();
+		final boolean closing = g.isClanCodeEnabled() && customCode == null;
+
+		openCloseJoinsButton.setEnabled(false);
+		new SwingWorker<Object, Void>()
+		{
+			@Override
+			protected Object doInBackground()
+			{
+				return closing
+					? groupService.closeGroupCode(groupId, user)
+					: groupService.openGroupCode(groupId, user, customCode);
+			}
+
+			@Override
+			protected void done()
+			{
+				openCloseJoinsButton.setEnabled(true);
+				Object result;
+				try
+				{
+					result = get();
+				}
+				catch (Exception ex)
+				{
+					JOptionPane.showMessageDialog(SettingsPanel.this,
+						"Something went wrong: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+					return;
+				}
+
+				if (closing)
+				{
+					String error = (String) result;
+					if (error != null)
+					{
+						JOptionPane.showMessageDialog(SettingsPanel.this, error, "Not Closed", JOptionPane.WARNING_MESSAGE);
+					}
+				}
+				else
+				{
+					GroupService.GroupCodeResult r = (GroupService.GroupCodeResult) result;
+					if (r.error != null)
+					{
+						JOptionPane.showMessageDialog(SettingsPanel.this, r.error, "Not Opened", JOptionPane.WARNING_MESSAGE);
+					}
+					else if (r.syncEnabled && !r.publishedToRelay)
+					{
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"Joins are open, but the code couldn't reach the sync server —\n"
+								+ "it currently only works for players on this computer. Try\n"
+								+ "toggling joins again in a moment.",
+							"Partially Open", JOptionPane.WARNING_MESSAGE);
+					}
+				}
+				refresh();
+			}
+		}.execute();
+	}
+
+	private void copyGroupCode()
+	{
+		LendingGroup g = groupService.getActiveGroup();
+		if (g == null || g.getClanCode() == null)
+		{
+			return;
+		}
+		java.awt.Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+			new java.awt.datatransfer.StringSelection(g.getClanCode()), null);
+		JOptionPane.showMessageDialog(this, "Group code copied!", "Copied", JOptionPane.INFORMATION_MESSAGE);
 	}
 
 	private JPanel buildScreenshotSection()
@@ -699,6 +843,7 @@ public class SettingsPanel extends JPanel
 		inviteCodeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 		copyCodeButton.setEnabled(false);
 		generateCodeButton.setEnabled(false);
+		if (groupCodePanel != null) groupCodePanel.setVisible(false);
 		permissionsPanel.setVisible(false);
 		if (dangerZonePanel != null) dangerZonePanel.setVisible(false);
 		if (transferOwnerDropdown != null) { transferOwnerDropdown.removeAllItems(); transferOwnerDropdown.setEnabled(false); }
@@ -721,6 +866,24 @@ public class SettingsPanel extends JPanel
 		// Invite code
 		boolean canInvite = groupService.canGenerateInviteCode(g.getId(), currentUser);
 		if (inviteCodePanel != null) inviteCodePanel.setVisible(canInvite || isStaff);
+
+		// Multi-use group code (same permission gate as single-use codes)
+		if (groupCodePanel != null)
+		{
+			groupCodePanel.setVisible(canInvite || isStaff);
+			boolean hasCode = g.getClanCode() != null && !g.getClanCode().isEmpty();
+			boolean open = g.isClanCodeEnabled() && hasCode;
+			groupCodeLabel.setText(hasCode ? g.getClanCode() : "No group code");
+			groupCodeLabel.setForeground(hasCode ? ColorScheme.BRAND_ORANGE : ColorScheme.LIGHT_GRAY_COLOR);
+			groupCodeStatusLabel.setText(open
+				? "Joins: OPEN (" + g.getClanCodeUseCount() + " used)"
+				: (hasCode ? "Joins: closed (code kept)" : "Joins: closed"));
+			groupCodeStatusLabel.setForeground(open ? new Color(0, 200, 0) : ColorScheme.LIGHT_GRAY_COLOR);
+			openCloseJoinsButton.setText(open ? "Close Joins" : "Open Joins");
+			openCloseJoinsButton.setEnabled(canInvite);
+			customGroupCodeButton.setEnabled(canInvite);
+			copyGroupCodeButton.setEnabled(hasCode);
+		}
 		if (canInvite || isStaff)
 		{
 			if (g.hasActiveInviteCode())

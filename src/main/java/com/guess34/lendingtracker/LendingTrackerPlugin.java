@@ -484,6 +484,9 @@ public class LendingTrackerPlugin extends Plugin
 	{
 		LendingGroup g = groupService.getActiveGroup();
 		if (g != null) { groupService.syncAllEntries(g.getId(), dataService.getActiveEntries()); }
+		// Keep an OPEN multi-use group code alive on the relay (stored codes
+		// expire after 24h; this refreshes while an invite-permitted member is on)
+		groupService.refreshGroupCodePresence();
 	}
 
 	// Resolved requests linger so both parties can observe the outcome; keep them at
