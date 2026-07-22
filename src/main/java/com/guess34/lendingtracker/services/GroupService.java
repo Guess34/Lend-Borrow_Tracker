@@ -320,10 +320,29 @@ public class GroupService
 			local.getMembers() != null ? local.getMembers() : new ArrayList<>());
 		boolean remoteIsNewer = remote.getMembersUpdatedAt() >= local.getMembersUpdatedAt();
 
+		// Union the kick tombstones first (newest removal time wins per name) so
+		// the member merge below can test against the combined set. This is how a
+		// kick propagates: rosters only ever ADD members, so without tombstones a
+		// peer with a stale roster would resurrect anyone we kicked.
+		Map<String, Long> tombstones = new HashMap<>(local.getRemovedMembersSafe());
+		for (Map.Entry<String, Long> t : remote.getRemovedMembersSafe().entrySet())
+		{
+			tombstones.merge(t.getKey(), t.getValue(), Math::max);
+		}
+
 		if (remote.getMembers() != null)
 		{
 			for (GroupMember rm : remote.getMembers())
 			{
+				// Don't adopt a member who was kicked after they joined — that's a
+				// stale roster echoing someone we removed. (A re-join carries a
+				// fresh joinedAt newer than the tombstone, so it survives.)
+				Long removedAt = tombstones.get(rm.getName().toLowerCase());
+				if (removedAt != null && removedAt > rm.getJoinedAt())
+				{
+					continue;
+				}
+
 				GroupMember existing = merged.stream()
 					.filter(m -> m.getName().equalsIgnoreCase(rm.getName()))
 					.findFirst().orElse(null);
@@ -338,8 +357,38 @@ public class GroupService
 			}
 		}
 
+		// Apply tombstones to what we already had: this is the receiving side of a
+		// kick performed on another machine.
+		merged.removeIf(m ->
+		{
+			Long removedAt = tombstones.get(m.getName().toLowerCase());
+			return removedAt != null && removedAt > m.getJoinedAt();
+		});
+
+		// Prune tombstones that a re-join has outdated, so the map can't grow
+		// stale entries forever.
+		for (GroupMember m : merged)
+		{
+			Long removedAt = tombstones.get(m.getName().toLowerCase());
+			if (removedAt != null && m.getJoinedAt() >= removedAt)
+			{
+				tombstones.remove(m.getName().toLowerCase());
+			}
+		}
+		local.setRemovedMembers(tombstones);
+
 		local.setMembers(merged);
 		local.setMembersUpdatedAt(Math.max(local.getMembersUpdatedAt(), remote.getMembersUpdatedAt()));
+
+		// Union who used the multi-use group code so the owner's "(N used)" counter
+		// reflects joins that happened on other machines. Names union cleanly;
+		// keep the displayed int in step (never lower it).
+		Set<String> usedBy = new HashSet<>(local.getClanCodeUsedBySafe());
+		usedBy.addAll(remote.getClanCodeUsedBySafe());
+		local.setClanCodeUsedBy(usedBy);
+		local.setClanCodeUseCount(Math.max(
+			Math.max(local.getClanCodeUseCount(), remote.getClanCodeUseCount()),
+			usedBy.size()));
 
 		if (remoteIsNewer)
 		{
@@ -360,7 +409,9 @@ public class GroupService
 		boolean exists = g.getMembers().stream().anyMatch(m -> m.getName().equalsIgnoreCase(name));
 		if (!exists)
 		{
-			g.getMembers().add(new GroupMember(name, role));
+			// Model addMember also clears any kick tombstone, so a re-invited
+			// member isn't immediately re-removed by sync.
+			g.addMember(new GroupMember(name, role));
 			touchRoster(g);
 			saveGroups();
 			publishEvent(SyncEventType.MEMBER_JOINED, groupId + ":" + name, null);
@@ -372,6 +423,9 @@ public class GroupService
 		LendingGroup g = groups.get(groupId);
 		if (g == null || g.getMembers() == null) return;
 		g.getMembers().removeIf(m -> m.getName().equalsIgnoreCase(name));
+		// Tombstone the removal so it propagates: without it the union-only roster
+		// merge would let any peer with a stale roster re-add the member.
+		g.recordRemoval(name);
 		touchRoster(g);
 		saveGroups();
 		publishEvent(SyncEventType.MEMBER_LEFT, groupId + ":" + name, null);
@@ -391,6 +445,8 @@ public class GroupService
 		boolean removed = group.getMembers().removeIf(m -> m.getName().equalsIgnoreCase(targetName));
 		if (removed)
 		{
+			// Tombstone so the kick sticks across machines (see removeMember).
+			group.recordRemoval(targetName);
 			touchRoster(group);
 			saveGroups();
 			publishEvent(SyncEventType.MEMBER_LEFT, groupId + ":" + targetName, null);
@@ -704,7 +760,7 @@ public class GroupService
 					touchRoster(group);
 				}
 
-				group.setClanCodeUseCount(group.getClanCodeUseCount() + 1);
+				group.recordClanCodeUse(playerName);
 				setCurrentGroupId(group.getId());
 				saveGroups();
 				return JoinResult.joined(group.getId());
@@ -733,7 +789,7 @@ public class GroupService
 
 					if (multiUse)
 					{
-						sharedGroup.setClanCodeUseCount(sharedGroup.getClanCodeUseCount() + 1);
+						sharedGroup.recordClanCodeUse(playerName);
 					}
 					else
 					{
@@ -813,7 +869,7 @@ public class GroupService
 						}
 						if (multiUse)
 						{
-							relayGroup.setClanCodeUseCount(relayGroup.getClanCodeUseCount() + 1);
+							relayGroup.recordClanCodeUse(playerName);
 						}
 						else
 						{

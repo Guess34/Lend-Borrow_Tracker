@@ -20,6 +20,16 @@ public class LendingGroup {
     private boolean clanCodeEnabled = true;
     private Set<String> usedGroupCodes = new HashSet<>(); // Track who used group codes
     private int clanCodeUseCount = 0; // Track clan code usage
+    // Who used the multi-use group code (lower-cased names). Unlike the raw count,
+    // a name set union-merges cleanly across machines, so the owner sees joins that
+    // happened on other clients. The count is kept in step for display.
+    private Set<String> clanCodeUsedBy = new HashSet<>();
+    // Kick tombstones: lower-cased name -> when they were removed (epoch millis).
+    // Roster sync only ever ADDS members (so a stale peer can't erase a fresh
+    // join); these tombstones are how a kick propagates without reopening that
+    // hole. A member is dropped when a tombstone is NEWER than their joinedAt;
+    // re-joining after a kick gets a fresh joinedAt and survives.
+    private Map<String, Long> removedMembers = new HashMap<>();
     // CopyOnWriteArrayList: the roster is read on the EDT while sync threads may
     // add members, so reads must never throw ConcurrentModificationException.
     private List<GroupMember> members = new CopyOnWriteArrayList<>();
@@ -105,10 +115,48 @@ public class LendingGroup {
         if (!hasMember(member.getName())) {
             members.add(member);
         }
+        // A (re)join always clears any old kick tombstone for this name, so a
+        // legitimately re-invited member isn't immediately re-removed by sync.
+        clearRemoval(member.getName());
     }
 
     public void removeMember(String memberName) {
         members.removeIf(m -> m.getName().equalsIgnoreCase(memberName));
+    }
+
+    /** Record a kick tombstone so the removal propagates across machines. */
+    public void recordRemoval(String memberName) {
+        if (memberName == null || memberName.isEmpty()) return;
+        if (removedMembers == null) removedMembers = new HashMap<>();
+        removedMembers.put(memberName.toLowerCase(), System.currentTimeMillis());
+    }
+
+    /** Drop the kick tombstone for a name (member re-joined). */
+    public void clearRemoval(String memberName) {
+        if (memberName == null || removedMembers == null) return;
+        removedMembers.remove(memberName.toLowerCase());
+    }
+
+    /** Null-safe view of the kick tombstones (name may predate this field in saved data). */
+    public Map<String, Long> getRemovedMembersSafe() {
+        return removedMembers != null ? removedMembers : Collections.emptyMap();
+    }
+
+    /**
+     * Record that a player used the multi-use group code. Tracked as a name set so
+     * it survives cross-machine merges; the display count follows the set size
+     * (same person re-joining doesn't double-count).
+     */
+    public void recordClanCodeUse(String playerName) {
+        if (playerName == null || playerName.isEmpty()) return;
+        if (clanCodeUsedBy == null) clanCodeUsedBy = new HashSet<>();
+        clanCodeUsedBy.add(playerName.toLowerCase());
+        clanCodeUseCount = Math.max(clanCodeUseCount, clanCodeUsedBy.size());
+    }
+
+    /** Null-safe view of who used the group code. */
+    public Set<String> getClanCodeUsedBySafe() {
+        return clanCodeUsedBy != null ? clanCodeUsedBy : Collections.emptySet();
     }
 
     public boolean hasMember(String memberName) {
