@@ -71,6 +71,10 @@ public class LendingTrackerPlugin extends Plugin
 
 	private LendingPanel newPanel;
 	private NavigationButton navButton;
+	// Local world, cached from the client thread (see onGameStateChanged). The relay
+	// presence join message reads this off the ws thread, where a direct
+	// client.getWorld() would be unsafe/stale.
+	private volatile int lastKnownWorld;
 
 	@Override
 	protected void startUp() throws Exception
@@ -112,7 +116,28 @@ public class LendingTrackerPlugin extends Plugin
 		relaySyncService.setOnConnectionChanged(status ->
 		{
 			if (newPanel != null) { newPanel.updateConnectionStatus(status); }
+			// When our own socket drops we can no longer vouch for anyone's presence.
+			if (!status && groupService.clearPresence() && newPanel != null)
+			{
+				newPanel.refreshRoster();
+			}
 		});
+		// Announce our roster the instant we (re)connect so a freshly joined
+		// member shows up for everyone immediately instead of after the periodic push.
+		relaySyncService.setOnConnected(() -> groupService.announcePresence());
+		// Relay-authoritative online status: a member is online iff they hold an open
+		// sync socket to the room, regardless of friends chat / friends list.
+		relaySyncService.setOnPresenceReceived(present ->
+		{
+			if (groupService.handlePresence(present) && newPanel != null)
+			{
+				newPanel.refreshRoster();
+			}
+		});
+		// Report our world in presence so peers can show it next to our name. Read
+		// from a value cached on the client thread — the supplier runs on the ws
+		// thread, where calling client.getWorld() directly could be stale/unsafe.
+		relaySyncService.setLocalWorldSupplier(() -> lastKnownWorld);
 
 		// Keep the Render free-tier relay warm so invite codes don't get
 		// wiped by spindown between when the owner creates one and a member uses it.
@@ -121,6 +146,7 @@ public class LendingTrackerPlugin extends Plugin
 		if (client.getGameState() == GameState.LOGGED_IN
 			&& client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
 		{
+			lastKnownWorld = client.getWorld();
 			triggerLoginFlow(client.getLocalPlayer().getName());
 		}
 
@@ -374,6 +400,9 @@ public class LendingTrackerPlugin extends Plugin
 			{
 				if (client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null) { return false; }
 				String playerName = client.getLocalPlayer().getName();
+				// Cache the world on the client thread for the presence join message
+				// (fires on login AND after every world hop).
+				lastKnownWorld = client.getWorld();
 				groupService.setOnSyncCallback(this::onGroupDataSynced);
 				triggerLoginFlow(playerName);
 				return true;
@@ -484,6 +513,12 @@ public class LendingTrackerPlugin extends Plugin
 	{
 		LendingGroup g = groupService.getActiveGroup();
 		if (g != null) { groupService.syncAllEntries(g.getId(), dataService.getActiveEntries()); }
+		// Data-resync heartbeat: push our full state every cycle even with no active
+		// loans (syncAllEntries no-ops when we have none). This re-broadcasts our
+		// roster/data so a peer that missed a live update converges, and it flushes
+		// any changes made while we were briefly disconnected. (Online/offline status
+		// is handled separately by the relay's presence broadcast, not this push.)
+		groupService.announcePresence();
 		// Keep an OPEN multi-use group code alive on the relay (stored codes
 		// expire after 24h; this refreshes while an invite-permitted member is on)
 		groupService.refreshGroupCodePresence();

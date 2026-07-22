@@ -139,6 +139,21 @@ public class LendingPanel extends PluginPanel
 	}
 
 	/**
+	 * Lightweight refresh for presence-only changes (a member coming online/offline
+	 * or hopping worlds). Rebuilds just the roster — not the marketplace/history
+	 * panels — so an unrelated presence ping doesn't reset the user's scroll or
+	 * reload data from config on the whole UI.
+	 */
+	public void refreshRoster()
+	{
+		SwingUtilities.invokeLater(() ->
+		{
+			rosterPanel.refresh();
+			updateConnectionStatus(plugin.isRelaySyncConnected());
+		});
+	}
+
+	/**
 	 * Update the connection status indicator (called from relay sync callback).
 	 */
 	public void updateConnectionStatus(boolean connected)

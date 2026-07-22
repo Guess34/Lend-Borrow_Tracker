@@ -303,14 +303,39 @@ public class RosterPanel extends JPanel
 				}
 			}
 
-			// Current player is always "online" on their current world
+			// Current player is always "online" on their current world.
+			String localNameLower = null;
 			if (plugin.getClient().getLocalPlayer() != null)
 			{
 				String localName = plugin.getClient().getLocalPlayer().getName();
 				if (localName != null)
 				{
+					localNameLower = localName.toLowerCase();
 					int currentWorld = plugin.getClient().getWorld();
-					online.put(localName.toLowerCase(), currentWorld);
+					online.put(localNameLower, currentWorld);
+				}
+			}
+
+			// Relay-authoritative presence: anyone with an open sync connection to the
+			// group room is online, regardless of friends chat / friends list. The
+			// relay reports their world too when it knows it. This is the primary
+			// online signal — the friends-list pass above just enriches worlds.
+			for (Map.Entry<String, Integer> e : groupService.getOnlineMembers().entrySet())
+			{
+				// Never override the local player's own row — the world we just read
+				// from the client is fresher than the one captured at our last join.
+				if (e.getKey().equals(localNameLower))
+				{
+					continue;
+				}
+				Integer w = e.getValue();
+				if (w != null && w > 0)
+				{
+					online.put(e.getKey(), w);          // real world from presence
+				}
+				else
+				{
+					online.putIfAbsent(e.getKey(), 0);  // online, world unknown -> "Online"
 				}
 			}
 		}

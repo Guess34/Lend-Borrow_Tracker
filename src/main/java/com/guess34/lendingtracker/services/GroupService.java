@@ -73,6 +73,15 @@ public class GroupService
 	private Runnable onSyncCallback;
 	private java.util.function.Consumer<SyncEvent> onWildernessAlert;
 
+	// --- Relay-authoritative presence ---
+	// The relay knows exactly which members hold an open websocket to the group's
+	// room and broadcasts that list; a member is online iff they are in it, with no
+	// friends-list relationship required. Keyed by lower-cased name -> world (0 if
+	// unknown). Held as a single volatile reference to an immutable map and swapped
+	// WHOLESALE, so the Swing EDT (which reads it while building the roster) always
+	// sees a complete map — never a half-updated one mid clear()/putAll().
+	private volatile Map<String, Integer> relayPresence = java.util.Collections.emptyMap();
+
 	// --- Initialization & Account Lifecycle ---
 
 	public void initialize()
@@ -1132,6 +1141,84 @@ public class GroupService
 		{
 			onSyncCallback.run();
 		}
+	}
+
+	/**
+	 * Apply an authoritative presence snapshot from the relay: the exact set of
+	 * members currently connected to the room (lower-cased name -> world). Replaces
+	 * the previous set wholesale, so a member who logged off drops out immediately.
+	 * Returns true if the online set actually changed (so the caller can skip a
+	 * needless roster repaint on an identical snapshot).
+	 */
+	public boolean handlePresence(java.util.Map<String, Integer> present)
+	{
+		java.util.Map<String, Integer> next = (present == null || present.isEmpty())
+			? java.util.Collections.emptyMap()
+			: java.util.Collections.unmodifiableMap(new java.util.HashMap<>(present));
+		if (relayPresence.equals(next))
+		{
+			return false;
+		}
+		relayPresence = next; // single volatile reference swap — readers see old or new, never torn
+		return true;
+	}
+
+	/**
+	 * Drop all presence when our own connection goes down — we can't vouch for
+	 * anyone. Returns true if anything was actually cleared.
+	 */
+	public boolean clearPresence()
+	{
+		if (relayPresence.isEmpty())
+		{
+			return false;
+		}
+		relayPresence = java.util.Collections.emptyMap();
+		return true;
+	}
+
+	/**
+	 * Members the relay reports as online right now, lower-cased name -> world
+	 * (0 = world unknown). The roster shows everyone here with a green dot.
+	 */
+	public java.util.Map<String, Integer> getOnlineMembers()
+	{
+		return relayPresence; // already an immutable snapshot reference
+	}
+
+	/**
+	 * Announce our current group state to the relay immediately. Fired the moment
+	 * the websocket (re)connects so a freshly joined member — and everyone already
+	 * in the room — propagate their rosters to each other without waiting for the
+	 * periodic 5-minute push. Also flushes changes made while briefly disconnected.
+	 *
+	 * Serializing the full group+data snapshot is CPU work, and this can be called
+	 * from the OkHttp ws-callback thread (onConnected) — hand it to the sync
+	 * executor when one is running so snapshot building never delays inbound
+	 * message delivery.
+	 */
+	public void announcePresence()
+	{
+		final String groupId = currentSyncGroupId;
+		if (groupId == null)
+		{
+			return;
+		}
+
+		ScheduledExecutorService exec = syncExecutor;
+		if (exec != null && !exec.isShutdown())
+		{
+			try
+			{
+				exec.execute(() -> pushStateToRelay(groupId));
+				return;
+			}
+			catch (java.util.concurrent.RejectedExecutionException ignored)
+			{
+				// Executor shut down between the check and submit — fall through.
+			}
+		}
+		pushStateToRelay(groupId);
 	}
 
 	public void publishEvent(SyncEventType type, String dataId, Object data)

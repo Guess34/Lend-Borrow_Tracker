@@ -39,13 +39,25 @@ public class RelaySyncService
 	// blocked by the per-publisher monotonic timestamp gate below.
 	private static final long MAX_MESSAGE_AGE_MS = 24L * 60 * 60 * 1000;
 
-	// Highest state timestamp applied per "groupId:publisher", so a replayed
-	// (older-or-equal) state broadcast can't revert a member's rows.
+	// Newest state timestamp APPLIED per "groupId:publisher". A state strictly older
+	// than this is dropped as a replay — the timestamp is inside the signed payload,
+	// so a captured old signed snapshot can't be re-injected to revert a publisher's
+	// marketplace/lent rows (applyPublisherRows adopts the publisher's rows
+	// wholesale, so it has no per-row recency of its own).
 	private final java.util.concurrent.ConcurrentHashMap<String, Long> lastStateTs =
+		new java.util.concurrent.ConcurrentHashMap<>();
+	// Content hash of the last state applied per "groupId:publisher", so an IDENTICAL
+	// repeat (the re-announce burst when a member joins, or the periodic heartbeat)
+	// is skipped without reprocessing. Recorded only AFTER a best-effort apply so a
+	// failed apply doesn't permanently dedup the publisher's retry.
+	private final java.util.concurrent.ConcurrentHashMap<String, Integer> lastStateHash =
 		new java.util.concurrent.ConcurrentHashMap<>();
 	// Keepalive cadence: ping ~every 12 min, never sooner than 2 min apart
 	private static final long KEEPALIVE_INTERVAL_MS = 12 * 60 * 1000;
 	private static final long KEEPALIVE_MIN_DELAY_MS = 2 * 60 * 1000;
+	// Websocket ping cadence. Keeps the relay socket warm (so it isn't idle-closed)
+	// and lets OkHttp detect a dead socket and fail over to a reconnect.
+	private static final long WS_PING_INTERVAL_S = 25;
 	// Render free tier takes 30-60s to wake from spindown — shared OkHttpClient's
 	// default 10s timeout would give up before the server responds, so the
 	// REST client used for relay calls needs its own longer timeouts.
@@ -56,20 +68,41 @@ public class RelaySyncService
 	@Inject private Gson gson;
 	@Inject private LendingTrackerConfig config;
 
+	// Serializes every transition of webSocket / connected / intentionalClose /
+	// reconnectExecutor / reconnectDelay. These are touched from the EDT
+	// (connect/disconnect), the OkHttp ws-callback thread (onOpen/onClosing/
+	// onFailure), and the reconnect executor thread; without a single lock they
+	// race — e.g. a ws-thread close could null a socket a concurrent reconnect just
+	// created, or a reconnect could resurrect a socket after an intentional close.
+	private final Object connLock = new Object();
 	private volatile WebSocket webSocket;
-	private String currentGroupId;
-	private String currentPlayerName;
-	// ADDED: Current group's sync secret for HMAC signing
-	private String currentSyncSecret;
+	// The one scheduled reconnect attempt, if any. Guarded by connLock. Cancelled
+	// when connect() opens a socket directly so a stale timer can't spawn a second
+	// concurrent connection attempt.
+	private java.util.concurrent.ScheduledFuture<?> pendingReconnect;
+	// Room identity: written by joinRoom/leaveRoom/disconnect (EDT or sync executor)
+	// and read on the ws thread (onOpen rejoin, signature verification) — volatile
+	// so a join is immediately visible to a concurrently-opening socket.
+	private volatile String currentGroupId;
+	private volatile String currentPlayerName;
+	// Current group's sync secret for HMAC signing
+	private volatile String currentSyncSecret;
 	private volatile boolean connected = false;
 	private volatile boolean intentionalClose = false;
 	private long reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 	private ScheduledExecutorService reconnectExecutor;
 	private ScheduledExecutorService keepaliveExecutor;
 	private volatile OkHttpClient restClient;
+	private volatile OkHttpClient wsClient;
 	private Consumer<GroupService.SyncEvent> onEventReceived;
 	private Consumer<Boolean> onConnectionChanged;
 	private StateHandler onStateReceived;
+	private volatile Runnable onConnected;
+	private volatile Consumer<java.util.Map<String, Integer>> onPresenceReceived;
+	// Supplies the local player's current world so the relay can report it to peers
+	// as part of presence. Read lazily at each join so a world hop (which triggers a
+	// reconnect + rejoin) reports the fresh world.
+	private volatile java.util.function.IntSupplier localWorldSupplier;
 
 	/** Callback for relay state messages (join catch-up or live broadcast). */
 	@FunctionalInterface
@@ -87,49 +120,86 @@ public class RelaySyncService
 		String url = config.relayServerUrl();
 		if (url == null || url.isEmpty()) return;
 
-		// If already connected, don't reconnect
-		if (connected && webSocket != null)
+		synchronized (connLock)
 		{
-			log.debug("Relay already connected, skipping connect");
-			return;
+			// If already connected, don't reconnect
+			if (connected && webSocket != null)
+			{
+				log.debug("Relay already connected, skipping connect");
+				return;
+			}
+
+			intentionalClose = false;
+			reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+
+			// We're connecting right now — a previously scheduled retry would only
+			// race this attempt and orphan one of the two sockets.
+			if (pendingReconnect != null)
+			{
+				pendingReconnect.cancel(false);
+				pendingReconnect = null;
+			}
+
+			if (reconnectExecutor == null || reconnectExecutor.isShutdown())
+			{
+				reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
+			}
+
+			doConnectLocked(url);
 		}
-
-		intentionalClose = false;
-		reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
-
-		if (reconnectExecutor == null || reconnectExecutor.isShutdown())
-		{
-			reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
-		}
-
-		doConnect(url);
 	}
 
-	private void doConnect(String url)
+	/** Open a websocket. MUST be called while holding {@link #connLock}. */
+	private void doConnectLocked(String url)
 	{
 		if (config == null || !config.enableRelaySync()) return;
+		// Don't resurrect a socket after an intentional close (a concurrent
+		// disconnect() may have set this while a reconnect task was queued).
+		if (intentionalClose) return;
 
 		try
 		{
 			log.debug("Connecting to relay: {}", url);
 			Request request = new Request.Builder().url(url).build();
-			webSocket = httpClient.newWebSocket(request, new RelayWebSocketListener());
+			webSocket = getWsClient().newWebSocket(request, new RelayWebSocketListener());
 		}
 		catch (Exception e)
 		{
 			log.warn("Failed to connect to relay: {}", e.getMessage());
-			scheduleReconnect();
+			scheduleReconnectLocked();
 		}
 	}
 
 	public void disconnect()
 	{
-		intentionalClose = true;
-		connected = false;
+		WebSocket ws;
+		synchronized (connLock)
+		{
+			intentionalClose = true;
+			connected = false;
 
-		// Null out the field FIRST so stale callbacks see ws != webSocket
-		WebSocket ws = webSocket;
-		webSocket = null;
+			// Null the field so any in-flight/stale callback sees ws != webSocket.
+			ws = webSocket;
+			webSocket = null;
+			// Clear the room so a socket that somehow (re)opens can't rejoin the
+			// group we just left.
+			currentGroupId = null;
+
+			pendingReconnect = null; // shutdownNow below cancels the task itself
+
+			if (reconnectExecutor != null && !reconnectExecutor.isShutdown())
+			{
+				reconnectExecutor.shutdownNow();
+				reconnectExecutor = null;
+			}
+		}
+
+		// Full teardown (logout / group switch) — the per-publisher dedup floors
+		// belong to the room we just left; drop them so they can't grow unbounded
+		// across group switches. (The auto-reconnect path never comes through here,
+		// so a mid-session reconnect keeps its replay floors.)
+		lastStateTs.clear();
+		lastStateHash.clear();
 
 		if (ws != null)
 		{
@@ -138,12 +208,6 @@ public class RelaySyncService
 				ws.close(CLOSE_NORMAL, "Plugin shutdown");
 			}
 			catch (Exception ignored) { }
-		}
-
-		if (reconnectExecutor != null && !reconnectExecutor.isShutdown())
-		{
-			reconnectExecutor.shutdownNow();
-			reconnectExecutor = null;
 		}
 
 		notifyConnectionChanged(false);
@@ -189,6 +253,16 @@ public class RelaySyncService
 		msg.addProperty("type", "join");
 		msg.addProperty("groupId", groupId);
 		msg.addProperty("playerName", playerName);
+		// Report our current world so peers can show it next to our name. Read lazily
+		// here so a reconnect after a world hop reports the new world.
+		int world = 0;
+		try
+		{
+			java.util.function.IntSupplier supplier = localWorldSupplier;
+			if (supplier != null) { world = supplier.getAsInt(); }
+		}
+		catch (Exception ignored) { /* world stays 0 */ }
+		msg.addProperty("world", world);
 		ws.send(gson.toJson(msg));
 	}
 
@@ -196,12 +270,16 @@ public class RelaySyncService
 	{
 		if (config == null || !config.enableRelaySync()) return;
 
-		if (connected && webSocket != null && groupId != null)
+		// Cache the volatile field: onClosing/onFailure can null it from the ws
+		// thread between our check and the send (a send on a dying socket is a
+		// harmless no-op; an NPE here would propagate to the caller's thread).
+		WebSocket ws = webSocket;
+		if (connected && ws != null && groupId != null)
 		{
 			JsonObject msg = new JsonObject();
 			msg.addProperty("type", "leave");
 			msg.addProperty("groupId", groupId);
-			webSocket.send(gson.toJson(msg));
+			ws.send(gson.toJson(msg));
 		}
 
 		if (groupId != null && groupId.equals(currentGroupId))
@@ -220,7 +298,9 @@ public class RelaySyncService
 	public void sendEvent(String groupId, GroupService.SyncEvent event)
 	{
 		if (config == null || !config.enableRelaySync()) return;
-		if (!connected || webSocket == null || groupId == null) return;
+		// Cache the volatile field — see leaveRoom for why.
+		WebSocket ws = webSocket;
+		if (!connected || ws == null || groupId == null) return;
 
 		JsonObject eventJson = gson.toJsonTree(event).getAsJsonObject();
 
@@ -240,7 +320,7 @@ public class RelaySyncService
 			}
 		}
 
-		webSocket.send(gson.toJson(msg));
+		ws.send(gson.toJson(msg));
 	}
 
 	public boolean isConnected()
@@ -598,7 +678,9 @@ public class RelaySyncService
 	public void publishState(String groupId, String groupJson, String dataJson, String publisher)
 	{
 		if (config == null || !config.enableRelaySync()) return;
-		if (!connected || webSocket == null || groupId == null) return;
+		// Cache the volatile field — see leaveRoom for why.
+		WebSocket ws = webSocket;
+		if (!connected || ws == null || groupId == null) return;
 
 		long timestamp = System.currentTimeMillis();
 
@@ -627,7 +709,7 @@ public class RelaySyncService
 			}
 		}
 
-		webSocket.send(gson.toJson(msg));
+		ws.send(gson.toJson(msg));
 		log.debug("Published group state to relay for group {}", groupId);
 	}
 
@@ -762,6 +844,33 @@ public class RelaySyncService
 		this.onStateReceived = callback;
 	}
 
+	/**
+	 * Called on the websocket thread right after we (re)connect and rejoin our
+	 * room. Used to announce our current state immediately so other members see
+	 * us and our roster without waiting for the periodic push.
+	 */
+	public void setOnConnected(Runnable callback)
+	{
+		this.onConnected = callback;
+	}
+
+	/**
+	 * Called with the authoritative set of players currently connected to our room
+	 * (lower-cased name -> world, world 0 if unknown), whenever the relay broadcasts
+	 * presence. This is the source of truth for who is online — no friends-list
+	 * relationship required.
+	 */
+	public void setOnPresenceReceived(Consumer<java.util.Map<String, Integer>> callback)
+	{
+		this.onPresenceReceived = callback;
+	}
+
+	/** Supplies the local player's current world for presence reporting. */
+	public void setLocalWorldSupplier(java.util.function.IntSupplier supplier)
+	{
+		this.localWorldSupplier = supplier;
+	}
+
 	// --- Keepalive ---
 	// Prevents Render free-tier spindown (15 min idle) which wipes the relay's
 	// ephemeral filesystem and loses all invite codes. Each client with cloud
@@ -880,24 +989,73 @@ public class RelaySyncService
 		}
 	}
 
+	/**
+	 * Websocket client with an application-level ping interval. OkHttp sends WS ping
+	 * frames on this cadence, which (a) keeps the connection warm so the relay/proxy
+	 * doesn't idle it out, and (b) surfaces a half-open/dead socket as an onFailure
+	 * — the path that actually reconnects. The REST /keepalive pinger only warms the
+	 * HTTP dyno; it sends no WS frames, so without this the socket still goes stale.
+	 */
+	private OkHttpClient getWsClient()
+	{
+		OkHttpClient existing = wsClient;
+		if (existing != null) return existing;
+
+		synchronized (this)
+		{
+			if (wsClient == null)
+			{
+				wsClient = httpClient.newBuilder()
+					.pingInterval(WS_PING_INTERVAL_S, TimeUnit.SECONDS)
+					.build();
+			}
+			return wsClient;
+		}
+	}
+
 	private void scheduleReconnect()
 	{
-		if (intentionalClose || reconnectExecutor == null || reconnectExecutor.isShutdown()) return;
-
-		log.debug("Scheduling relay reconnect in {}ms", reconnectDelay);
-		reconnectExecutor.schedule(() ->
+		synchronized (connLock)
 		{
-			if (!intentionalClose && !connected)
-			{
-				String url = config != null ? config.relayServerUrl() : null;
-				if (url != null && !url.isEmpty())
-				{
-					doConnect(url);
-				}
-			}
-		}, reconnectDelay, TimeUnit.MILLISECONDS);
+			scheduleReconnectLocked();
+		}
+	}
 
-		reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
+	/** Schedule a reconnect. MUST be called while holding {@link #connLock}. */
+	private void scheduleReconnectLocked()
+	{
+		// Cache the executor into a local: reading the field twice lets a concurrent
+		// disconnect() null it between the guard and the schedule() call (NPE), or
+		// shut it down (RejectedExecutionException).
+		ScheduledExecutorService exec = reconnectExecutor;
+		if (intentionalClose || exec == null || exec.isShutdown()) return;
+
+		final long delay = reconnectDelay;
+		log.debug("Scheduling relay reconnect in {}ms", delay);
+		try
+		{
+			pendingReconnect = exec.schedule(() ->
+			{
+				synchronized (connLock)
+				{
+					pendingReconnect = null;
+					if (!intentionalClose && !connected)
+					{
+						String url = config != null ? config.relayServerUrl() : null;
+						if (url != null && !url.isEmpty())
+						{
+							doConnectLocked(url);
+						}
+					}
+				}
+			}, delay, TimeUnit.MILLISECONDS);
+
+			reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
+		}
+		catch (java.util.concurrent.RejectedExecutionException ignored)
+		{
+			// Executor was shut down concurrently (teardown in progress) — nothing to do.
+		}
 	}
 
 	private void notifyConnectionChanged(boolean status)
@@ -924,22 +1082,45 @@ public class RelaySyncService
 		@Override
 		public void onOpen(WebSocket ws, Response response)
 		{
-			if (!isCurrent(ws))
+			synchronized (connLock)
 			{
-				log.debug("Ignoring onOpen from stale WebSocket");
-				ws.close(CLOSE_NORMAL, null);
-				return;
+				// Ignore a socket that's no longer current OR one that opened after we
+				// intentionally closed (a reconnect that raced a disconnect): close it.
+				if (!isCurrent(ws) || intentionalClose)
+				{
+					log.debug("Ignoring onOpen from stale/closed WebSocket");
+					ws.close(CLOSE_NORMAL, null);
+					return;
+				}
+
+				log.debug("Relay connected");
+
+				// Enqueue the room join BEFORE flipping connected: any other thread
+				// that observes connected==true and sends (event/state push) will
+				// enqueue AFTER the join, so the server always sees us join the room
+				// before our first message to it. ws.send is a non-blocking enqueue,
+				// safe under the lock.
+				String gid = currentGroupId;
+				String pn = currentPlayerName;
+				if (gid != null && pn != null)
+				{
+					sendJoinMessage(gid, pn);
+				}
+
+				connected = true;
+				reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 			}
 
-			log.debug("Relay connected");
-			connected = true;
-			reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 			notifyConnectionChanged(true);
 
-			// Rejoin current room after reconnect
-			if (currentGroupId != null && currentPlayerName != null)
+			// Announce our state immediately so other members see us (and our
+			// roster) the moment we connect, instead of waiting for the periodic
+			// 5-minute push. Fires on first join AND on reconnect. Also flushes any
+			// changes made while we were briefly disconnected.
+			Runnable oc = onConnected;
+			if (oc != null)
 			{
-				sendJoinMessage(currentGroupId, currentPlayerName);
+				oc.run();
 			}
 		}
 
@@ -1002,21 +1183,24 @@ public class RelaySyncService
 					long timestamp = msg.has("timestamp") && !msg.get("timestamp").isJsonNull()
 						? msg.get("timestamp").getAsLong() : 0;
 
-					// Drop a replayed or duplicate state: only apply strictly newer
-					// timestamps per publisher.
-					if (groupId != null && publisher != null)
+					String key = (groupId != null && publisher != null) ? groupId + ":" + publisher : null;
+					int hash = java.util.Objects.hash(groupJson, dataJson);
+					if (key != null)
 					{
-						String key = groupId + ":" + publisher;
-						Long prev = lastStateTs.get(key);
-						// Drop only STRICTLY older states (definitely superseded). Equal
-						// timestamps are allowed through: two pushes can share a
-						// millisecond, and re-applying the same full snapshot is
-						// idempotent, so this can't lose the more recent of the two.
-						if (prev != null && timestamp < prev)
+						// Replay guard: drop a state strictly OLDER than the newest we've
+						// applied from this publisher (signed timestamp, can't be forged).
+						Long prevTs = lastStateTs.get(key);
+						if (prevTs != null && timestamp < prevTs)
+						{
+							log.debug("Dropping stale relay state from {} ({} < {})", publisher, timestamp, prevTs);
+							return;
+						}
+						// Throttle: skip an identical repeat (re-announce / heartbeat).
+						Integer prevHash = lastStateHash.get(key);
+						if (prevHash != null && prevHash == hash)
 						{
 							return;
 						}
-						lastStateTs.put(key, Math.max(timestamp, prev != null ? prev : timestamp));
 					}
 
 					if (groupJson != null && publisher != null && onStateReceived != null)
@@ -1024,7 +1208,52 @@ public class RelaySyncService
 						log.info("Received live state from relay for group {} (publisher: {})",
 							groupId != null ? groupId : "unknown", publisher);
 						onStateReceived.accept(groupJson, dataJson, publisher);
+						// Record AFTER apply so a failed apply doesn't dedup the retry.
+						if (key != null)
+						{
+							Long prevTs = lastStateTs.get(key);
+							long floor = Math.max(timestamp, prevTs != null ? prevTs : timestamp);
+							// Clamp the replay floor to OUR clock (+1 min): a publisher
+							// whose clock was ahead would otherwise latch a future floor
+							// and have every later legitimate push dropped for the whole
+							// session. Old replays stay blocked; a future-latch self-heals
+							// within a minute of receiver time.
+							lastStateTs.put(key, Math.min(floor, System.currentTimeMillis() + 60_000L));
+							lastStateHash.put(key, hash);
+						}
 					}
+				}
+				else if ("presence".equals(type))
+				{
+					// Authoritative online list for the room: everyone with an open ws
+					// here, independent of friends chat / friends list. No signature is
+					// needed — presence carries no group data, only who is connected, and
+					// the relay is the sole authority on its own socket set.
+					// Guard: only apply presence for the room we're currently in (a
+					// stale-socket broadcast for a previous group must not leak through).
+					String presenceGroup = msg.has("groupId") && !msg.get("groupId").isJsonNull()
+						? msg.get("groupId").getAsString() : null;
+					String activeGroup = currentGroupId;
+					if (presenceGroup != null && activeGroup != null && !presenceGroup.equals(activeGroup))
+					{
+						return;
+					}
+					java.util.Map<String, Integer> present = new java.util.HashMap<>();
+					if (msg.has("players") && msg.get("players").isJsonArray())
+					{
+						for (com.google.gson.JsonElement el : msg.getAsJsonArray("players"))
+						{
+							if (el == null || !el.isJsonObject()) continue;
+							JsonObject p = el.getAsJsonObject();
+							if (!p.has("name") || p.get("name").isJsonNull()) continue;
+							String name = p.get("name").getAsString();
+							if (name.isEmpty()) continue;
+							int w = p.has("world") && !p.get("world").isJsonNull() ? p.get("world").getAsInt() : 0;
+							present.put(name.toLowerCase(), w);
+						}
+					}
+					Consumer<java.util.Map<String, Integer>> cb = onPresenceReceived;
+					if (cb != null) { cb.accept(present); }
 				}
 			}
 			catch (Exception e)
@@ -1038,30 +1267,62 @@ public class RelaySyncService
 		{
 			ws.close(CLOSE_NORMAL, null);
 
-			if (!isCurrent(ws))
+			boolean doReconnect = false;
+			synchronized (connLock)
 			{
-				log.debug("Ignoring onClosing from stale WebSocket");
-				return;
+				if (!isCurrent(ws))
+				{
+					log.debug("Ignoring onClosing from stale WebSocket");
+					return;
+				}
+
+				log.debug("Relay closing: {} {}", code, reason);
+				connected = false;
+
+				// A GRACEFUL close from the server/proxy (Render free-tier idle timeout,
+				// dyno cycle, load-balancer idle cutoff) lands here — NOT in onFailure.
+				// Previously we stopped at notify and the socket stayed dead until the
+				// next startSync, so live sync AND presence silently halted until a
+				// RuneLite restart. Treat it like any other drop and reconnect, unless
+				// we closed it ourselves. isCurrent(ws) confirmed ws == webSocket while
+				// holding the lock, so this null only clears THIS socket.
+				if (!intentionalClose)
+				{
+					webSocket = null;
+					doReconnect = true;
+				}
 			}
 
-			log.debug("Relay closing: {} {}", code, reason);
-			connected = false;
 			notifyConnectionChanged(false);
+			if (doReconnect)
+			{
+				log.debug("Relay closed by server; scheduling reconnect");
+				scheduleReconnect();
+			}
 		}
 
 		@Override
 		public void onFailure(WebSocket ws, Throwable t, Response response)
 		{
-			if (!isCurrent(ws))
+			boolean doReconnect = false;
+			synchronized (connLock)
 			{
-				log.debug("Ignoring onFailure from stale WebSocket");
-				return;
+				if (!isCurrent(ws))
+				{
+					log.debug("Ignoring onFailure from stale WebSocket");
+					return;
+				}
+
+				connected = false;
+				if (!intentionalClose)
+				{
+					webSocket = null;
+					doReconnect = true;
+				}
 			}
 
-			connected = false;
 			notifyConnectionChanged(false);
-
-			if (!intentionalClose)
+			if (doReconnect)
 			{
 				log.warn("Relay connection failed: {}", t.getMessage());
 				scheduleReconnect();
