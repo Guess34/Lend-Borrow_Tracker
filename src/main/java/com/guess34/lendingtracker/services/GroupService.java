@@ -390,6 +390,54 @@ public class GroupService
 			Math.max(local.getClanCodeUseCount(), remote.getClanCodeUseCount()),
 			usedBy.size()));
 
+		// Code state is GROUP data: every staff member must see the same single-use
+		// code, group code, and open/closed status. Adopt the remote code state
+		// wholesale when it's newer — a joiner consuming a code or a staff member
+		// rotating/toggling one then propagates to everyone with the panel open.
+		// On an exact-millisecond tie (two staff acting at once), break it
+		// deterministically by the code-state key so BOTH sides pick the same
+		// winner instead of each keeping its own code forever.
+		long remoteCodeStamp = remote.getCodeStateUpdatedAt();
+		long localCodeStamp = local.getCodeStateUpdatedAt();
+		boolean adoptCodeState = remoteCodeStamp > localCodeStamp
+			|| (remoteCodeStamp == localCodeStamp && remoteCodeStamp > 0
+				&& codeStateKey(remote).compareTo(codeStateKey(local)) > 0);
+		if (adoptCodeState)
+		{
+			String oldInvite = local.getInviteCode();
+			String oldClan = local.getClanCode();
+			boolean oldClanEnabled = local.isClanCodeEnabled();
+
+			local.setInviteCode(remote.getInviteCode());
+			local.setInviteCodeGeneratedAt(remote.getInviteCodeGeneratedAt());
+			local.setInviteCodeUsedByName(remote.getInviteCodeUsedByName());
+			local.setClanCode(remote.getClanCode());
+			local.setClanCodeEnabled(remote.isClanCodeEnabled());
+			local.setCodeStateUpdatedAt(remote.getCodeStateUpdatedAt());
+
+			// Retire stale same-machine lookup keys: a code consumed or closed on
+			// ANOTHER machine must stop working for alts on this one too.
+			if (oldInvite != null && !oldInvite.equals(local.getInviteCode()))
+			{
+				configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + oldInvite);
+			}
+			if (oldClan != null && oldClanEnabled
+				&& (!local.isClanCodeEnabled() || !oldClan.equals(local.getClanCode())))
+			{
+				configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + oldClan);
+			}
+			// And mirror an OPEN group code / active invite for same-machine joins
+			// here, like the machine that opened it does.
+			if (local.isClanCodeEnabled() && local.getClanCode() != null && !local.getClanCode().isEmpty())
+			{
+				configManager.setConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + local.getClanCode(), gson.toJson(local));
+			}
+			if (local.hasActiveInviteCode())
+			{
+				configManager.setConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + local.getInviteCode(), gson.toJson(local));
+			}
+		}
+
 		if (remoteIsNewer)
 		{
 			local.setCoOwnerCanKick(remote.isCoOwnerCanKick());
@@ -399,6 +447,14 @@ public class GroupService
 			local.setAdminCanInvite(remote.isAdminCanInvite());
 			local.setModCanInvite(remote.isModCanInvite());
 		}
+	}
+
+	/** Stable key for a group's code state — used only to break exact-timestamp ties. */
+	private static String codeStateKey(LendingGroup g)
+	{
+		return (g.getInviteCode() == null ? "" : g.getInviteCode())
+			+ "|" + (g.getClanCode() == null ? "" : g.getClanCode())
+			+ "|" + g.isClanCodeEnabled();
 	}
 
 	public void addMember(String groupId, String name, String role)
@@ -990,7 +1046,14 @@ public class GroupService
 			return null;
 		}
 
+		// Retire the previous code's same-machine lookup key — otherwise the old
+		// (rotated-away) code would keep working for alts on this computer.
+		String previousCode = group.getInviteCode();
 		String code = group.generateSingleUseCode();
+		if (previousCode != null && !previousCode.isEmpty() && !previousCode.equals(code))
+		{
+			configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + previousCode);
+		}
 		saveGroups();
 		String groupJson = gson.toJson(group);
 		// Store in shared config so other accounts on the same machine can look up this code
@@ -1003,6 +1066,10 @@ public class GroupService
 			// Confirm the code actually reached the relay before the owner hands it out
 			published = relaySyncService.publishInviteBlocking(code, groupId, groupJson);
 		}
+
+		// Code state is shared group data — push it live so every staff member's
+		// panel shows the same active code immediately.
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
 		return new InviteCodeResult(code, syncEnabled, published);
 	}
 
@@ -1069,6 +1136,7 @@ public class GroupService
 
 		group.setClanCode(code);
 		group.setClanCodeEnabled(true);
+		group.touchCodeState();
 		saveGroups();
 
 		String groupJson = gson.toJson(group);
@@ -1081,6 +1149,9 @@ public class GroupService
 		{
 			published = relaySyncService.publishInviteBlocking(code, groupId, groupJson);
 		}
+
+		// Shared group data — every staff member's panel must show the code is OPEN.
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
 		return new GroupCodeResult(code, null, syncEnabled, published);
 	}
 
@@ -1101,6 +1172,7 @@ public class GroupService
 		}
 
 		group.setClanCodeEnabled(false);
+		group.touchCodeState();
 		saveGroups();
 
 		if (group.getClanCode() != null)
@@ -1111,6 +1183,9 @@ public class GroupService
 				relaySyncService.consumeInviteCode(group.getClanCode()); // removes it from the relay
 			}
 		}
+
+		// Shared group data — every staff member's panel must show joins CLOSED.
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
 		return null;
 	}
 
@@ -1199,6 +1274,12 @@ public class GroupService
 			{
 				scheduleCatchUpFetch(groupId, 0, 0);
 			}
+			// Push our current state too: this re-sync may follow a local change
+			// this path wouldn't otherwise broadcast (e.g. redeeming a single-use
+			// code for a group we were already syncing — staff must see "USED by X").
+			// No-ops until connected; harmless when nothing changed (peers dedup an
+			// identical snapshot by content hash).
+			announcePresence();
 			return;
 		}
 
@@ -1491,7 +1572,13 @@ public class GroupService
 			LendingGroup localGroup = groups.get(groupId);
 			if (localGroup != null)
 			{
-				mergeRoster(localGroup, remoteGroup);
+				// mergeRoster runs on BOTH the ws thread (here) and the sync-executor
+				// thread (loadSharedGroupState); lock the group so their field writes
+				// can't interleave into a torn code/roster state.
+				synchronized (localGroup)
+				{
+					mergeRoster(localGroup, remoteGroup);
+				}
 				saveGroups();
 			}
 
@@ -1681,8 +1768,12 @@ public class GroupService
 			if (localGroup != null)
 			{
 				// Same union-merge path as relay state: never drop a member, and
-				// keep the roster in a thread-safe (COW) list.
-				mergeRoster(localGroup, remoteGroup);
+				// keep the roster in a thread-safe (COW) list. Locked on the group
+				// so it can't interleave with the ws-thread merge (see handleRelayState).
+				synchronized (localGroup)
+				{
+					mergeRoster(localGroup, remoteGroup);
+				}
 			}
 			else
 			{

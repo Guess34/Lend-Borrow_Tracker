@@ -1245,7 +1245,7 @@ public class RelaySyncService
 
 					if (groupJson != null && publisher != null && onStateReceived != null)
 					{
-						log.info("Received live state from relay for group {} (publisher: {})",
+						log.debug("Received live state from relay for group {} (publisher: {})",
 							groupId != null ? groupId : "unknown", publisher);
 						onStateReceived.accept(groupJson, dataJson, publisher);
 						// Record AFTER apply so a failed apply doesn't dedup the retry.

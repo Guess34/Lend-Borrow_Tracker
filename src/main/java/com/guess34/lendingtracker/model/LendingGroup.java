@@ -18,6 +18,18 @@ public class LendingGroup {
     private String inviteCode; // Single-use group code (one per person)
     private String clanCode; // Multi-use clan code
     private boolean clanCodeEnabled = true;
+    // When the single-use code was generated (epoch millis). The relay expires
+    // stored codes after 24h, so past that the code is dead everywhere — the UI
+    // shows EXPIRED and hasActiveInviteCode() stops matching it.
+    private long inviteCodeGeneratedAt;
+    // Who redeemed the last single-use code (display name), so staff on every
+    // machine see "USED by X" instead of a code that silently vanished.
+    private String inviteCodeUsedByName;
+    // Version stamp for ALL code state above + clanCode/clanCodeEnabled. Code
+    // state is GROUP data: every staff member must see the same code and the
+    // same open/closed status. Newer stamp wins wholesale on sync, so a joiner
+    // consuming a code, or one staff member rotating it, propagates to all.
+    private long codeStateUpdatedAt;
     private Set<String> usedGroupCodes = new HashSet<>(); // Track who used group codes
     private int clanCodeUseCount = 0; // Track clan code usage
     // Who used the multi-use group code (lower-cased names). Unlike the raw count,
@@ -83,14 +95,25 @@ public class LendingGroup {
         return uuid.substring(0, 3) + "-" + uuid.substring(3, 6) + "-" + uuid.substring(6, 9);
     }
 
+    // Matches the relay's stored-code TTL: past this the code is dead everywhere.
+    public static final long INVITE_CODE_TTL_MS = 24L * 60 * 60 * 1000;
+
+    /** Stamp the code state so this change wins over older state on sync. */
+    public void touchCodeState() {
+        this.codeStateUpdatedAt = System.currentTimeMillis();
+    }
+
     /**
      * Generate a new single-use invite code.
      * This code will be voided after one person uses it.
      */
     public String generateSingleUseCode() {
         this.inviteCode = generateFormattedCode();
+        this.inviteCodeGeneratedAt = System.currentTimeMillis();
+        this.inviteCodeUsedByName = null;
         // Clear previous code usage since this is a new code
         this.usedGroupCodes.clear();
+        touchCodeState();
         return this.inviteCode;
     }
 
@@ -102,13 +125,25 @@ public class LendingGroup {
         usedGroupCodes.add(playerName.toLowerCase());
         // FIXED: Single-use code - void the code after use
         this.inviteCode = null;
+        this.inviteCodeUsedByName = playerName;
+        touchCodeState();
     }
 
     /**
-     * Check if an invite code is currently active (not voided)
+     * Check if an invite code is currently active: present AND younger than the
+     * relay's 24h expiry. Codes saved before the generated-at field existed
+     * deserialize to 0 and read as expired — correct, since their relay copy is
+     * long gone and only a stale local shortcut could still match them.
      */
     public boolean hasActiveInviteCode() {
-        return this.inviteCode != null && !this.inviteCode.isEmpty();
+        return this.inviteCode != null && !this.inviteCode.isEmpty()
+            && this.inviteCodeGeneratedAt > 0
+            && System.currentTimeMillis() - this.inviteCodeGeneratedAt < INVITE_CODE_TTL_MS;
+    }
+
+    /** The single-use code exists but has aged past the relay's 24h expiry. */
+    public boolean isInviteCodeExpired() {
+        return this.inviteCode != null && !this.inviteCode.isEmpty() && !hasActiveInviteCode();
     }
 
     public void addMember(GroupMember member) {

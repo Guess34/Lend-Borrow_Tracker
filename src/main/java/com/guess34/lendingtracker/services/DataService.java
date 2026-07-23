@@ -997,7 +997,7 @@ public class DataService
 
 			// Persist the reconciled state locally so it survives a restart.
 			persist(groupId, "sync");
-			log.info("Applied group snapshot for group {} (publisher: {})", groupId,
+			log.debug("Applied group snapshot for group {} (publisher: {})", groupId,
 				publisher != null ? publisher : "catch-up");
 		}
 		catch (Exception e)

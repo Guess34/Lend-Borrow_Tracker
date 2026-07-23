@@ -29,6 +29,7 @@ public class SettingsPanel extends JPanel
 
 	private JLabel groupNameLabel, memberCountLabel, roleLabel, inviteCodeLabel;
 	private JButton generateCodeButton, copyCodeButton;
+	private JLabel inviteCodeStatusLabel;
 	private JLabel groupCodeLabel, groupCodeStatusLabel;
 	private JButton openCloseJoinsButton, copyGroupCodeButton, customGroupCodeButton;
 	private JPanel groupCodePanel;
@@ -145,6 +146,12 @@ public class SettingsPanel extends JPanel
 		inviteCodeLabel.setBorder(new CompoundBorder(
 			new LineBorder(ColorScheme.MEDIUM_GRAY_COLOR, 1), new EmptyBorder(5, 8, 5, 8)));
 		content.add(inviteCodeLabel);
+		content.add(Box.createVerticalStrut(3));
+
+		// USED by X / EXPIRED / expiry countdown — synced group state, so every
+		// staff member sees the same code status.
+		inviteCodeStatusLabel = smallLabel(" ");
+		content.add(inviteCodeStatusLabel);
 		content.add(Box.createVerticalStrut(5));
 
 		JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 3, 0));
@@ -528,6 +535,8 @@ public class SettingsPanel extends JPanel
 				inviteCodeLabel.setText(r.code);
 				inviteCodeLabel.setForeground(ColorScheme.BRAND_ORANGE);
 				copyCodeButton.setEnabled(true);
+				inviteCodeStatusLabel.setText("Active — expires in ~24h");
+				inviteCodeStatusLabel.setForeground(new Color(0, 200, 0));
 
 				if (!r.syncEnabled)
 				{
@@ -841,6 +850,7 @@ public class SettingsPanel extends JPanel
 		roleLabel.setText("-");
 		inviteCodeLabel.setText("No active code");
 		inviteCodeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		if (inviteCodeStatusLabel != null) inviteCodeStatusLabel.setText(" ");
 		copyCodeButton.setEnabled(false);
 		generateCodeButton.setEnabled(false);
 		if (groupCodePanel != null) groupCodePanel.setVisible(false);
@@ -891,12 +901,36 @@ public class SettingsPanel extends JPanel
 				inviteCodeLabel.setText(g.getInviteCode());
 				inviteCodeLabel.setForeground(ColorScheme.BRAND_ORANGE);
 				copyCodeButton.setEnabled(true);
+				long hoursLeft = Math.max(1, (g.getInviteCodeGeneratedAt()
+					+ LendingGroup.INVITE_CODE_TTL_MS - System.currentTimeMillis()) / 3600000L);
+				inviteCodeStatusLabel.setText("Active — expires in ~" + hoursLeft + "h");
+				inviteCodeStatusLabel.setForeground(new Color(0, 200, 0));
+			}
+			else if (g.isInviteCodeExpired())
+			{
+				// The code string is kept so staff can see WHICH code died, but it
+				// no longer joins anyone — relay copies expire after 24h.
+				inviteCodeLabel.setText(g.getInviteCode());
+				inviteCodeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+				copyCodeButton.setEnabled(false);
+				inviteCodeStatusLabel.setText("EXPIRED — generate a new code");
+				inviteCodeStatusLabel.setForeground(new Color(200, 60, 60));
+			}
+			else if (g.getInviteCodeUsedByName() != null)
+			{
+				inviteCodeLabel.setText("No active code");
+				inviteCodeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+				copyCodeButton.setEnabled(false);
+				inviteCodeStatusLabel.setText("USED by " + g.getInviteCodeUsedByName()
+					+ " — generate a new code");
+				inviteCodeStatusLabel.setForeground(new Color(200, 60, 60));
 			}
 			else
 			{
 				inviteCodeLabel.setText("No active code");
 				inviteCodeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 				copyCodeButton.setEnabled(false);
+				inviteCodeStatusLabel.setText(" ");
 			}
 			generateCodeButton.setEnabled(canInvite);
 		}
