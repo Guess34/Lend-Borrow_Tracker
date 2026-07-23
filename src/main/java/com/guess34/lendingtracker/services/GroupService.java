@@ -418,6 +418,57 @@ public class GroupService
 		}
 	}
 
+	/**
+	 * Restore a whole group from a LOCAL BACKUP file, preserving its identity.
+	 * Recreating via createGroup minted a NEW random id, which forked the group
+	 * from its sync room, lost the syncSecret and kick tombstones, and orphaned
+	 * the per-group data still keyed by the original id. Restoring the object
+	 * as-is keeps the same room, secret, roster, and tombstones. No-op if a group
+	 * with this id already exists locally.
+	 */
+	public void restoreGroupFromBackup(LendingGroup backupGroup)
+	{
+		if (backupGroup == null || backupGroup.getId() == null) return;
+		if (groups.containsKey(backupGroup.getId())) return;
+
+		// Same backfill loadGroups does: a pre-HMAC backup has no syncSecret, and
+		// without one this group would sync unsigned for the rest of the session.
+		backupGroup.ensureSyncSecret();
+		groups.put(backupGroup.getId(), ensureCowMembers(backupGroup));
+		saveGroups();
+	}
+
+	/**
+	 * Re-add a member from a LOCAL BACKUP file (not a live join). Unlike
+	 * {@link #addMember}, this must NOT mint a fresh joinedAt or clear kick
+	 * tombstones: the backup predates whatever happened while we were offline,
+	 * so a member kicked in the meantime has a tombstone NEWER than their
+	 * backed-up joinedAt and must stay removed — otherwise a stale backup would
+	 * resurrect them (and, worse, push the resurrection to the whole group).
+	 */
+	public void restoreMemberFromBackup(String groupId, GroupMember backupMember)
+	{
+		if (backupMember == null || backupMember.getName() == null) return;
+		LendingGroup g = groups.get(groupId);
+		if (g == null) return;
+		if (g.hasMember(backupMember.getName())) return;
+
+		Long removedAt = g.getRemovedMembersSafe().get(backupMember.getName().toLowerCase());
+		if (removedAt != null && removedAt > backupMember.getJoinedAt())
+		{
+			// Kicked after this backup was taken — the tombstone wins.
+			return;
+		}
+
+		if (g.getMembers() == null) g.setMembers(new java.util.concurrent.CopyOnWriteArrayList<>());
+		// Keep the ORIGINAL joinedAt (0 for pre-update backups) so a tombstone
+		// learned later via sync still outranks this restore.
+		g.getMembers().add(backupMember);
+		touchRoster(g);
+		saveGroups();
+		publishEvent(SyncEventType.MEMBER_JOINED, groupId + ":" + backupMember.getName(), null);
+	}
+
 	public void removeMember(String groupId, String name)
 	{
 		LendingGroup g = groups.get(groupId);
@@ -652,6 +703,10 @@ public class GroupService
 			default:
 				return false;
 		}
+		// Peers only adopt permission flags when the roster stamp is newer — without
+		// bumping it, this change could be silently discarded by any peer whose
+		// stamp is already ahead.
+		touchRoster(group);
 		saveGroups();
 		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
 		return true;
@@ -1115,6 +1170,38 @@ public class GroupService
 			return;
 		}
 
+		// Already syncing this exact group+player? Both GameStateChanged(LOGGED_IN)
+		// and RuneScapeProfileChanged fire the login flow, so every login (and every
+		// world hop) calls startSync twice. A full teardown/reconnect here caused a
+		// presence flap for peers, an all-offline roster flash locally, and a
+		// needless re-fetch. Deliberately NOT gated on isConnected(): at login the
+		// second call usually lands while the first call's websocket handshake is
+		// still in flight, and it must be absorbed too — connect() below no-ops
+		// when a socket is connected OR connecting, and joinRoom just refreshes the
+		// room (sent now if connected, else by onOpen when the handshake finishes).
+		if (groupId.equals(currentSyncGroupId)
+			&& playerName.equalsIgnoreCase(currentSyncPlayerName)
+			&& syncExecutor != null && !syncExecutor.isShutdown()
+			&& relaySyncService != null)
+		{
+			LendingGroup sameGroup = groups.get(groupId);
+			// Real reconnect only if sync was fully torn down (e.g. the Cloud Sync
+			// toggle was flipped off and back on without a group change).
+			boolean wasDisconnected = !relaySyncService.isConnected();
+			relaySyncService.connect();
+			relaySyncService.joinRoom(groupId, playerName,
+				sameGroup != null ? sameGroup.getSyncSecret() : null);
+			// Resuming from a dead connection means we may have missed peers'
+			// changes — pull the stored snapshot once. (Skipped when connected,
+			// so a world hop doesn't hit the relay's REST endpoint every time;
+			// a duplicate fetch from the login double-call is idempotent.)
+			if (wasDisconnected)
+			{
+				scheduleCatchUpFetch(groupId, 0, 0);
+			}
+			return;
+		}
+
 		stopSync();
 
 		this.currentSyncGroupId = groupId;
@@ -1141,11 +1228,42 @@ public class GroupService
 			String syncSecret = group != null ? group.getSyncSecret() : null;
 			relaySyncService.joinRoom(groupId, playerName, syncSecret);
 
-			// Pull the authoritative catch-up snapshot once, off the caller's thread
-			// (blocking REST call that can ride out a relay cold-start). This replaces
-			// the old ws join-catch-up push and reflects deletions made while offline.
-			final String fetchGroupId = groupId;
-			syncExecutor.execute(() -> relaySyncService.fetchStateSnapshot(fetchGroupId));
+			// Pull the authoritative catch-up snapshot off the caller's thread
+			// (blocking REST call). Retries with backoff so a Render cold-start
+			// (30-60s wake) or a transient failure doesn't mean "no catch-up until
+			// relog" — offline deletions/returns would otherwise never arrive.
+			scheduleCatchUpFetch(groupId, 0, 0);
+		}
+	}
+
+	// Catch-up retry backoff: immediate, then 10s/20s/40s/80s/160s — spans ~5min,
+	// enough to ride out a Render free-tier cold start.
+	private static final long[] CATCH_UP_RETRY_DELAYS_MS = { 0, 10_000, 20_000, 40_000, 80_000, 160_000 };
+
+	private void scheduleCatchUpFetch(String groupId, int attempt, long delayMs)
+	{
+		ScheduledExecutorService exec = syncExecutor;
+		if (exec == null || exec.isShutdown()) return;
+		try
+		{
+			exec.schedule(() ->
+			{
+				// The sync target may have changed while we waited (group switch).
+				if (!groupId.equals(currentSyncGroupId)) return;
+				boolean done = relaySyncService.fetchStateSnapshot(groupId);
+				if (!done && attempt + 1 < CATCH_UP_RETRY_DELAYS_MS.length)
+				{
+					scheduleCatchUpFetch(groupId, attempt + 1, CATCH_UP_RETRY_DELAYS_MS[attempt + 1]);
+				}
+				else if (!done)
+				{
+					log.warn("Catch-up fetch for group {} failed after {} attempts", groupId, attempt + 1);
+				}
+			}, delayMs, TimeUnit.MILLISECONDS);
+		}
+		catch (java.util.concurrent.RejectedExecutionException ignored)
+		{
+			// stopSync shut the executor down — nothing to catch up on anymore.
 		}
 	}
 
@@ -1356,6 +1474,15 @@ public class GroupService
 			if (remoteGroup == null || remoteGroup.getId() == null) return;
 
 			String groupId = remoteGroup.getId();
+
+			// An authoritative catch-up (null publisher) must only ever apply to the
+			// group we're currently syncing — a fetch that was in flight when the
+			// user switched or left a group must not write that group's data back.
+			// (Live broadcasts are already scoped: the ws socket is per-room.)
+			if (publisher == null && !groupId.equals(currentSyncGroupId))
+			{
+				return;
+			}
 
 			// Union-merge the roster: add members present remotely but not locally,
 			// and adopt role/permission changes when the remote roster is newer.
@@ -1604,6 +1731,14 @@ public class GroupService
 					boolean needsSave = false;
 					for (LendingGroup g : list)
 					{
+						// A malformed saved group (e.g. null id) must not abort the whole
+						// loop — groups.clear() already ran, so bailing here would make
+						// every OTHER group vanish from the UI until a config repair.
+						if (g == null || g.getId() == null)
+						{
+							log.warn("Skipping malformed saved group (missing id)");
+							continue;
+						}
 						// ADDED: Ensure existing groups have a sync secret (backwards compat)
 						if (g.getSyncSecret() == null || g.getSyncSecret().isEmpty())
 						{

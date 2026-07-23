@@ -424,6 +424,9 @@ public class LendingTrackerPlugin extends Plugin
 		{
 			if (client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null) { return false; }
 			String playerName = client.getLocalPlayer().getName();
+			// Keep the cached world fresh here too — this path also re-sends the
+			// presence join (via startSync's same-target fast path).
+			lastKnownWorld = client.getWorld();
 			triggerLoginFlow(playerName);
 			return true;
 		});

@@ -290,8 +290,11 @@ public class RosterPanel extends JPanel
 				}
 			}
 
-			// Check friends list for online status (includes world number)
-			Friend[] friends = plugin.getClient().getFriendContainer().getMembers();
+			// Check friends list for online status (includes world number).
+			// Container can be null early in login — an NPE here would abort the
+			// whole method and lose the self-row and presence merge below.
+			var friendContainer = plugin.getClient().getFriendContainer();
+			Friend[] friends = friendContainer != null ? friendContainer.getMembers() : null;
 			if (friends != null)
 			{
 				for (Friend f : friends)

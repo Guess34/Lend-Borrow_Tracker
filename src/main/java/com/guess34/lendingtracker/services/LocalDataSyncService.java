@@ -116,7 +116,9 @@ public class LocalDataSyncService {
      * Load and sync data from previous sessions
      */
     private void loadSyncData() {
-        if (!Files.exists(syncDataFile)) {
+        // syncDataFile stays null if initialize() failed — Files.exists(null)
+        // would NPE outside the try below and abort the caller's login flow.
+        if (syncDataFile == null || !Files.exists(syncDataFile)) {
 
             return;
         }
@@ -128,14 +130,17 @@ public class LocalDataSyncService {
             if (syncData != null) {
                 // Sync group data - merge with existing groups
                 syncGroups(syncData.groups);
-                
+
                 // Sync lending entries - merge new entries and update existing ones
                 syncLendingEntries(syncData);
-                
+
 
             }
-            
-        } catch (IOException e) {
+
+        } catch (Exception e) {
+            // Catch everything, not just IO: a malformed backup must degrade to
+            // "no restore" — an escaping exception here would abort the rest of
+            // the caller's login flow (sync never starts until relog).
             log.error("Failed to load sync data", e);
         }
     }
@@ -147,24 +152,15 @@ public class LocalDataSyncService {
         if (syncedGroups == null) return;
         
         for (LendingGroup syncedGroup : syncedGroups) {
+            if (syncedGroup == null || syncedGroup.getId() == null) continue;
             LendingGroup existingGroup = groupService.getGroup(syncedGroup.getId());
-            
+
             if (existingGroup == null) {
-                // FIXED: New group - recreate it using createGroup (was in wrong branch)
-                String ownerName = syncedGroup.getMembers().stream()
-                    .filter(m -> "owner".equalsIgnoreCase(m.getRole()))
-                    .map(GroupMember::getName)
-                    .findFirst()
-                    .orElse("Unknown");
-                String groupId = groupService.createGroup(syncedGroup.getName(), syncedGroup.getDescription(), ownerName);
-                // Add remaining members to the new group
-                if (syncedGroup.getMembers() != null) {
-                    for (var member : syncedGroup.getMembers()) {
-                        if (!"owner".equalsIgnoreCase(member.getRole())) {
-                            groupService.addMember(groupId, member.getName(), member.getRole());
-                        }
-                    }
-                }
+                // Restore the group AS-IS, keeping its original id/secret/roster.
+                // (Recreating via createGroup minted a new id — forking the group
+                // from its sync room and orphaning its per-group data — and could
+                // NPE on a name collision, aborting the rest of the login flow.)
+                groupService.restoreGroupFromBackup(syncedGroup);
             } else {
                 // Existing group - check for new members
                 syncGroupMembers(existingGroup, syncedGroup);
@@ -177,22 +173,25 @@ public class LocalDataSyncService {
      */
     private void syncGroupMembers(LendingGroup existing, LendingGroup synced) {
         if (synced.getMembers() == null) return;
-        
+
         Set<String> existingMemberNames = new HashSet<>();
         if (existing.getMembers() != null) {
-            existing.getMembers().forEach(member -> existingMemberNames.add(member.getName()));
+            existing.getMembers().forEach(member -> existingMemberNames.add(member.getName().toLowerCase()));
         }
-        
-        boolean membersAdded = false;
-        for (var syncedMember : synced.getMembers()) {
-            if (!existingMemberNames.contains(syncedMember.getName())) {
-                groupService.addMember(existing.getId(), syncedMember.getName(), syncedMember.getRole());
-                membersAdded = true;
 
+        for (var syncedMember : synced.getMembers()) {
+            if (syncedMember.getName() == null) continue;
+            if (!existingMemberNames.contains(syncedMember.getName().toLowerCase())) {
+                // Restore via the backup-aware path: it keeps the member's original
+                // joinedAt and respects kick tombstones, so a stale backup can't
+                // resurrect someone who was kicked while this user was offline.
+                // (addMember here minted a FRESH joinedAt and cleared the tombstone,
+                // which un-kicked them for the entire group.)
+                groupService.restoreMemberFromBackup(existing.getId(), syncedMember);
             }
         }
-        
-        // saveGroup is not needed as addMember already saves
+
+        // saveGroup is not needed as restoreMemberFromBackup already saves
     }
     
     /**

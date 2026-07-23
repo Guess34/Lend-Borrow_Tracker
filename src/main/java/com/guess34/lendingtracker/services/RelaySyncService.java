@@ -122,10 +122,14 @@ public class RelaySyncService
 
 		synchronized (connLock)
 		{
-			// If already connected, don't reconnect
-			if (connected && webSocket != null)
+			// A non-null socket means connected OR a handshake already in flight
+			// (onClosing/onFailure/disconnect all null the field under this lock).
+			// Skipping the in-flight case matters: at login two triggers call
+			// startSync back-to-back, and connecting again during the first
+			// attempt's handshake would orphan a socket and churn the relay.
+			if (webSocket != null)
 			{
-				log.debug("Relay already connected, skipping connect");
+				log.debug("Relay already connected/connecting, skipping connect");
 				return;
 			}
 
@@ -181,9 +185,12 @@ public class RelaySyncService
 			// Null the field so any in-flight/stale callback sees ws != webSocket.
 			ws = webSocket;
 			webSocket = null;
-			// Clear the room so a socket that somehow (re)opens can't rejoin the
-			// group we just left.
+			// Clear the room AND its secret so a socket that somehow (re)opens can't
+			// rejoin the group we just left, and a late response for the old group
+			// (e.g. an in-flight catch-up fetch) fails signature verification instead
+			// of being applied after we've moved on.
 			currentGroupId = null;
+			currentSyncSecret = null;
 
 			pendingReconnect = null; // shutdownNow below cancels the task itself
 
@@ -223,13 +230,20 @@ public class RelaySyncService
 	{
 		if (config == null || !config.enableRelaySync()) return;
 
-		this.currentGroupId = groupId;
-		this.currentPlayerName = playerName;
-		this.currentSyncSecret = syncSecret;
-
-		if (connected && webSocket != null)
+		// Under connLock so this serializes with onOpen: without it, joinRoom could
+		// set the room just after onOpen read a null room, while onOpen flips
+		// connected just after we read false — neither side sends the join and the
+		// socket sits connected but never in the room (no presence in or out).
+		synchronized (connLock)
 		{
-			sendJoinMessage(groupId, playerName);
+			this.currentGroupId = groupId;
+			this.currentPlayerName = playerName;
+			this.currentSyncSecret = syncSecret;
+
+			if (connected && webSocket != null)
+			{
+				sendJoinMessage(groupId, playerName);
+			}
 		}
 	}
 
@@ -270,22 +284,24 @@ public class RelaySyncService
 	{
 		if (config == null || !config.enableRelaySync()) return;
 
-		// Cache the volatile field: onClosing/onFailure can null it from the ws
-		// thread between our check and the send (a send on a dying socket is a
-		// harmless no-op; an NPE here would propagate to the caller's thread).
-		WebSocket ws = webSocket;
-		if (connected && ws != null && groupId != null)
+		// Under connLock like joinRoom: an unlocked leave could race onOpen's
+		// rejoin and re-enter the room being left. ws.send is a non-blocking
+		// enqueue, safe under the lock.
+		synchronized (connLock)
 		{
-			JsonObject msg = new JsonObject();
-			msg.addProperty("type", "leave");
-			msg.addProperty("groupId", groupId);
-			ws.send(gson.toJson(msg));
-		}
+			if (connected && webSocket != null && groupId != null)
+			{
+				JsonObject msg = new JsonObject();
+				msg.addProperty("type", "leave");
+				msg.addProperty("groupId", groupId);
+				webSocket.send(gson.toJson(msg));
+			}
 
-		if (groupId != null && groupId.equals(currentGroupId))
-		{
-			currentGroupId = null;
-			currentSyncSecret = null;
+			if (groupId != null && groupId.equals(currentGroupId))
+			{
+				currentGroupId = null;
+				currentSyncSecret = null;
+			}
 		}
 	}
 
@@ -718,13 +734,18 @@ public class RelaySyncService
 	 * state handler with a null publisher (authoritative full-state catch-up).
 	 * This is a request the client initiates to the configured relay, so the
 	 * response is trusted without a per-message signature. Blocking — run off the EDT.
+	 *
+	 * @return true when the fetch completed (snapshot applied, or the relay
+	 *         definitively has no/invalid state for this group — nothing to retry);
+	 *         false on a transport failure (timeout, cold-start, non-2xx) that the
+	 *         caller should retry with backoff.
 	 */
-	public void fetchStateSnapshot(String groupId)
+	public boolean fetchStateSnapshot(String groupId)
 	{
-		if (config == null || !config.enableRelaySync() || groupId == null) return;
+		if (config == null || !config.enableRelaySync() || groupId == null) return true;
 
 		String baseUrl = getRestBaseUrl();
-		if (baseUrl == null) return;
+		if (baseUrl == null) return true;
 
 		Request request = new Request.Builder()
 			.url(baseUrl + "/api/state/" + groupId)
@@ -733,12 +754,18 @@ public class RelaySyncService
 
 		try (Response response = getRestClient().newCall(request).execute())
 		{
+			if (response.code() == 404)
+			{
+				// Relay answered: it has no stored state for this group (new group,
+				// or storage wiped). Nothing to catch up on — don't retry.
+				return true;
+			}
 			if (!response.isSuccessful() || response.body() == null)
 			{
-				return;
+				return false;
 			}
 			JsonObject json = gson.fromJson(response.body().string(), JsonObject.class);
-			if (json == null) return;
+			if (json == null) return true;
 
 			// Verify the stored snapshot was signed by a member holding the group
 			// secret. The relay stores whatever it's sent (and anyone who knows the
@@ -755,8 +782,10 @@ public class RelaySyncService
 			copyIfPresent(json, stateMsg, "signature");
 			if (!verifyStateSignature(stateMsg))
 			{
+				// A snapshot the relay HAS but we can't verify won't get better on
+				// retry (e.g. stored by an old client before signing was rolled out).
 				log.warn("Dropping catch-up state for group {}: invalid or missing signature", groupId);
-				return;
+				return true;
 			}
 
 			String groupJson = json.has("groupJson") && !json.get("groupJson").isJsonNull()
@@ -766,11 +795,22 @@ public class RelaySyncService
 			if (groupJson != null && onStateReceived != null)
 			{
 				onStateReceived.accept(groupJson, dataJson, null);
+
+				// The catch-up snapshot can be marginally older than a live state we
+				// already applied (it was read from the store before that push), and
+				// applying it can briefly revert a peer's rows. Drop the per-publisher
+				// content hashes so the peer's next identical heartbeat/announce is
+				// NOT deduped and re-applies their newer state — otherwise the revert
+				// would stick until their content actually changed.
+				String prefix = groupId + ":";
+				lastStateHash.keySet().removeIf(k -> k.startsWith(prefix));
 			}
+			return true;
 		}
 		catch (Exception e)
 		{
 			log.warn("Failed to fetch catch-up state from relay: {}", e.getMessage());
+			return false;
 		}
 	}
 

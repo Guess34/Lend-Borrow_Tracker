@@ -213,7 +213,7 @@ public interface LendingTrackerConfig extends Config
 		keyName = "enableRelaySync",
 		name = "Enable Cloud Sync",
 		description = "Sync group data between members on different computers via relay server",
-		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers.",
+		warning = "This feature submits your IP address, player name, current world, and online status to a 3rd-party server not controlled or verified by RuneLite developers. Group members can see when you are online and what world you are on.",
 		position = 0,
 		section = syncSection
 	)
