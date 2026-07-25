@@ -1001,6 +1001,18 @@ public class TradeLoanTracker
 			return false;
 		}
 
+		// Fungible duplicates: if the bank + what you'd still hold after this
+		// trade covers everything you owe of this item, you're trading your OWN
+		// spare — no warning needed.
+		if (tradeAwayCovered(baseId))
+		{
+			if (warnedBaseIds.add(baseId))
+			{
+				addGameMessage(itemName(itemId) + " matches a borrowed item, but your remaining copies still cover what you owe — trading your spare is fine.");
+			}
+			return false;
+		}
+
 		if (config.tradeGuard() == GuardMode.BLOCK && !client.isKeyPressed(KeyCode.KC_SHIFT))
 		{
 			event.consume();
@@ -1041,6 +1053,11 @@ public class TradeLoanTracker
 			{
 				// Returning to the lender is fine — don't block the Accept
 				if (partner != null && partner.equalsIgnoreCase(borrowed.getLender()))
+				{
+					continue;
+				}
+				// Trading a covered spare of your own is fine too
+				if (tradeAwayCovered(ItemVariationMapping.map(item.getId())))
 				{
 					continue;
 				}
@@ -1108,12 +1125,14 @@ public class TradeLoanTracker
 		}
 
 		Map<Integer, Integer> carried = carriedQuantitiesByBase();
+		Map<Integer, Integer> owedByBase = totalOwedByBase();
 
 		List<LendingEntry> result = new ArrayList<>();
 		for (LendingEntry e : dataService.getActiveEntries())
 		{
 			if (!e.isReturned() && me.equalsIgnoreCase(e.getBorrower())
-				&& atRiskCarrying(carried, ItemVariationMapping.map(e.getItemId()), e.outstandingLentQty()))
+				&& e.outstandingLentQty() > 0
+				&& atRiskCarrying(carried, owedByBase, ItemVariationMapping.map(e.getItemId())))
 			{
 				result.add(e);
 			}
@@ -1124,16 +1143,16 @@ public class TradeLoanTracker
 	/**
 	 * Items are fungible: what matters is never WHICH copy you hold, only that
 	 * you can still cover what you owe. Carrying a base item is AT RISK only when
-	 * losing the carried copies would drop your total (carried + banked) below
-	 * the quantity owed — so someone who owns a duplicate of a collateral or
-	 * borrowed item can freely carry/trade their own copy while the covering one
-	 * sits in the bank. Bank contents are only known after the bank has been
-	 * opened this session; until then banked counts as 0 (the cautious old
-	 * behavior).
+	 * the bank no longer covers the TOTAL owed of that base across ALL open
+	 * obligations — so someone with a spare in the bank can freely carry their
+	 * own copy, but one banked spare can never vouch for two debts at once.
+	 * Bank contents are only known after the bank has been opened this session;
+	 * until then banked counts as 0 (the cautious old behavior).
 	 */
-	private boolean atRiskCarrying(Map<Integer, Integer> carried, int baseId, int qtyOwed)
+	private boolean atRiskCarrying(Map<Integer, Integer> carried, Map<Integer, Integer> owedByBase, int baseId)
 	{
-		if (qtyOwed <= 0)
+		int owed = owedByBase.getOrDefault(baseId, 0);
+		if (owed <= 0)
 		{
 			return false;
 		}
@@ -1143,7 +1162,64 @@ public class TradeLoanTracker
 			return false;
 		}
 		int banked = bankKnown ? bankQtyByBase.getOrDefault(baseId, 0) : 0;
-		return banked < qtyOwed;
+		return banked < owed;
+	}
+
+	/**
+	 * TOTAL quantity owed per variation-base id across ALL my open obligations:
+	 * items I borrowed (owed back to their lenders) plus collateral I hold (owed
+	 * back to borrowers). Aggregated so coverage checks can't double-count one
+	 * banked spare against several debts of the same item.
+	 */
+	private Map<Integer, Integer> totalOwedByBase()
+	{
+		Map<Integer, Integer> owed = new HashMap<>();
+		String me = localPlayerName();
+		if (me == null)
+		{
+			return owed;
+		}
+		for (LendingEntry e : dataService.getActiveEntries())
+		{
+			if (me.equalsIgnoreCase(e.getBorrower()))
+			{
+				int q = e.outstandingLentQty();
+				if (q > 0)
+				{
+					owed.merge(ItemVariationMapping.map(e.getItemId()), q, Integer::sum);
+				}
+			}
+			if (me.equalsIgnoreCase(e.getLender()))
+			{
+				for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
+				{
+					owed.merge(ItemVariationMapping.map(pair[0]), pair[1], Integer::sum);
+				}
+			}
+		}
+		return owed;
+	}
+
+	/**
+	 * May I trade a copy of this base item AWAY (to a non-lender) without going
+	 * below what I owe? True when the bank plus what I'd still be carrying after
+	 * the trade covers the total debt of that base. Offered items have already
+	 * left the inventory container, so carried here is the post-trade remainder.
+	 */
+	private boolean tradeAwayCovered(int baseId)
+	{
+		if (!bankKnown)
+		{
+			return false;
+		}
+		int owed = totalOwedByBase().getOrDefault(baseId, 0);
+		if (owed <= 0)
+		{
+			return true;
+		}
+		int banked = bankQtyByBase.getOrDefault(baseId, 0);
+		int carried = carriedQuantitiesByBase().getOrDefault(baseId, 0);
+		return banked + carried >= owed;
 	}
 
 	/** Carried (inventory + worn) quantities per variation-base id. */
@@ -1169,6 +1245,7 @@ public class TradeLoanTracker
 		}
 
 		Map<Integer, Integer> carried = carriedQuantitiesByBase();
+		Map<Integer, Integer> owedByBase = totalOwedByBase();
 
 		List<LendingEntry> result = new ArrayList<>();
 		for (LendingEntry e : dataService.getActiveEntries())
@@ -1179,7 +1256,7 @@ public class TradeLoanTracker
 			}
 			for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
 			{
-				if (atRiskCarrying(carried, ItemVariationMapping.map(pair[0]), pair[1]))
+				if (atRiskCarrying(carried, owedByBase, ItemVariationMapping.map(pair[0])))
 				{
 					result.add(e);
 					break;
@@ -1187,21 +1264,6 @@ public class TradeLoanTracker
 			}
 		}
 		return result;
-	}
-
-	/**
-	 * Parse the OUTSTANDING collateral ("itemId:qty,itemId:qty") into item ids.
-	 * Uses the running tally, so collateral already handed back partway through a
-	 * loan stops being guarded/highlighted the moment it goes home.
-	 */
-	private static List<Integer> parseCollateralItemIds(LendingEntry e)
-	{
-		List<Integer> ids = new ArrayList<>();
-		for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
-		{
-			ids.add(pair[0]);
-		}
-		return ids;
 	}
 
 	/** Parse an "itemId:qty,itemId:qty" string into [id, qty] pairs (qty >= 1). */
@@ -2250,21 +2312,6 @@ public class TradeLoanTracker
 		}
 	}
 
-	private void collectBaseIds(Set<Integer> into, int containerId)
-	{
-		ItemContainer container = client.getItemContainer(containerId);
-		if (container == null)
-		{
-			return;
-		}
-		for (Item item : container.getItems())
-		{
-			if (item != null && item.getId() > 0)
-			{
-				into.add(ItemVariationMapping.map(item.getId()));
-			}
-		}
-	}
 
 	private String itemName(int itemId)
 	{
