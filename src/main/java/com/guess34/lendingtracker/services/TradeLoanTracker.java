@@ -114,9 +114,21 @@ public class TradeLoanTracker
 	// The "Loan" toggle button drawn on the trade window (group trades only).
 	// When ON, EVERYTHING handed over in this trade is recorded as a loan — one
 	// tap, no popup or right-click; the partner doesn't need the plugin at all.
+	// The button cycles OFF -> LIST -> 1-TIME: LIST relists the item on the group
+	// marketplace when it comes home, 1-TIME records the loan but never lists it
+	// (a friend borrowing your axe once shouldn't become a standing offer).
 	private boolean autoLoanAll;
+	private boolean loanOneTime;
 	private Widget loanButton;
 	private Widget loanButtonBg;
+	// The "Collat" toggle button, drawn under the Loan button. Pressed by the
+	// BORROWER side of a trade: everything I hand over is my collateral deposit
+	// for a borrow — never a lend — so none of my items may be recorded as loans
+	// or trip the marketplace popup. The loan itself is recorded by the lender's
+	// client (single writer), exactly like every other loan.
+	private boolean collatMode;
+	private Widget collatButton;
+	private Widget collatButtonBg;
 	// Trades that completed before their popup was answered, keyed by session id;
 	// a late "yes" records from here. Cleared on logout/shutdown so a stale stash
 	// can never record loans under a different account's session.
@@ -249,7 +261,7 @@ public class TradeLoanTracker
 	/** Does the current screen-1 state look like a loan/return in progress? */
 	private boolean firstScreenRelevant()
 	{
-		if (autoLoanAll || !markedItemIds.isEmpty())
+		if (autoLoanAll || collatMode || !markedItemIds.isEmpty())
 		{
 			return true;
 		}
@@ -287,7 +299,7 @@ public class TradeLoanTracker
 	/** Will this trade plausibly produce a loan or return worth screenshotting? */
 	private boolean screenshotRelevant()
 	{
-		if (!markedItemIds.isEmpty() || !findReturnedLoans().isEmpty())
+		if (!markedItemIds.isEmpty() || collatMode || hasOpenLoanWithPartner())
 		{
 			return true;
 		}
@@ -314,8 +326,9 @@ public class TradeLoanTracker
 	 */
 	public void onMyOfferChanged(Item[] offerItems)
 	{
-		// No popup needed when the Loan button already covers the whole trade
-		if (!tradeOpen || autoLoanAll || loanPromptShown || promptOpen || offerItems == null
+		// No popup needed when the Loan button already covers the whole trade, and
+		// never in Collat mode — those items are a deposit, not a lend.
+		if (!tradeOpen || autoLoanAll || collatMode || loanPromptShown || promptOpen || offerItems == null
 			|| !config.promptListedLoans())
 		{
 			return;
@@ -330,10 +343,16 @@ public class TradeLoanTracker
 			return;
 		}
 
+		// Items I owe back to THIS partner (I'm their borrower) are returns, not
+		// new lends — a return trade must never trip the loan popup. This is the
+		// role fix for "traded back and it asked/recorded like I was lending".
+		Set<Integer> owedBases = baseIdsIOweTo(partner);
+
 		List<String> listedNames = new ArrayList<>();
 		for (Item item : offerItems)
 		{
-			if (item != null && item.getId() > 0 && isListedForLending(item.getId()))
+			if (item != null && item.getId() > 0 && isListedForLending(item.getId())
+				&& !owedBases.contains(ItemVariationMapping.map(item.getId())))
 			{
 				listedNames.add(itemName(item.getId()));
 			}
@@ -398,13 +417,18 @@ public class TradeLoanTracker
 			return;
 		}
 
-		// Still have a live button attached to the interface? Keep it.
-		if (loanButton != null && loanButton.getParent() != null)
+		// Still have live buttons attached to the interface? Keep them. (A null
+		// collatButton with a live loanButton means it was deliberately skipped
+		// for lack of room — don't loop trying to recreate it.)
+		if (loanButton != null && loanButton.getParent() != null
+			&& (collatButton == null || collatButton.getParent() != null))
 		{
 			return;
 		}
 		loanButton = null;
 		loanButtonBg = null;
+		collatButton = null;
+		collatButtonBg = null;
 
 		// Prefer the middle column layer (holds Accept/Decline); fall back outward
 		Widget parent = firstNonNull(
@@ -421,9 +445,32 @@ public class TradeLoanTracker
 		int width = Math.max(90, Math.min(pw > 0 ? pw - 4 : 120, 120));
 		int height = 16;
 		int x = Math.max(0, (pw - width) / 2);
-		int y = Math.max(2, ph - height - 4);
+		// Loan button at the bottom, Collat stacked directly above it — each side
+		// of the trade taps the one matching their role.
+		int loanY = Math.max(2, ph - height - 4);
+		int collatY = Math.max(2, loanY - height - 2);
 
-		// Filled background rectangle so it clearly reads as a button
+		Widget[] loan = createTradeButton(parent, x, loanY, width, height,
+			loanButtonText(), loanButtonColor(), this::toggleLoanMode);
+		loanButtonBg = loan[0];
+		loanButton = loan[1];
+
+		// Only add the Collat button when there's genuinely room above the Loan
+		// button — in a too-short fallback layer the two would overlap (or cover
+		// Accept/Decline), which is worse than the borrower using the popup flow.
+		if (collatY + height + 2 <= loanY)
+		{
+			Widget[] collat = createTradeButton(parent, x, collatY, width, height,
+				collatButtonText(collatMode), collatMode ? 0x00ff00 : 0xffff00, this::toggleCollatMode);
+			collatButtonBg = collat[0];
+			collatButton = collat[1];
+		}
+	}
+
+	/** Build one background+text pseudo-button pair on the trade interface. */
+	private Widget[] createTradeButton(Widget parent, int x, int y, int width, int height,
+		String text, int color, Runnable onClick)
+	{
 		Widget bg = parent.createChild(-1, WidgetType.RECTANGLE);
 		bg.setOriginalX(x);
 		bg.setOriginalY(y);
@@ -434,12 +481,12 @@ public class TradeLoanTracker
 		bg.setOpacity(70);
 		bg.setAction(0, "Toggle");
 		bg.setHasListener(true);
-		bg.setOnOpListener((JavaScriptCallback) ev -> toggleLoanMode());
+		bg.setOnOpListener((JavaScriptCallback) ev -> onClick.run());
 		bg.revalidate();
 
 		Widget btn = parent.createChild(-1, WidgetType.TEXT);
-		btn.setText(loanButtonText(false));
-		btn.setTextColor(0xffff00);
+		btn.setText(text);
+		btn.setTextColor(color);
 		btn.setFontId(FontID.BOLD_12);
 		btn.setTextShadowed(true);
 		btn.setXTextAlignment(1);
@@ -450,11 +497,10 @@ public class TradeLoanTracker
 		btn.setOriginalHeight(height);
 		btn.setAction(0, "Toggle");
 		btn.setHasListener(true);
-		btn.setOnOpListener((JavaScriptCallback) ev -> toggleLoanMode());
+		btn.setOnOpListener((JavaScriptCallback) ev -> onClick.run());
 		btn.revalidate();
 
-		loanButtonBg = bg;
-		loanButton = btn;
+		return new Widget[] { bg, btn };
 	}
 
 	private static Widget firstNonNull(Widget... widgets)
@@ -477,24 +523,109 @@ public class TradeLoanTracker
 		{
 			return;
 		}
-		autoLoanAll = !autoLoanAll;
-		if (loanButton != null)
+		// Cycle OFF -> LIST -> 1-TIME -> OFF, so the lender picks per loan whether
+		// the item goes (back) on the marketplace when it's returned.
+		if (!autoLoanAll)
 		{
-			loanButton.setText(loanButtonText(autoLoanAll));
-			loanButton.setTextColor(autoLoanAll ? 0x00ff00 : 0xffff00);
+			autoLoanAll = true;
+			loanOneTime = false;
 		}
-		addGameMessage(autoLoanAll
-			? "Loan mode ON — everything you hand over in this trade will be recorded as a loan to " + partner + "."
-			: "Loan mode off for this trade.");
+		else if (!loanOneTime)
+		{
+			loanOneTime = true;
+		}
+		else
+		{
+			autoLoanAll = false;
+			loanOneTime = false;
+		}
+		// You're either the lender or the borrower in a trade — not both
+		if (autoLoanAll && collatMode)
+		{
+			collatMode = false;
+			refreshCollatButton();
+			addGameMessage("Collat mode off — you're lending in this trade.");
+		}
+		refreshLoanButton();
 		if (autoLoanAll)
+		{
+			addGameMessage(loanOneTime
+				? "One-time loan mode — everything you hand over is recorded as a loan to " + partner
+					+ ", and will NOT be listed on the marketplace when returned."
+				: "Loan mode ON — everything you hand over is recorded as a loan to " + partner
+					+ " and relists on the group marketplace when returned.");
+			maybeCacheFirstScreen();
+		}
+		else
+		{
+			addGameMessage("Loan mode off for this trade.");
+		}
+	}
+
+	private void toggleCollatMode()
+	{
+		if (!tradeOpen || partner == null)
+		{
+			return;
+		}
+		collatMode = !collatMode;
+		if (collatMode && autoLoanAll)
+		{
+			autoLoanAll = false;
+			loanOneTime = false;
+			refreshLoanButton();
+			addGameMessage("Loan mode off — you're borrowing in this trade.");
+		}
+		refreshCollatButton();
+		addGameMessage(collatMode
+			? "Collat mode ON — items you hand over in this trade are your collateral deposit for a borrow from "
+				+ partner + ", not a loan. They will never appear on your marketplace."
+			: "Collat mode off for this trade.");
+		if (collatMode)
 		{
 			maybeCacheFirstScreen();
 		}
 	}
 
-	private static String loanButtonText(boolean on)
+	private void refreshLoanButton()
 	{
-		return on ? "Loan: ON" : "Loan: OFF";
+		if (loanButton != null)
+		{
+			loanButton.setText(loanButtonText());
+			loanButton.setTextColor(loanButtonColor());
+		}
+	}
+
+	private void refreshCollatButton()
+	{
+		if (collatButton != null)
+		{
+			collatButton.setText(collatButtonText(collatMode));
+			collatButton.setTextColor(collatMode ? 0x00ff00 : 0xffff00);
+		}
+	}
+
+	private String loanButtonText()
+	{
+		if (!autoLoanAll)
+		{
+			return "Loan: OFF";
+		}
+		return loanOneTime ? "Loan: 1-TIME" : "Loan: LIST";
+	}
+
+	private int loanButtonColor()
+	{
+		if (!autoLoanAll)
+		{
+			return 0xffff00;
+		}
+		return loanOneTime ? 0xff9900 : 0x00ff00;
+	}
+
+	private static String collatButtonText(boolean on)
+	{
+		return on ? "Collat: ON" : "Collat: OFF";
 	}
 
 	/** Popup answered — during the trade if possible, after it via the stash. */
@@ -537,6 +668,13 @@ public class TradeLoanTracker
 	/** Is this item (or a variant of it) listed by me on the group marketplace? */
 	private boolean isListedForLending(int itemId)
 	{
+		// Raw GP can never be a lendable item, even when someone listed "Coins" on
+		// the marketplace — treating offered coins as a loan would double-count GP
+		// the return tally already consumed as collateral coming home.
+		if (itemId == ItemID.COINS_995 || itemId == ItemID.PLATINUM_TOKEN)
+		{
+			return false;
+		}
 		String me = localPlayerName();
 		LendingGroup group = groupService.getActiveGroup();
 		if (me == null || group == null)
@@ -660,8 +798,12 @@ public class TradeLoanTracker
 		loanPromptShown = false;
 		autoLoanAccepted = null;
 		autoLoanAll = false;
-		loanButton = null; // the widget dies with the trade interface
+		loanOneTime = false;
+		collatMode = false;
+		loanButton = null; // the widgets die with the trade interface
 		loanButtonBg = null;
+		collatButton = null;
+		collatButtonBg = null;
 		// pendingDecisions deliberately survives reset() — it's how a popup answered
 		// after its trade ended still records the loans. It IS cleared on logout and
 		// shutdown via clearPendingDecisions().
@@ -988,27 +1130,62 @@ public class TradeLoanTracker
 		return result;
 	}
 
-	/** Parse the "itemId:qty,itemId:qty" collateral field into item ids. */
+	/**
+	 * Parse the OUTSTANDING collateral ("itemId:qty,itemId:qty") into item ids.
+	 * Uses the running tally, so collateral already handed back partway through a
+	 * loan stops being guarded/highlighted the moment it goes home.
+	 */
 	private static List<Integer> parseCollateralItemIds(LendingEntry e)
 	{
 		List<Integer> ids = new ArrayList<>();
-		String raw = e.getCollateralItemIds();
+		for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
+		{
+			ids.add(pair[0]);
+		}
+		return ids;
+	}
+
+	/** Parse an "itemId:qty,itemId:qty" string into [id, qty] pairs (qty >= 1). */
+	private static List<int[]> parseIdQtyPairs(String raw)
+	{
+		List<int[]> pairs = new ArrayList<>();
 		if (raw == null || raw.isEmpty())
 		{
-			return ids;
+			return pairs;
 		}
 		for (String pair : raw.split(","))
 		{
 			try
 			{
 				int idx = pair.indexOf(':');
-				ids.add(Integer.parseInt(idx > 0 ? pair.substring(0, idx) : pair));
+				int id = Integer.parseInt(idx > 0 ? pair.substring(0, idx) : pair);
+				int qty = idx > 0 ? Integer.parseInt(pair.substring(idx + 1)) : 1;
+				pairs.add(new int[] { id, Math.max(1, qty) });
 			}
 			catch (NumberFormatException ignored)
 			{
 			}
 		}
-		return ids;
+		return pairs;
+	}
+
+	/** Join [id, qty] pairs back into the "itemId:qty,..." wire format. */
+	private static String joinIdQtyPairs(List<int[]> pairs)
+	{
+		StringBuilder sb = new StringBuilder();
+		for (int[] p : pairs)
+		{
+			if (p[1] <= 0)
+			{
+				continue;
+			}
+			if (sb.length() > 0)
+			{
+				sb.append(',');
+			}
+			sb.append(p[0]).append(':').append(p[1]);
+		}
+		return sb.toString();
 	}
 
 	// --- Trade completion ---
@@ -1030,17 +1207,26 @@ public class TradeLoanTracker
 				return;
 			}
 
-			List<LendingEntry> returned = findReturnedLoans();
+			// Match this trade against open loans FIRST (running tally, both sides):
+			// what came home is a return, and returns are excluded from everything
+			// below so they can never be re-recorded as new lends or collateral.
+			ReturnTally tally = applyReturnTallies();
 
 			// Loans = everything I offered (Loan button ON) ∪ explicitly marked
 			// items ∪ (listed items, if the popup was answered yes). An unanswered
 			// popup stashes the listed items so a late "yes" can still record them.
+			// Raw GP is NEVER a lendable item — coins/platinum in a loan trade are
+			// collateral (or its return, or payment); recording a "Coins loan" would
+			// double-count the same GP the tally just consumed.
 			Set<Integer> loanItemIds = new HashSet<>(markedItemIds);
+			loanItemIds.remove(ItemID.COINS_995);
+			loanItemIds.remove(ItemID.PLATINUM_TOKEN);
 			if (autoLoanAll && finalMyOffer != null)
 			{
 				for (Item item : finalMyOffer)
 				{
-					if (item != null && item.getId() > 0)
+					if (item != null && item.getId() > 0
+						&& item.getId() != ItemID.COINS_995 && item.getId() != ItemID.PLATINUM_TOKEN)
 					{
 						loanItemIds.add(item.getId());
 					}
@@ -1050,24 +1236,62 @@ public class TradeLoanTracker
 			{
 				loanItemIds.addAll(listedItemIdsInFinalOffer());
 			}
-			List<LendingEntry> newLoans = recordLoans(loanItemIds, !returned.isEmpty());
 
-			PendingLoanDecision stashedNow = null;
-			if (loanPromptShown && autoLoanAccepted == null)
+			// Collat mode: everything I handed over is my deposit for a borrow —
+			// nothing of mine may be recorded as a loan.
+			if (collatMode && !loanItemIds.isEmpty())
 			{
-				stashedNow = stashPendingDecision(loanItemIds, !returned.isEmpty());
+				loanItemIds.clear();
+			}
+			// Items I owe back to this partner are returns in progress, never new
+			// lends — the lender's client records the tally, mine just stays quiet.
+			if (!loanItemIds.isEmpty())
+			{
+				Set<Integer> owedBases = baseIdsIOweTo(partner);
+				if (!owedBases.isEmpty())
+				{
+					loanItemIds.removeIf(id -> owedBases.contains(ItemVariationMapping.map(id)));
+				}
 			}
 
-			for (LendingEntry e : returned)
+			List<LendingEntry> newLoans = recordLoans(loanItemIds, tally);
+
+			PendingLoanDecision stashedNow = null;
+			if (!collatMode && loanPromptShown && autoLoanAccepted == null)
+			{
+				stashedNow = stashPendingDecision(loanItemIds, tally);
+			}
+
+			for (LendingEntry e : tally.closed)
 			{
 				dataService.completeEntry(e.getId(), true);
 				relistReturnedItem(e);
-				addGameMessage("Return recorded: " + e.getItemName() + " from " + partner + ".");
+				addGameMessage("Return complete: " + e.getItemName() + " — loan with " + partner + " fully settled.");
+			}
+			for (LendingEntry e : tally.progressed)
+			{
+				dataService.updateEntryProgress(e);
+				addGameMessage("Return progress recorded — " + outstandingSummary(e) + ".");
 			}
 
-			notePartialReturns(returned);
+			if (collatMode)
+			{
+				addGameMessage("Collateral deposit noted — the loan record comes from " + partner + "'s client.");
+				// The DEPOSITOR deserves their own on-disk proof of what they handed
+				// over — the lender's screenshot is no help to the borrower in a
+				// dispute against that lender.
+				if (config.enableTradeScreenshots())
+				{
+					LendingEntry deposit = provisionalDepositEntry();
+					if (deposit != null)
+					{
+						proofScreenshot.commitCachedTrade(localPlayerName(), activeGroupName(), partner, "DEPOSIT", deposit);
+						screenshotCached = false;
+					}
+				}
+			}
 
-			if (!newLoans.isEmpty() || !returned.isEmpty())
+			if (!newLoans.isEmpty() || tally.any())
 			{
 				// commitCachedTrade prefers the frame cached on the confirm screen;
 				// if none was cached (e.g. the partner name resolved too late) it
@@ -1075,7 +1299,8 @@ public class TradeLoanTracker
 				// better than nothing
 				if (config.enableTradeScreenshots())
 				{
-					LendingEntry subject = !newLoans.isEmpty() ? newLoans.get(0) : returned.get(0);
+					LendingEntry subject = !newLoans.isEmpty() ? newLoans.get(0)
+						: !tally.closed.isEmpty() ? tally.closed.get(0) : tally.progressed.get(0);
 					String eventType = !newLoans.isEmpty() ? "LOAN" : "RETURN";
 					proofScreenshot.commitCachedTrade(localPlayerName(), activeGroupName(), partner, eventType, subject);
 				}
@@ -1105,7 +1330,7 @@ public class TradeLoanTracker
 			}
 			screenshotCached = false;
 
-			if ((!newLoans.isEmpty() || !returned.isEmpty()) && onLoanRecorded != null)
+			if ((!newLoans.isEmpty() || tally.any()) && onLoanRecorded != null)
 			{
 				onLoanRecorded.run();
 			}
@@ -1116,44 +1341,121 @@ public class TradeLoanTracker
 		}
 	}
 
-	/**
-	 * Active loans I lent to this partner that their final offer fully hands back.
-	 *
-	 * Quantity-aware: each loan consumes its quantity from what was offered, oldest
-	 * loan first, so one returned whip closes one whip loan (not every whip loan),
-	 * and a PARTIAL return (3 of 10 lent brews) closes nothing — the loan stays
-	 * open and the user is told to settle it manually.
-	 */
-	private List<LendingEntry> findReturnedLoans()
+	/** Outcome of matching one completed trade against the open loans with this partner. */
+	private static final class ReturnTally
 	{
-		List<LendingEntry> result = new ArrayList<>();
-		String me = localPlayerName();
-		if (me == null || partner == null || finalTheirOffer == null)
+		final List<LendingEntry> closed = new ArrayList<>();      // fully settled, both sides home
+		final List<LendingEntry> progressed = new ArrayList<>();  // partial — still open, tallies updated
+		// What this trade consumed as returns, per variation-base id — used to keep
+		// those quantities out of new-loan / collateral aggregation.
+		final Map<Integer, Integer> consumedTheirQtyByBase = new HashMap<>();
+		final Map<Integer, Integer> consumedMyQtyByBase = new HashMap<>();
+
+		boolean any()
 		{
-			return result;
+			return !closed.isEmpty() || !progressed.isEmpty();
+		}
+	}
+
+	/**
+	 * The running-tally return engine. A loan settles piece by piece, on BOTH
+	 * sides: the partner handing lent items back decrements what the borrower
+	 * owes, and ME handing their collateral back decrements what I owe. Each
+	 * completed trade consumes whatever matched (any quantity, oldest loan
+	 * first); a loan only closes when both sides reach zero — so a partial
+	 * return records progress but can never mark the loan complete, and a
+	 * "return" that keeps the collateral no longer counts as settled.
+	 *
+	 * Runs on the lender's client (the single writer for the loan's lifecycle,
+	 * same as loan recording) and syncs every change live to the group.
+	 */
+	private ReturnTally applyReturnTallies()
+	{
+		ReturnTally tally = new ReturnTally();
+		String me = localPlayerName();
+		if (me == null || partner == null)
+		{
+			return tally;
+		}
+		// Collat mode declares this whole trade a NEW borrow: my items are a fresh
+		// deposit and the partner's items are what I'm borrowing (recorded on their
+		// client). Explicit intent beats auto-matching — consuming either side as
+		// returns here would fight the partner's client's interpretation.
+		if (collatMode)
+		{
+			return tally;
 		}
 
-		// Quantity offered per variation-base id
-		Map<Integer, Integer> offeredByBase = new HashMap<>();
-		for (Item item : finalTheirOffer)
+		// Pools of what actually changed hands, per variation-base id
+		Map<Integer, Integer> theirByBase = new HashMap<>();
+		if (finalTheirOffer != null)
 		{
-			if (item != null && item.getId() > 0)
+			for (Item item : finalTheirOffer)
 			{
-				offeredByBase.merge(ItemVariationMapping.map(item.getId()), item.getQuantity(), Integer::sum);
+				if (item != null && item.getId() > 0)
+				{
+					theirByBase.merge(ItemVariationMapping.map(item.getId()), item.getQuantity(), Integer::sum);
+				}
 			}
 		}
-		if (offeredByBase.isEmpty())
+		Map<Integer, Integer> myByBase = new HashMap<>();
+		long myGp = 0;
+		if (finalMyOffer != null)
 		{
-			return result;
+			for (Item item : finalMyOffer)
+			{
+				if (item == null || item.getId() <= 0)
+				{
+					continue;
+				}
+				if (item.getId() == ItemID.COINS_995)
+				{
+					myGp += item.getQuantity();
+				}
+				else if (item.getId() == ItemID.PLATINUM_TOKEN)
+				{
+					myGp += item.getQuantity() * 1000L;
+				}
+				else
+				{
+					myByBase.merge(ItemVariationMapping.map(item.getId()), item.getQuantity(), Integer::sum);
+				}
+			}
+		}
+		if (theirByBase.isEmpty() && myByBase.isEmpty() && myGp == 0)
+		{
+			return tally;
+		}
+
+		// Reserve quantities I owe THIS partner as their borrower: those hand-overs
+		// settle MY debt on their client's records — the same physical item must
+		// not also be consumed here as a collateral return on a loan I lent
+		// (cross-loans with the same base item would let one item settle two
+		// obligations across the two clients).
+		for (LendingEntry e : dataService.getActiveEntries())
+		{
+			if (me.equalsIgnoreCase(e.getBorrower())
+				&& partner.equalsIgnoreCase(e.getLender()))
+			{
+				int owed = e.outstandingLentQty();
+				if (owed > 0)
+				{
+					int baseId = ItemVariationMapping.map(e.getItemId());
+					int pool = myByBase.getOrDefault(baseId, 0);
+					if (pool > 0)
+					{
+						myByBase.put(baseId, Math.max(0, pool - owed));
+					}
+				}
+			}
 		}
 
 		List<LendingEntry> candidates = new ArrayList<>();
 		for (LendingEntry e : dataService.getActiveEntries())
 		{
-			if (!e.isReturned()
+			if (!e.isFullySettled()
 				&& me.equalsIgnoreCase(e.getLender())
-				&& partner.equalsIgnoreCase(e.getBorrower())
-				&& offeredByBase.containsKey(ItemVariationMapping.map(e.getItemId())))
+				&& partner.equalsIgnoreCase(e.getBorrower()))
 			{
 				candidates.add(e);
 			}
@@ -1162,61 +1464,153 @@ public class TradeLoanTracker
 
 		for (LendingEntry e : candidates)
 		{
-			int baseId = ItemVariationMapping.map(e.getItemId());
-			int available = offeredByBase.getOrDefault(baseId, 0);
-			int needed = Math.max(1, e.getQuantity());
-			if (available >= needed)
+			boolean changed = false;
+
+			// Lent side: partner handing my item back
+			int outLent = e.outstandingLentQty();
+			if (outLent > 0)
 			{
-				offeredByBase.put(baseId, available - needed);
-				result.add(e);
+				int baseId = ItemVariationMapping.map(e.getItemId());
+				int available = theirByBase.getOrDefault(baseId, 0);
+				int take = Math.min(available, outLent);
+				if (take > 0)
+				{
+					theirByBase.put(baseId, available - take);
+					e.setLentOutstanding(outLent - take);
+					tally.consumedTheirQtyByBase.merge(baseId, take, Integer::sum);
+					changed = true;
+				}
+			}
+
+			// Collateral items side: me handing their deposit back
+			List<int[]> collatPairs = parseIdQtyPairs(e.outstandingCollateralIds());
+			if (!collatPairs.isEmpty())
+			{
+				boolean collatChanged = false;
+				for (int[] pair : collatPairs)
+				{
+					int baseId = ItemVariationMapping.map(pair[0]);
+					int available = myByBase.getOrDefault(baseId, 0);
+					int take = Math.min(available, pair[1]);
+					if (take > 0)
+					{
+						myByBase.put(baseId, available - take);
+						pair[1] -= take;
+						tally.consumedMyQtyByBase.merge(baseId, take, Integer::sum);
+						collatChanged = true;
+					}
+				}
+				if (collatChanged)
+				{
+					e.setCollateralOutstandingIds(joinIdQtyPairs(collatPairs));
+					changed = true;
+				}
+			}
+
+			// Collateral GP side: me handing coins/plat back
+			long outGp = e.outstandingCollateralGp();
+			if (outGp > 0 && myGp > 0)
+			{
+				long take = Math.min(myGp, outGp);
+				myGp -= take;
+				e.setCollateralGpOutstanding(outGp - take);
+				changed = true;
+			}
+
+			if (changed)
+			{
+				// Materialize all three tallies so a legacy record that just took its
+				// first partial return can't fall back to the old all-or-nothing view
+				e.setLentOutstanding(e.outstandingLentQty());
+				e.setCollateralOutstandingIds(e.outstandingCollateralIds());
+				e.setCollateralGpOutstanding(e.outstandingCollateralGp());
+				if (e.isFullySettled())
+				{
+					tally.closed.add(e);
+				}
+				else
+				{
+					tally.progressed.add(e);
+				}
 			}
 		}
-		return result;
+		return tally;
 	}
 
 	/**
-	 * Tell the user when the partner handed back SOME of a loan but not enough to
-	 * close it (e.g. 3 of 10 lent brews) — the loan stays open, and pretending
-	 * nothing happened would be confusing.
+	 * Variation-base ids of items I still owe back to this partner (I'm their
+	 * borrower). Anything matching these in MY offer is a return in progress —
+	 * never a new lend, never a marketplace-popup candidate.
 	 */
-	private void notePartialReturns(List<LendingEntry> fullyReturned)
+	private Set<Integer> baseIdsIOweTo(String partnerName)
 	{
+		Set<Integer> bases = new HashSet<>();
 		String me = localPlayerName();
-		if (me == null || partner == null || finalTheirOffer == null)
+		if (me == null || partnerName == null)
 		{
-			return;
+			return bases;
 		}
-
-		// Quantity offered per base, MINUS what the completed returns consumed —
-		// only genuinely leftover quantity indicates a partial return. Without this,
-		// an exact full return would flag any second same-base loan as "partial".
-		Map<Integer, Integer> remainingByBase = new HashMap<>();
-		for (Item item : finalTheirOffer)
-		{
-			if (item != null && item.getId() > 0)
-			{
-				remainingByBase.merge(ItemVariationMapping.map(item.getId()), item.getQuantity(), Integer::sum);
-			}
-		}
-		Set<String> returnedIds = new HashSet<>();
-		for (LendingEntry e : fullyReturned)
-		{
-			returnedIds.add(e.getId());
-			remainingByBase.merge(ItemVariationMapping.map(e.getItemId()), -Math.max(1, e.getQuantity()), Integer::sum);
-		}
-
 		for (LendingEntry e : dataService.getActiveEntries())
 		{
-			if (!e.isReturned()
-				&& !returnedIds.contains(e.getId())
-				&& me.equalsIgnoreCase(e.getLender())
-				&& partner.equalsIgnoreCase(e.getBorrower())
-				&& remainingByBase.getOrDefault(ItemVariationMapping.map(e.getItemId()), 0) > 0)
+			if (e.outstandingLentQty() > 0
+				&& me.equalsIgnoreCase(e.getBorrower())
+				&& partnerName.equalsIgnoreCase(e.getLender()))
 			{
-				addGameMessage(warnPrefix() + "Partial return of " + e.getItemName()
-					+ " detected — the loan (x" + e.getQuantity() + ") stays open. Mark it returned in the panel once settled.");
+				bases.add(ItemVariationMapping.map(e.getItemId()));
 			}
 		}
+		return bases;
+	}
+
+	/** Any open (not fully settled) loan between me and this partner, either direction? */
+	private boolean hasOpenLoanWithPartner()
+	{
+		String me = localPlayerName();
+		if (me == null || partner == null)
+		{
+			return false;
+		}
+		for (LendingEntry e : dataService.getActiveEntries())
+		{
+			if (e.isFullySettled())
+			{
+				continue;
+			}
+			boolean meLender = me.equalsIgnoreCase(e.getLender()) && partner.equalsIgnoreCase(e.getBorrower());
+			boolean meBorrower = me.equalsIgnoreCase(e.getBorrower()) && partner.equalsIgnoreCase(e.getLender());
+			if (meLender || meBorrower)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Human summary of what's still outstanding on a loan, for chat messages. */
+	private String outstandingSummary(LendingEntry e)
+	{
+		List<String> parts = new ArrayList<>();
+		int lent = e.outstandingLentQty();
+		if (lent > 0)
+		{
+			parts.add(e.getItemName() + " x" + lent + " still with " + e.getBorrower());
+		}
+		List<int[]> collat = parseIdQtyPairs(e.outstandingCollateralIds());
+		if (!collat.isEmpty())
+		{
+			int count = 0;
+			for (int[] p : collat)
+			{
+				count += p[1];
+			}
+			parts.add(count + " collateral item(s) still held");
+		}
+		long gp = e.outstandingCollateralGp();
+		if (gp > 0)
+		{
+			parts.add(QuantityFormatter.quantityToStackSize(gp) + " GP collateral still held");
+		}
+		return parts.isEmpty() ? "settled" : String.join(", ", parts);
 	}
 
 	/** Exact ids of items in my final offer that I have listed for lending. */
@@ -1238,7 +1632,7 @@ public class TradeLoanTracker
 	}
 
 	/** Create loan records for the given item ids present in my final offer. */
-	private List<LendingEntry> recordLoans(Set<Integer> loanItemIds, boolean hasReturns)
+	private List<LendingEntry> recordLoans(Set<Integer> loanItemIds, ReturnTally tally)
 	{
 		List<LendingEntry> created = new ArrayList<>();
 		String me = localPlayerName();
@@ -1263,15 +1657,43 @@ public class TradeLoanTracker
 				lentQuantities.merge(item.getId(), item.getQuantity(), Integer::sum);
 			}
 		}
+		// Quantities I handed back as COLLATERAL RETURNS are not new lends — the
+		// tally consumed them; subtract per variation-base so a mixed trade
+		// (returning their deposit while lending something new) records only the
+		// genuinely new part.
+		if (!tally.consumedMyQtyByBase.isEmpty())
+		{
+			Map<Integer, Integer> remainingConsumed = new HashMap<>(tally.consumedMyQtyByBase);
+			for (Map.Entry<Integer, Integer> lent : new ArrayList<>(lentQuantities.entrySet()))
+			{
+				int baseId = ItemVariationMapping.map(lent.getKey());
+				int consumed = remainingConsumed.getOrDefault(baseId, 0);
+				if (consumed <= 0)
+				{
+					continue;
+				}
+				int take = Math.min(consumed, lent.getValue());
+				remainingConsumed.put(baseId, consumed - take);
+				int left = lent.getValue() - take;
+				if (left > 0)
+				{
+					lentQuantities.put(lent.getKey(), left);
+				}
+				else
+				{
+					lentQuantities.remove(lent.getKey());
+				}
+			}
+		}
 		if (lentQuantities.isEmpty())
 		{
 			return created;
 		}
 
 		// The partner's side of a loan trade is collateral. Coins and platinum
-		// tokens count as GP. If this trade is ALSO returning loans to me, their
-		// other items are most likely those returns, so they aren't listed as
-		// collateral in that case.
+		// tokens count as GP. Quantities the tally consumed as LENT-ITEM RETURNS
+		// are exactly that — returns — so only the leftover is collateral.
+		Map<Integer, Integer> remainingTheirConsumed = new HashMap<>(tally.consumedTheirQtyByBase);
 		long collateralGp = 0;
 		List<String> collateralItems = new ArrayList<>();
 		List<String> collateralIdPairs = new ArrayList<>();
@@ -1291,11 +1713,23 @@ public class TradeLoanTracker
 				{
 					collateralGp += item.getQuantity() * 1000L;
 				}
-				else if (!hasReturns)
+				else
 				{
-					collateralItems.add(itemName(item.getId())
-						+ (item.getQuantity() > 1 ? " x" + item.getQuantity() : ""));
-					collateralIdPairs.add(item.getId() + ":" + item.getQuantity());
+					int baseId = ItemVariationMapping.map(item.getId());
+					int consumed = remainingTheirConsumed.getOrDefault(baseId, 0);
+					int qty = item.getQuantity();
+					int take = Math.min(consumed, qty);
+					if (take > 0)
+					{
+						remainingTheirConsumed.put(baseId, consumed - take);
+						qty -= take;
+					}
+					if (qty > 0)
+					{
+						collateralItems.add(itemName(item.getId())
+							+ (qty > 1 ? " x" + qty : ""));
+						collateralIdPairs.add(item.getId() + ":" + qty);
+					}
 				}
 			}
 		}
@@ -1313,6 +1747,12 @@ public class TradeLoanTracker
 			entry.setItemId(itemId);
 			entry.setQuantity(quantity);
 			entry.setValue((long) itemManager.getItemPrice(itemId) * quantity);
+			// Running tally starts with everything outstanding
+			entry.setLentOutstanding(quantity);
+			entry.setCollateralOutstandingIds("");
+			entry.setCollateralGpOutstanding(0L);
+			// Lender chose one-time: tracked like any loan, never (re)listed on return
+			entry.setOneTime(autoLoanAll && loanOneTime);
 			// Collateral covers the whole trade — attach it to the FIRST loan record
 			// only, so several loans from one trade don't multiply the recorded total
 			if (first)
@@ -1321,11 +1761,13 @@ public class TradeLoanTracker
 				{
 					entry.setCollateralValue((int) Math.min(collateralGp, Integer.MAX_VALUE));
 					entry.setCollateralType("GP");
+					entry.setCollateralGpOutstanding(collateralGp);
 				}
 				if (!collateralItems.isEmpty())
 				{
 					entry.setCollateralItems(String.join(", ", collateralItems));
 					entry.setCollateralItemIds(String.join(",", collateralIdPairs));
+					entry.setCollateralOutstandingIds(String.join(",", collateralIdPairs));
 				}
 			}
 			dataService.addLoan(group.getId(), me, partner, entry, dueTime);
@@ -1335,6 +1777,7 @@ public class TradeLoanTracker
 			addGameMessage("Loan recorded: " + entry.getItem()
 				+ (quantity > 1 ? " x" + quantity : "") + " to " + partner
 				+ " (" + config.defaultLoanDuration() + " days"
+				+ (entry.isOneTimeLoan() ? ", one-time" : "")
 				+ (first && collateralGp > 0 ? ", collateral " + QuantityFormatter.quantityToStackSize(collateralGp) + " GP" : "")
 				+ ").");
 			first = false;
@@ -1351,6 +1794,15 @@ public class TradeLoanTracker
 	 */
 	private void relistReturnedItem(LendingEntry returned)
 	{
+		// One-time loans are recorded and tracked like any other, but the lender
+		// chose NOT to make the item a standing marketplace offer — coming home
+		// ends the story.
+		if (returned.isOneTimeLoan())
+		{
+			addGameMessage(returned.getItemName() + " returned — not re-listed (one-time loan).");
+			return;
+		}
+
 		String me = localPlayerName();
 		LendingGroup group = groupService.getActiveGroup();
 		if (me == null || group == null || returned.getItemId() <= 0)
@@ -1403,7 +1855,7 @@ public class TradeLoanTracker
 	 * everything needed so a late "yes" can still record the loans.
 	 * Already-recorded ids (explicitly marked ones) are excluded.
 	 */
-	private PendingLoanDecision stashPendingDecision(Set<Integer> alreadyRecorded, boolean hasReturns)
+	private PendingLoanDecision stashPendingDecision(Set<Integer> alreadyRecorded, ReturnTally tally)
 	{
 		String me = localPlayerName();
 		LendingGroup group = groupService.getActiveGroup();
@@ -1413,13 +1865,40 @@ public class TradeLoanTracker
 		}
 
 		PendingLoanDecision stash = new PendingLoanDecision(sessionId, partner, me, group.getId());
+		// Quantities consumed as returns (either side) never become stashed loans
+		Set<Integer> owedBases = baseIdsIOweTo(partner);
 		Map<Integer, Integer> quantities = new HashMap<>();
 		for (Item item : finalMyOffer)
 		{
 			if (item != null && item.getId() > 0 && !alreadyRecorded.contains(item.getId())
-				&& isListedForLending(item.getId()))
+				&& isListedForLending(item.getId())
+				&& !owedBases.contains(ItemVariationMapping.map(item.getId())))
 			{
 				quantities.merge(item.getId(), item.getQuantity(), Integer::sum);
+			}
+		}
+		if (!tally.consumedMyQtyByBase.isEmpty())
+		{
+			Map<Integer, Integer> remainingConsumed = new HashMap<>(tally.consumedMyQtyByBase);
+			for (Map.Entry<Integer, Integer> q : new ArrayList<>(quantities.entrySet()))
+			{
+				int baseId = ItemVariationMapping.map(q.getKey());
+				int consumed = remainingConsumed.getOrDefault(baseId, 0);
+				if (consumed <= 0)
+				{
+					continue;
+				}
+				int take = Math.min(consumed, q.getValue());
+				remainingConsumed.put(baseId, consumed - take);
+				int left = q.getValue() - take;
+				if (left > 0)
+				{
+					quantities.put(q.getKey(), left);
+				}
+				else
+				{
+					quantities.remove(q.getKey());
+				}
 			}
 		}
 		if (quantities.isEmpty())
@@ -1432,7 +1911,9 @@ public class TradeLoanTracker
 				(long) itemManager.getItemPrice(q.getKey()) * q.getValue()));
 		}
 
-		// Collateral snapshot (same rules as recordLoans)
+		// Collateral snapshot (same rules as recordLoans: returned lent items are
+		// returns, only the leftover of the partner's offer is collateral)
+		Map<Integer, Integer> remainingTheirConsumed = new HashMap<>(tally.consumedTheirQtyByBase);
 		long collateralGp = 0;
 		List<String> collateralItems = new ArrayList<>();
 		List<String> collateralIdPairs = new ArrayList<>();
@@ -1452,11 +1933,23 @@ public class TradeLoanTracker
 				{
 					collateralGp += item.getQuantity() * 1000L;
 				}
-				else if (!hasReturns)
+				else
 				{
-					collateralItems.add(itemName(item.getId())
-						+ (item.getQuantity() > 1 ? " x" + item.getQuantity() : ""));
-					collateralIdPairs.add(item.getId() + ":" + item.getQuantity());
+					int baseId = ItemVariationMapping.map(item.getId());
+					int consumed = remainingTheirConsumed.getOrDefault(baseId, 0);
+					int qty = item.getQuantity();
+					int take = Math.min(consumed, qty);
+					if (take > 0)
+					{
+						remainingTheirConsumed.put(baseId, consumed - take);
+						qty -= take;
+					}
+					if (qty > 0)
+					{
+						collateralItems.add(itemName(item.getId())
+							+ (qty > 1 ? " x" + qty : ""));
+						collateralIdPairs.add(item.getId() + ":" + qty);
+					}
 				}
 			}
 		}
@@ -1491,17 +1984,23 @@ public class TradeLoanTracker
 			entry.setItemId(loan.itemId);
 			entry.setQuantity(loan.quantity);
 			entry.setValue(loan.value);
+			// Running tally starts with everything outstanding
+			entry.setLentOutstanding(loan.quantity);
+			entry.setCollateralOutstandingIds("");
+			entry.setCollateralGpOutstanding(0L);
 			if (first)
 			{
 				if (stash.collateralGp > 0)
 				{
 					entry.setCollateralValue((int) Math.min(stash.collateralGp, Integer.MAX_VALUE));
 					entry.setCollateralType("GP");
+					entry.setCollateralGpOutstanding(stash.collateralGp);
 				}
 				if (stash.collateralItems != null)
 				{
 					entry.setCollateralItems(stash.collateralItems);
 					entry.setCollateralItemIds(stash.collateralItemIds);
+					entry.setCollateralOutstandingIds(stash.collateralItemIds);
 				}
 			}
 			dataService.addLoan(stash.groupId, stash.lenderName, stash.partnerName, entry, dueTime);
@@ -1519,6 +2018,59 @@ public class TradeLoanTracker
 		{
 			onLoanRecorded.run();
 		}
+	}
+
+	/**
+	 * A display-only entry describing MY collateral deposit (Collat mode), so the
+	 * borrower's proof screenshot overlay names what was handed over. Never saved.
+	 */
+	private LendingEntry provisionalDepositEntry()
+	{
+		String me = localPlayerName();
+		if (me == null || partner == null || finalMyOffer == null)
+		{
+			return null;
+		}
+		long gp = 0;
+		List<String> names = new ArrayList<>();
+		for (Item item : finalMyOffer)
+		{
+			if (item == null || item.getId() <= 0)
+			{
+				continue;
+			}
+			if (item.getId() == ItemID.COINS_995)
+			{
+				gp += item.getQuantity();
+			}
+			else if (item.getId() == ItemID.PLATINUM_TOKEN)
+			{
+				gp += item.getQuantity() * 1000L;
+			}
+			else
+			{
+				names.add(itemName(item.getId())
+					+ (item.getQuantity() > 1 ? " x" + item.getQuantity() : ""));
+			}
+		}
+		if (gp == 0 && names.isEmpty())
+		{
+			return null;
+		}
+		LendingEntry entry = new LendingEntry();
+		entry.setItem("Collateral deposit");
+		entry.setLender(partner);
+		entry.setBorrower(me);
+		if (gp > 0)
+		{
+			entry.setCollateralValue((int) Math.min(gp, Integer.MAX_VALUE));
+			entry.setCollateralType("GP");
+		}
+		if (!names.isEmpty())
+		{
+			entry.setCollateralItems(String.join(", ", names));
+		}
+		return entry;
 	}
 
 	/** A display-only entry describing the stashed loans, for the screenshot overlay. */

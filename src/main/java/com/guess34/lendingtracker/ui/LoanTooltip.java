@@ -62,6 +62,60 @@ final class LoanTooltip
 
 		sb.append("<br>Collateral: ").append(escape(collateralText(loan)));
 
+		// Running-tally state: what each side still needs to hand back. Only shown
+		// while something is outstanding, so settled/legacy loans stay unchanged.
+		if (loan.getReturnedAt() == 0)
+		{
+			int lentOut = loan.outstandingLentQty();
+			int lentTotal = Math.max(1, loan.getQuantity());
+			if (lentOut > 0 && lentOut < lentTotal)
+			{
+				sb.append("<br>Still out: <b>").append(lentOut).append(" of ")
+					.append(lentTotal).append("</b> with ")
+					.append(escape(loan.getBorrower()));
+			}
+			else if (lentOut == 0)
+			{
+				sb.append("<br><b>All items returned</b> — awaiting collateral hand-back");
+			}
+			String collatOut = loan.outstandingCollateralIds();
+			long gpOut = loan.outstandingCollateralGp();
+			boolean partialCollat = (loan.getCollateralItemIds() != null
+				&& !loan.getCollateralItemIds().equals(collatOut))
+				|| (loan.getCollateralValue() != null && loan.getCollateralValue() > 0
+					&& gpOut < loan.getCollateralValue());
+			if (partialCollat)
+			{
+				sb.append("<br>Collateral still held: ");
+				int collatQty = 0;
+				if (!collatOut.isEmpty())
+				{
+					for (String pair : collatOut.split(","))
+					{
+						int idx = pair.indexOf(':');
+						try
+						{
+							collatQty += idx > 0 ? Integer.parseInt(pair.substring(idx + 1)) : 1;
+						}
+						catch (NumberFormatException ignored)
+						{
+							collatQty += 1;
+						}
+					}
+					sb.append(collatQty).append(" item(s)");
+				}
+				if (gpOut > 0)
+				{
+					sb.append(collatOut.isEmpty() ? "" : " + ")
+						.append(QuantityFormatter.quantityToStackSize(gpOut)).append(" GP");
+				}
+				if (collatOut.isEmpty() && gpOut == 0)
+				{
+					sb.append("none — all returned");
+				}
+			}
+		}
+
 		if (loan.getNotes() != null && !loan.getNotes().isEmpty())
 		{
 			sb.append("<br>Notes: ").append(escape(loan.getNotes()));

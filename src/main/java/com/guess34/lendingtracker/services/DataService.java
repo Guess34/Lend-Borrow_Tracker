@@ -550,6 +550,23 @@ public class DataService
 		}
 	}
 
+	/**
+	 * Restore an entry from a LOCAL BACKUP file. Unlike {@link #addEntry} this
+	 * PRESERVES the entry's original updatedAt and publishes nothing: a backup is
+	 * a point-in-time copy, and stamping it "now" would let stale return tallies
+	 * win last-write-wins against the whole group's fresher state (e.g. a partial
+	 * return silently rolling back to fully-outstanding everywhere).
+	 */
+	public void restoreEntry(LendingEntry entry)
+	{
+		if (entry == null || entry.getId() == null)
+		{
+			return;
+		}
+		allEntries.put(entry.getId(), new LendingEntry(entry));
+		saveEntries();
+	}
+
 	public List<LendingEntry> getActiveEntries()
 	{
 		return allEntries.values().stream()
@@ -582,6 +599,35 @@ public class DataService
 		return allEntries.values().stream()
 			.filter(entry -> !entry.isReturned() && entry.getDueDate() > 0 && entry.getDueDate() < currentTime)
 			.collect(Collectors.toList());
+	}
+
+	/**
+	 * Persist and sync a PARTIAL return: the entry's outstanding tallies changed
+	 * but the loan isn't fully settled yet, so it stays active. Bumps updatedAt
+	 * (last-write-wins) and pushes the change live so every member's panel shows
+	 * the new "still to return" state immediately.
+	 */
+	public void updateEntryProgress(LendingEntry entry)
+	{
+		if (entry == null || entry.getId() == null)
+		{
+			return;
+		}
+		entry.setUpdatedAt(System.currentTimeMillis());
+		allEntries.put(entry.getId(), entry);
+		saveEntries();
+		if (entry.getGroupId() != null)
+		{
+			persist(entry.getGroupId(), "loan");
+		}
+		if (groupService != null && entry.getGroupId() != null)
+		{
+			groupService.publishEvent(
+				GroupService.SyncEventType.ITEM_UPDATED,
+				entry.getId(),
+				entry
+			);
+		}
 	}
 
 	public void completeEntry(String entryId, boolean returned)
@@ -653,11 +699,15 @@ public class DataService
 		return true;
 	}
 
-	/** True if this loan has GP or item collateral recorded against it. */
+	/**
+	 * True if the lender STILL HOLDS collateral against this loan. Uses the
+	 * running tally: once every deposit went back to the borrower, forgiving the
+	 * loan strands nothing — the lender is only dropping their own claim.
+	 */
 	public static boolean hasCollateral(LendingEntry entry)
 	{
-		return (entry.getCollateralValue() != null && entry.getCollateralValue() > 0)
-			|| (entry.getCollateralItems() != null && !entry.getCollateralItems().isEmpty());
+		return entry.outstandingCollateralGp() > 0
+			|| !entry.outstandingCollateralIds().isEmpty();
 	}
 
 	/**

@@ -506,7 +506,13 @@ public class LendingTrackerPlugin extends Plugin
 			long daysOverdue = ChronoUnit.DAYS.between(Instant.ofEpochMilli(entry.getDueDate()), Instant.now());
 			if (daysOverdue > 0 && daysOverdue % config.overdueReminderFrequency() == 0)
 			{
-				notifier.notify("Overdue loan: " + entry.getItemName() + " (" + daysOverdue + " days overdue)");
+				// With running-tally returns a loan can stay open past due while the
+				// BORROWER's side is fully home (only collateral still to hand back) —
+				// don't frame that as an overdue item on the borrower.
+				String message = entry.outstandingLentQty() > 0
+					? "Overdue loan: " + entry.getItemName() + " (" + daysOverdue + " days overdue)"
+					: "Open loan: " + entry.getItemName() + " — items returned, collateral still to be handed back";
+				notifier.notify(message);
 				if (config.enableSoundAlerts()) { client.playSoundEffect(SoundEffectID.UI_BOOP); }
 			}
 		}

@@ -219,11 +219,13 @@ public class LocalDataSyncService {
             });
         }
         
-        // Sync active entries
+        // Sync active entries. restoreEntry (NOT addEntry) keeps the backup's
+        // original updatedAt and publishes nothing — stamping a backup copy "now"
+        // would let its stale return tallies win last-write-wins group-wide.
         if (syncData.activeEntries != null) {
             for (LendingEntry entry : syncData.activeEntries) {
                 if (!existingEntryIds.contains(entry.getId())) {
-                    dataService.addEntry(entry);
+                    dataService.restoreEntry(entry);
 
                 }
             }

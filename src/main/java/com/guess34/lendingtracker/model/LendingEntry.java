@@ -48,6 +48,21 @@ public class LendingEntry {
     // reconciliation when the same entry arrives from another client via sync.
     private long updatedAt;
 
+    // --- Running-tally return tracking ---
+    // A loan settles piece by piece: the borrower owes the lent item(s) back, and
+    // the lender owes the collateral back. Each completed trade decrements
+    // whatever actually came home, on either side; the loan only closes when BOTH
+    // sides reach zero. All three are wrappers so records saved before this
+    // feature deserialize to null and the accessors below fall back to the old
+    // all-or-nothing semantics — no migration, no broken saved data.
+    private Integer lentOutstanding;         // qty of the lent item still with the borrower
+    private String collateralOutstandingIds; // "itemId:qty,..." still held by the lender
+    private Long collateralGpOutstanding;    // GP collateral still held by the lender
+
+    // Lender chose a one-time loan: recorded and tracked like any loan, but the
+    // item is never (re)listed on the marketplace when it comes home.
+    private Boolean oneTime;
+
     // Misc
     private String notes;
 
@@ -56,6 +71,38 @@ public class LendingEntry {
     public long getDueDate() { return this.dueTime; }
     public long getLendDate() { return this.lendTime; }
     public boolean isReturned() { return this.returnedAt > 0; }
+
+    // --- Null-safe outstanding accessors (legacy records fall back to the old
+    // all-or-nothing model: everything outstanding while active, nothing after) ---
+
+    /** Quantity of the lent item the borrower still holds. */
+    public int outstandingLentQty() {
+        if (lentOutstanding != null) return Math.max(0, lentOutstanding);
+        return isReturned() ? 0 : Math.max(1, quantity);
+    }
+
+    /** Collateral items ("itemId:qty,...") the lender still holds. Empty = none. */
+    public String outstandingCollateralIds() {
+        if (collateralOutstandingIds != null) return collateralOutstandingIds;
+        if (isReturned()) return "";
+        return collateralItemIds != null ? collateralItemIds : "";
+    }
+
+    /** GP collateral the lender still holds. */
+    public long outstandingCollateralGp() {
+        if (collateralGpOutstanding != null) return Math.max(0, collateralGpOutstanding);
+        if (isReturned()) return 0;
+        return collateralValue != null && "GP".equals(collateralType) ? Math.max(0, collateralValue) : 0;
+    }
+
+    /** True when nothing is outstanding on EITHER side — item home AND collateral home. */
+    public boolean isFullySettled() {
+        return outstandingLentQty() == 0
+            && outstandingCollateralIds().isEmpty()
+            && outstandingCollateralGp() == 0;
+    }
+
+    public boolean isOneTimeLoan() { return Boolean.TRUE.equals(oneTime); }
 
     public boolean isOverdue() {
         return returnedAt == 0 && dueTime > 0 && System.currentTimeMillis() > dueTime;
@@ -80,6 +127,10 @@ public class LendingEntry {
         this.dueTime = other.dueTime;
         this.returnedAt = other.returnedAt;
         this.updatedAt = other.updatedAt;
+        this.lentOutstanding = other.lentOutstanding;
+        this.collateralOutstandingIds = other.collateralOutstandingIds;
+        this.collateralGpOutstanding = other.collateralGpOutstanding;
+        this.oneTime = other.oneTime;
         this.notes = other.notes;
     }
 
