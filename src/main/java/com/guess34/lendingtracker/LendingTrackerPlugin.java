@@ -241,6 +241,14 @@ public class LendingTrackerPlugin extends Plugin
 		{
 			tradeLoanTracker.onTradeOfferUpdated();
 		}
+		// Bank snapshot for the fungible-duplicate guard logic: owning a spare copy
+		// of a collateral/borrowed item (safe in the bank) means carrying your own
+		// copy isn't at-risk. Only known once the bank has been opened this session.
+		if (event.getContainerId() == net.runelite.api.gameval.InventoryID.BANK
+			&& event.getItemContainer() != null)
+		{
+			tradeLoanTracker.onBankUpdated(event.getItemContainer().getItems());
+		}
 	}
 
 	@Subscribe

@@ -129,6 +129,13 @@ public class TradeLoanTracker
 	private boolean collatMode;
 	private Widget collatButton;
 	private Widget collatButtonBg;
+	// Last-known bank contents per variation-base id, for the fungible-duplicate
+	// guard logic (see atRiskCarrying). Only populated once the bank has been
+	// opened this session; cleared on logout so one account's bank can never
+	// vouch for another's collateral.
+	private final Map<Integer, Integer> bankQtyByBase = new HashMap<>();
+	private boolean bankKnown;
+
 	// Trades that completed before their popup was answered, keyed by session id;
 	// a late "yes" records from here. Cleared on logout/shutdown so a stale stash
 	// can never record loans under a different account's session.
@@ -663,6 +670,28 @@ public class TradeLoanTracker
 	{
 		pendingDecisions.clear();
 		promptOpen = false;
+		// Logout hook: forget the bank snapshot too — guards fall back to cautious
+		// until this (possibly different) account opens its own bank.
+		bankQtyByBase.clear();
+		bankKnown = false;
+	}
+
+	/** The bank container changed (it's open) — snapshot quantities per base id. */
+	public void onBankUpdated(Item[] items)
+	{
+		bankQtyByBase.clear();
+		bankKnown = true;
+		if (items == null)
+		{
+			return;
+		}
+		for (Item item : items)
+		{
+			if (item != null && item.getId() > 0)
+			{
+				bankQtyByBase.merge(ItemVariationMapping.map(item.getId()), item.getQuantity(), Integer::sum);
+			}
+		}
 	}
 
 	/** Is this item (or a variant of it) listed by me on the group marketplace? */
@@ -1078,20 +1107,52 @@ public class TradeLoanTracker
 			return new ArrayList<>();
 		}
 
-		Set<Integer> carriedBaseIds = new HashSet<>();
-		collectBaseIds(carriedBaseIds, InventoryID.INV);
-		collectBaseIds(carriedBaseIds, InventoryID.WORN);
+		Map<Integer, Integer> carried = carriedQuantitiesByBase();
 
 		List<LendingEntry> result = new ArrayList<>();
 		for (LendingEntry e : dataService.getActiveEntries())
 		{
 			if (!e.isReturned() && me.equalsIgnoreCase(e.getBorrower())
-				&& carriedBaseIds.contains(ItemVariationMapping.map(e.getItemId())))
+				&& atRiskCarrying(carried, ItemVariationMapping.map(e.getItemId()), e.outstandingLentQty()))
 			{
 				result.add(e);
 			}
 		}
 		return result;
+	}
+
+	/**
+	 * Items are fungible: what matters is never WHICH copy you hold, only that
+	 * you can still cover what you owe. Carrying a base item is AT RISK only when
+	 * losing the carried copies would drop your total (carried + banked) below
+	 * the quantity owed — so someone who owns a duplicate of a collateral or
+	 * borrowed item can freely carry/trade their own copy while the covering one
+	 * sits in the bank. Bank contents are only known after the bank has been
+	 * opened this session; until then banked counts as 0 (the cautious old
+	 * behavior).
+	 */
+	private boolean atRiskCarrying(Map<Integer, Integer> carried, int baseId, int qtyOwed)
+	{
+		if (qtyOwed <= 0)
+		{
+			return false;
+		}
+		int carriedQty = carried.getOrDefault(baseId, 0);
+		if (carriedQty <= 0)
+		{
+			return false;
+		}
+		int banked = bankKnown ? bankQtyByBase.getOrDefault(baseId, 0) : 0;
+		return banked < qtyOwed;
+	}
+
+	/** Carried (inventory + worn) quantities per variation-base id. */
+	private Map<Integer, Integer> carriedQuantitiesByBase()
+	{
+		Map<Integer, Integer> carried = new HashMap<>();
+		collectBaseQuantities(carried, InventoryID.INV);
+		collectBaseQuantities(carried, InventoryID.WORN);
+		return carried;
 	}
 
 	/**
@@ -1107,9 +1168,7 @@ public class TradeLoanTracker
 			return new ArrayList<>();
 		}
 
-		Set<Integer> carriedBaseIds = new HashSet<>();
-		collectBaseIds(carriedBaseIds, InventoryID.INV);
-		collectBaseIds(carriedBaseIds, InventoryID.WORN);
+		Map<Integer, Integer> carried = carriedQuantitiesByBase();
 
 		List<LendingEntry> result = new ArrayList<>();
 		for (LendingEntry e : dataService.getActiveEntries())
@@ -1118,9 +1177,9 @@ public class TradeLoanTracker
 			{
 				continue;
 			}
-			for (int collateralId : parseCollateralItemIds(e))
+			for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
 			{
-				if (carriedBaseIds.contains(ItemVariationMapping.map(collateralId)))
+				if (atRiskCarrying(carried, ItemVariationMapping.map(pair[0]), pair[1]))
 				{
 					result.add(e);
 					break;
@@ -2172,6 +2231,23 @@ public class TradeLoanTracker
 			return -1;
 		}
 		return inv.getItems()[slot].getId();
+	}
+
+	/** Sum quantities per variation-base id from a live container. */
+	private void collectBaseQuantities(Map<Integer, Integer> into, int containerId)
+	{
+		ItemContainer container = client.getItemContainer(containerId);
+		if (container == null)
+		{
+			return;
+		}
+		for (Item item : container.getItems())
+		{
+			if (item != null && item.getId() > 0)
+			{
+				into.merge(ItemVariationMapping.map(item.getId()), item.getQuantity(), Integer::sum);
+			}
+		}
 	}
 
 	private void collectBaseIds(Set<Integer> into, int containerId)
