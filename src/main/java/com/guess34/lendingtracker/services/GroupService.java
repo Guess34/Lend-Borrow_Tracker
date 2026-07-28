@@ -1458,18 +1458,13 @@ public class GroupService
 	{
 		if (syncExecutor != null && !syncExecutor.isShutdown())
 		{
-			syncExecutor.shutdown();
-			try
-			{
-				if (!syncExecutor.awaitTermination(1, TimeUnit.SECONDS))
-				{
-					syncExecutor.shutdownNow();
-				}
-			}
-			catch (InterruptedException e)
-			{
-				syncExecutor.shutdownNow();
-			}
+			// shutdownNow() only — never wait here. stopSync runs from the plugin's
+			// shutDown(), and blocking there stalls the client's whole plugin
+			// teardown. A catch-up fetch can hold a socket read for up to 90s, so
+			// awaiting it was a real stall, not a theoretical one. Tasks that
+			// survive the interrupt are harmless: each re-checks the sync target,
+			// the connection epoch and the executor identity before acting.
+			syncExecutor.shutdownNow();
 		}
 		// Disconnect relay
 		if (relaySyncService != null)
