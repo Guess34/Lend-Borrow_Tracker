@@ -478,7 +478,7 @@ public class RelaySyncService
 			return;
 		}
 
-		log.info("Publishing invite code {} for group {} to relay at {}", code, groupId, baseUrl);
+		log.debug("Publishing invite code {} for group {} to relay at {}", code, groupId, baseUrl);
 
 		JsonObject body = new JsonObject();
 		body.addProperty("code", code);
@@ -504,7 +504,7 @@ public class RelaySyncService
 			{
 				if (response.isSuccessful())
 				{
-					log.info("Invite code {} published to relay successfully", code);
+					log.debug("Invite code {} published to relay successfully", code);
 				}
 				else
 				{
@@ -553,7 +553,7 @@ public class RelaySyncService
 			{
 				if (response.isSuccessful())
 				{
-					log.info("Invite code {} published to relay (attempt {})", code, attempt);
+					log.debug("Invite code {} published to relay (attempt {})", code, attempt);
 					return true;
 				}
 				log.warn("Publish attempt {} for code {} got HTTP {}", attempt, code, response.code());
@@ -606,7 +606,7 @@ public class RelaySyncService
 			return new InviteLookupResult(InviteStatus.UNREACHABLE, null);
 		}
 
-		log.info("Looking up invite code {} from relay at {}", code, baseUrl);
+		log.debug("Looking up invite code {} from relay at {}", code, baseUrl);
 
 		Request request = new Request.Builder()
 			.url(baseUrl + "/api/invite/" + code)
@@ -615,7 +615,7 @@ public class RelaySyncService
 
 		try (Response response = getRestClient().newCall(request).execute())
 		{
-			log.info("Relay returned {} for invite code lookup {}", response.code(), code);
+			log.debug("Relay returned {} for invite code lookup {}", response.code(), code);
 			if (response.isSuccessful() && response.body() != null)
 			{
 				String responseBody = response.body().string();
@@ -747,13 +747,18 @@ public class RelaySyncService
 		String baseUrl = getRestBaseUrl();
 		if (baseUrl == null) return true;
 
-		Request request = new Request.Builder()
-			.url(baseUrl + "/api/state/" + groupId)
-			.get()
-			.build();
-
-		try (Response response = getRestClient().newCall(request).execute())
+		try
 		{
+			// Built inside the try: url() throws IllegalArgumentException on a
+			// malformed relay URL (e.g. configured without a scheme), and an
+			// escape here would leak past the caller's bookkeeping.
+			Request request = new Request.Builder()
+				.url(baseUrl + "/api/state/" + groupId)
+				.get()
+				.build();
+
+			try (Response response = getRestClient().newCall(request).execute())
+			{
 			if (response.code() == 404)
 			{
 				// Relay answered: it has no stored state for this group (new group,
@@ -806,6 +811,7 @@ public class RelaySyncService
 				lastStateHash.keySet().removeIf(k -> k.startsWith(prefix));
 			}
 			return true;
+			}
 		}
 		catch (Exception e)
 		{
@@ -1003,7 +1009,15 @@ public class RelaySyncService
 		if (config == null) return null;
 		String wsUrl = config.relayServerUrl();
 		if (wsUrl == null || wsUrl.isEmpty()) return null;
-		return wsUrl.replace("wss://", "https://").replace("ws://", "http://");
+		if (wsUrl.regionMatches(true, 0, "wss://", 0, 6))
+		{
+			return "https://" + wsUrl.substring(6);
+		}
+		if (wsUrl.regionMatches(true, 0, "ws://", 0, 5))
+		{
+			return "http://" + wsUrl.substring(5);
+		}
+		return wsUrl;
 	}
 
 	/**

@@ -277,7 +277,25 @@ public class DataService
 		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
 		if (groupData != null)
 		{
-			List<LendingEntry> removed = groupData.remove(lenderName);
+			// Names are keyed however the publishing client happened to capitalise
+			// them, so an exact-case remove left a kicked member's listings behind.
+			// Everything else in this file compares names with equalsIgnoreCase.
+			List<LendingEntry> removed = null;
+			for (String key : new ArrayList<>(groupData.keySet()))
+			{
+				if (key != null && key.equalsIgnoreCase(lenderName))
+				{
+					List<LendingEntry> hit = groupData.remove(key);
+					if (hit != null)
+					{
+						if (removed == null)
+						{
+							removed = new ArrayList<>();
+						}
+						removed.addAll(hit);
+					}
+				}
+			}
 			if (removed != null && !removed.isEmpty())
 			{
 				persist(groupId, "available");
@@ -644,6 +662,20 @@ public class DataService
 			if (returned)
 			{
 				allEntries.remove(entryId);
+				// Drop it from the group lists too, the way forgiveLoan and the staff
+				// removal path already do. Left behind, the row kept being published
+				// as an active loan, and after a restart it no longer shared an object
+				// with the history copy — so its returnedAt stayed 0 and no retention
+				// sweep could ever reap it.
+				removeEntryFromCategory(groupLent, entryId);
+				removeEntryFromCategory(groupBorrowed, entryId);
+				// The group lists live in the per-group snapshot key, which only
+				// persist() writes — saveEntries() covers just entries/history. Skip
+				// it and the next loadGroupData resurrects the row from stale config.
+				if (entry.getGroupId() != null)
+				{
+					persist(entry.getGroupId(), "returned");
+				}
 			}
 			saveEntries();
 			if (groupService != null && entry.getGroupId() != null)
@@ -690,6 +722,13 @@ public class DataService
 		allEntries.remove(entryId);
 		removeEntryFromCategory(groupLent, entryId);
 		removeEntryFromCategory(groupBorrowed, entryId);
+		// The group lists only reach config via persist() — saveEntries() covers
+		// just entries/history. Without it the next loadGroupData resurrects the
+		// removed row from the stale per-group snapshot.
+		if (entry.getGroupId() != null)
+		{
+			persist(entry.getGroupId(), "returned");
+		}
 		saveEntries();
 
 		if (groupService != null && entry.getGroupId() != null)
@@ -735,6 +774,13 @@ public class DataService
 		allEntries.remove(entryId);
 		removeEntryFromCategory(groupLent, entryId);
 		removeEntryFromCategory(groupBorrowed, entryId);
+		// The group lists only reach config via persist() — saveEntries() covers
+		// just entries/history. Without it the next loadGroupData resurrects the
+		// removed row from the stale per-group snapshot.
+		if (entry.getGroupId() != null)
+		{
+			persist(entry.getGroupId(), "returned");
+		}
 		saveEntries();
 
 		if (groupService != null && entry.getGroupId() != null)
@@ -803,8 +849,15 @@ public class DataService
 
 	// Data retention / cleanup
 
-	public int deleteOldReturnedEntries(long cutoffTime)
+	public int deleteOldReturnedEntries(long requestedCutoff)
 	{
+		// The "this loan came back" tombstone is derived from history on every
+		// publish, so pruning history below the tombstone window silently shortens
+		// it — and it is the PUBLISHER's retention setting that decides, so one
+		// member on a short setting would break catch-up for everyone else. Never
+		// delete history a snapshot might still need to name.
+		final long cutoffTime = Math.min(requestedCutoff, System.currentTimeMillis() - RETURNED_TOMBSTONE_MS);
+
 		int deletedCount = 0;
 
 		for (Map.Entry<String, Map<String, List<LendingEntry>>> groupEntry : groupLent.entrySet())
@@ -1037,6 +1090,12 @@ public class DataService
 				// Live update: publisher is authoritative only for their own rows.
 				applyPublisherRows(getCategory(snapshot, "available"), groupId, groupAvailable, publisher);
 				applyPublisherRows(getCategory(snapshot, "lent"), groupId, groupLent, publisher);
+				// "borrowed" is deliberately NOT applied here. Unlike available/lent,
+				// that map is keyed by BORROWER, not by the publisher — so the
+				// publisher-authoritative replace applyPublisherRows does would delete
+				// rows other lenders filed under the publisher's borrower key. Borrowed
+				// rows still arrive via the catch-up merge, which handles keying
+				// correctly; live borrowed sync needs its own merge rule.
 				mergeRequests(groupId, snapshot.get("requests"));
 				mergeActiveEntries(groupId, snapshot.get("entries"));
 			}
@@ -1233,8 +1292,17 @@ public class DataService
 	 */
 	public void applyReturnedFromSync(String entryId)
 	{
+		// Grab the group before archiving removes the entry — the group snapshot
+		// needs the same persist the local return paths do, or the next
+		// loadGroupData resurrects the lent/borrowed rows from stale config and
+		// we republish the returned loan as active.
+		LendingEntry entry = allEntries.get(entryId);
 		if (archiveReturnedById(entryId))
 		{
+			if (entry != null && entry.getGroupId() != null)
+			{
+				persist(entry.getGroupId(), "returned");
+			}
 			saveEntries();
 		}
 	}

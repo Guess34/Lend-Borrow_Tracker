@@ -67,11 +67,40 @@ public class GroupService
 
 	// --- Sync State ---
 	private ScheduledExecutorService syncExecutor;
-	private String currentSyncGroupId;
+	// Volatile: written by the client thread (startSync/stopSync) but read by the
+	// sync executor and the OkHttp ws-callback thread, which now act on it (the
+	// catch-up target re-check and the publish gate).
+	private volatile String currentSyncGroupId;
 	private String currentSyncPlayerName;
 	private long lastSyncTimestamp = 0;
 	private Runnable onSyncCallback;
 	private java.util.function.Consumer<SyncEvent> onWildernessAlert;
+
+	// The group whose stored snapshot we have reconciled with since connecting.
+	// Publishing before that has happened is what makes a brief disconnect
+	// destructive: the relay keeps ONE record per group and overwrites it with
+	// whatever arrives, so uploading a view that predates changes made while we
+	// were away rolls them back for every member, not just for us. Written from
+	// the sync executor, read from the ws callback thread — hence volatile.
+	private volatile String caughtUpGroupId;
+
+	// One catch-up retry chain at a time. pollForUpdates ticks every 5 seconds
+	// and would otherwise start a fresh 6-attempt chain on each tick whenever we
+	// aren't caught up — hundreds of overlapping blocking REST calls piling onto
+	// the single sync thread during a relay outage. Ownership is a token, not a
+	// boolean: a stale chain waking from a 90-second fetch may only release its
+	// OWN claim, never one a newer chain holds.
+	private final java.util.concurrent.atomic.AtomicLong catchUpOwner =
+		new java.util.concurrent.atomic.AtomicLong(0);
+	private final java.util.concurrent.atomic.AtomicLong catchUpTokens =
+		new java.util.concurrent.atomic.AtomicLong(0);
+
+	// Bumped every time the relay connection drops. A catch-up whose fetch began
+	// on an older connection must not mark us reconciled: peers can have changed
+	// the stored record during the outage, and its pre-drop read says nothing
+	// about what is there now.
+	private final java.util.concurrent.atomic.AtomicLong connectionEpoch =
+		new java.util.concurrent.atomic.AtomicLong(0);
 
 	// --- Relay-authoritative presence ---
 	// The relay knows exactly which members hold an open websocket to the group's
@@ -1272,7 +1301,7 @@ public class GroupService
 			// a duplicate fetch from the login double-call is idempotent.)
 			if (wasDisconnected)
 			{
-				scheduleCatchUpFetch(groupId, 0, 0);
+				scheduleCatchUpFetch(groupId);
 			}
 			// Push our current state too: this re-sync may follow a local change
 			// this path wouldn't otherwise broadcast (e.g. redeeming a single-use
@@ -1313,7 +1342,7 @@ public class GroupService
 			// (blocking REST call). Retries with backoff so a Render cold-start
 			// (30-60s wake) or a transient failure doesn't mean "no catch-up until
 			// relog" — offline deletions/returns would otherwise never arrive.
-			scheduleCatchUpFetch(groupId, 0, 0);
+			scheduleCatchUpFetch(groupId);
 		}
 	}
 
@@ -1321,30 +1350,107 @@ public class GroupService
 	// enough to ride out a Render free-tier cold start.
 	private static final long[] CATCH_UP_RETRY_DELAYS_MS = { 0, 10_000, 20_000, 40_000, 80_000, 160_000 };
 
-	private void scheduleCatchUpFetch(String groupId, int attempt, long delayMs)
+	/** Start a catch-up chain for the group, unless one is already running. */
+	private void scheduleCatchUpFetch(String groupId)
+	{
+		long token = catchUpTokens.incrementAndGet();
+		if (!catchUpOwner.compareAndSet(0L, token))
+		{
+			// A chain is already in flight; it (or the 5-second poll rescue after
+			// it releases) will get us caught up. Starting another would stack
+			// blocking fetches on the single sync thread.
+			return;
+		}
+		scheduleCatchUpAttempt(groupId, 0, 0, token, connectionEpoch.get());
+	}
+
+	private void scheduleCatchUpAttempt(String groupId, int attempt, long delayMs, long token, long epoch)
 	{
 		ScheduledExecutorService exec = syncExecutor;
-		if (exec == null || exec.isShutdown()) return;
+		if (exec == null || exec.isShutdown())
+		{
+			catchUpOwner.compareAndSet(token, 0L);
+			return;
+		}
 		try
 		{
 			exec.schedule(() ->
 			{
-				// The sync target may have changed while we waited (group switch).
-				if (!groupId.equals(currentSyncGroupId)) return;
-				boolean done = relaySyncService.fetchStateSnapshot(groupId);
-				if (!done && attempt + 1 < CATCH_UP_RETRY_DELAYS_MS.length)
+				// The finally releases our claim on every exit — including an
+				// unexpected throw, which would otherwise wedge the flag and leave
+				// the publish gate closed for the rest of the session. The one path
+				// that must NOT release is a scheduled retry: the chain lives on.
+				boolean chainContinues = false;
+				try
 				{
-					scheduleCatchUpFetch(groupId, attempt + 1, CATCH_UP_RETRY_DELAYS_MS[attempt + 1]);
+					// The sync target may have changed while we waited (group switch),
+					// or the connection may have cycled — a chain sleeping through a
+					// backoff wakes up obsolete. Check before spending a fetch.
+					if (!groupId.equals(currentSyncGroupId) || epoch != connectionEpoch.get()) return;
+					boolean done = relaySyncService.fetchStateSnapshot(groupId);
+					// Re-check AFTER the fetch too: it blocks for up to 90s (Render
+					// cold start) — ample time for a group switch, a stopSync, or a
+					// connection drop. A stale task must not mark the old group caught
+					// up, and a fetch that started before a drop must not vouch for
+					// the record after the reconnect: peers may have changed it during
+					// the outage.
+					if (exec != syncExecutor || !groupId.equals(currentSyncGroupId)
+						|| epoch != connectionEpoch.get())
+					{
+						return;
+					}
+					if (done)
+					{
+						// Reconciled with the stored record — or the relay definitively
+						// has nothing usable for this group (no record, or one whose
+						// signature we reject). Both make publishing safe: overwriting a
+						// record we refused to APPLY isn't a rollback, it replaces
+						// unusable data with our signed state.
+						caughtUpGroupId = groupId;
+						// The check above and this write aren't atomic against a drop on
+						// the ws thread. Re-read the epoch and take the marker back if it
+						// moved, so a snapshot read before the drop can't vouch for the
+						// record after it.
+						if (epoch != connectionEpoch.get())
+						{
+							caughtUpGroupId = null;
+							return;
+						}
+						// Now push our own view, which the gate suppressed until this
+						// point. This is what carries changes made while we were offline
+						// up to the relay, and it replaces the unconditional push that
+						// used to run on reconnect before we knew what we were
+						// overwriting.
+						pushStateToRelay(groupId);
+					}
+					else if (attempt + 1 < CATCH_UP_RETRY_DELAYS_MS.length)
+					{
+						chainContinues = true;
+						scheduleCatchUpAttempt(groupId, attempt + 1,
+							CATCH_UP_RETRY_DELAYS_MS[attempt + 1], token, epoch);
+					}
+					else
+					{
+						// Still not reconciled. We stay silent rather than publish
+						// blind — pollForUpdates starts a fresh chain, so a relay that
+						// comes back later heals without needing a relog.
+						log.warn("Catch-up fetch for group {} failed after {} attempts; "
+							+ "not publishing until reconciled", groupId, attempt + 1);
+					}
 				}
-				else if (!done)
+				finally
 				{
-					log.warn("Catch-up fetch for group {} failed after {} attempts", groupId, attempt + 1);
+					if (!chainContinues)
+					{
+						catchUpOwner.compareAndSet(token, 0L);
+					}
 				}
 			}, delayMs, TimeUnit.MILLISECONDS);
 		}
 		catch (java.util.concurrent.RejectedExecutionException ignored)
 		{
 			// stopSync shut the executor down — nothing to catch up on anymore.
+			catchUpOwner.compareAndSet(token, 0L);
 		}
 	}
 
@@ -1373,6 +1479,52 @@ public class GroupService
 
 		currentSyncGroupId = null;
 		currentSyncPlayerName = null;
+		caughtUpGroupId = null;
+		// Any pending chain died with the executor; a held claim would block the
+		// next session's first catch-up. A stale task that later wakes can only
+		// CAS its own token, so force-clearing here is safe.
+		catchUpOwner.set(0L);
+	}
+
+	/**
+	 * Called the moment the relay websocket drops. The caught-up marker must die
+	 * HERE, not on reconnect: publishes already queued on the sync executor would
+	 * otherwise race the reconnect callback and slip through the gate with
+	 * pre-outage state. Bumping the epoch invalidates any catch-up fetch that
+	 * started on the old connection — what it read says nothing about what peers
+	 * stored during the outage.
+	 */
+	public void onRelayDisconnected()
+	{
+		caughtUpGroupId = null;
+		connectionEpoch.incrementAndGet();
+	}
+
+	/**
+	 * Called when the relay websocket (re)connects. A drop can span any amount of
+	 * time — Render idles the free tier out routinely — and members may have
+	 * changed things meanwhile, so we re-read the stored record before publishing
+	 * anything. The catch-up push replaces the straight announce that used to run
+	 * here. If a chain from before the drop still holds the claim, this no-ops —
+	 * that chain dies on its epoch check and the 5-second poll rescue restarts.
+	 */
+	public void onRelayConnected()
+	{
+		final String groupId = currentSyncGroupId;
+		if (groupId == null) return;
+		caughtUpGroupId = null;
+		// Bump on connect as well as disconnect: a fetch whose store-read happened
+		// BEFORE we joined the room missed anything peers pushed in between, so it
+		// must not vouch for the record either. Chains started below capture the
+		// new epoch and are unaffected.
+		connectionEpoch.incrementAndGet();
+		// Hand the claim to the fresh chain. A chain from the old connection may be
+		// asleep in a backoff of up to 160s, and waiting for it to wake and notice
+		// would hold every publish back that whole time. It can't corrupt anything
+		// on waking: the epoch check kills it, and its release is a compare-and-set
+		// on its own token, which no longer owns the claim.
+		catchUpOwner.set(0L);
+		scheduleCatchUpFetch(groupId);
 	}
 
 	public void setOnWildernessAlert(java.util.function.Consumer<SyncEvent> callback)
@@ -1528,6 +1680,12 @@ public class GroupService
 	{
 		if (relaySyncService == null || !relaySyncService.isConnected()) return;
 
+		// Never publish a group we haven't reconciled with since connecting. Every
+		// publish path funnels through here — user actions, the 5-minute heartbeat,
+		// and the reconnect announce — so this one check is what stops a stale local
+		// copy from overwriting the shared record for everyone.
+		if (!groupId.equals(caughtUpGroupId)) return;
+
 		LendingGroup group = groups.get(groupId);
 		if (group == null) return;
 
@@ -1660,6 +1818,19 @@ public class GroupService
 	{
 		if (currentSyncGroupId == null) return;
 
+		// If catch-up hasn't succeeded FOR THIS GROUP, the publish gate is holding
+		// our data back. Retry so a relay that was down at login (or exhausted its
+		// backoff) heals on its own instead of staying silent until the next relog.
+		// Compared against the current group, not just null: a marker left behind
+		// by a previous group would otherwise block the rescue while the gate
+		// blocks every publish — permanently silent. The in-flight flag inside
+		// scheduleCatchUpFetch keeps this 5-second tick from stacking chains.
+		if (!currentSyncGroupId.equals(caughtUpGroupId)
+			&& relaySyncService != null && relaySyncService.isConnected())
+		{
+			scheduleCatchUpFetch(currentSyncGroupId);
+		}
+
 		try
 		{
 			List<SyncEvent> events = loadEventsFromQueue();
@@ -1700,15 +1871,18 @@ public class GroupService
 			switch (event.getType())
 			{
 				case ITEM_RETURNED:
+					// Reload FIRST, then apply the return. The other order re-read the
+					// pre-return rows out of local config immediately after deleting
+					// them, restoring the loan this event exists to close.
+					if (currentSyncGroupId != null)
+					{
+						dataService.loadGroupData(currentSyncGroupId);
+					}
 					// Apply the return directly by entry id — cross-machine, our own
 					// config doesn't contain the change, so reloading isn't enough
 					if (event.getDataId() != null)
 					{
 						dataService.applyReturnedFromSync(event.getDataId());
-					}
-					if (currentSyncGroupId != null)
-					{
-						dataService.loadGroupData(currentSyncGroupId);
 					}
 					break;
 				case ITEM_ADDED:

@@ -116,15 +116,22 @@ public class LendingTrackerPlugin extends Plugin
 		relaySyncService.setOnConnectionChanged(status ->
 		{
 			if (newPanel != null) { newPanel.updateConnectionStatus(status); }
-			// When our own socket drops we can no longer vouch for anyone's presence.
-			if (!status && groupService.clearPresence() && newPanel != null)
+			if (!status)
 			{
-				newPanel.refreshRoster();
+				// Invalidate the publish gate's caught-up marker at DROP time, not
+				// reconnect time — a queued publish racing the reconnect callback
+				// could otherwise upload pre-outage state over peers' changes.
+				groupService.onRelayDisconnected();
+				// When our own socket drops we can no longer vouch for anyone's presence.
+				if (groupService.clearPresence() && newPanel != null)
+				{
+					newPanel.refreshRoster();
+				}
 			}
 		});
 		// Announce our roster the instant we (re)connect so a freshly joined
 		// member shows up for everyone immediately instead of after the periodic push.
-		relaySyncService.setOnConnected(() -> groupService.announcePresence());
+		relaySyncService.setOnConnected(() -> groupService.onRelayConnected());
 		// Relay-authoritative online status: a member is online iff they hold an open
 		// sync socket to the room, regardless of friends chat / friends list.
 		relaySyncService.setOnPresenceReceived(present ->
