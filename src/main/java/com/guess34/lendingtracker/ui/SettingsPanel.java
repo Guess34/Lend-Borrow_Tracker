@@ -34,6 +34,8 @@ public class SettingsPanel extends JPanel
 	private JButton openCloseJoinsButton, copyGroupCodeButton, customGroupCodeButton;
 	private JPanel groupCodePanel;
 	private JButton deleteGroupButton, leaveGroupButton, transferOwnershipButton;
+	private JButton transferFounderButton;
+	private JComboBox<String> transferFounderDropdown;
 	private JPanel membersListPanel, permissionsPanel, dangerZonePanel;
 	private JPanel contentPanel, notLoggedInPanel, inviteCodePanel, membersSection;
 	private JCheckBox coOwnerKickCb, adminKickCb, modKickCb;
@@ -463,6 +465,18 @@ public class SettingsPanel extends JPanel
 		transferOwnershipButton = dangerButton("Transfer Ownership", new Color(180, 100, 50));
 		transferOwnershipButton.addActionListener(e -> transferOwnership());
 		btns.add(transferOwnershipButton);
+
+		// Founder-only. Hidden from everyone else, owners included - the founder
+		// keeps authority at any rank, so this is the only way to hand it over and
+		// the only way a founder can then leave the group.
+		transferFounderDropdown = new JComboBox<>();
+		transferFounderDropdown.setFont(FontManager.getRunescapeSmallFont());
+		transferFounderDropdown.setAlignmentX(LEFT_ALIGNMENT);
+		transferFounderDropdown.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
+		btns.add(transferFounderDropdown);
+		transferFounderButton = dangerButton("Transfer Founder", new Color(150, 60, 120));
+		transferFounderButton.addActionListener(e -> transferFounder());
+		btns.add(transferFounderButton);
 		btns.add(Box.createVerticalStrut(5));
 
 		deleteGroupButton = dangerButton("Delete Group", DANGER_BORDER);
@@ -615,27 +629,127 @@ public class SettingsPanel extends JPanel
 		}
 	}
 
+	private void transferFounder()
+	{
+		LendingGroup g = groupService.getActiveGroup();
+		if (g == null) return;
+		String user = getCurrentUsername();
+		if (!groupService.isFounder(g.getId(), user)) return;
+		String target = (String) transferFounderDropdown.getSelectedItem();
+		if (target == null || target.startsWith("Select")) return;
+		if (JOptionPane.showConfirmDialog(this,
+			"<html>Make <b>" + escapeHtml(target) + "</b> the founder of '" + escapeHtml(g.getName()) + "'?"
+				+ "<br><br>You will lose founder authority permanently. This cannot be undone"
+				+ "<br>unless they transfer it back.</html>",
+			"Transfer Founder", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION)
+		{
+			return;
+		}
+		if (groupService.transferFounder(g.getId(), user, target))
+		{
+			JOptionPane.showMessageDialog(this, target + " is now the founder.",
+				"Founder Transferred", JOptionPane.INFORMATION_MESSAGE);
+			plugin.refreshPanel();
+		}
+		else
+		{
+			JOptionPane.showMessageDialog(this, "Transfer failed.", "Error", JOptionPane.ERROR_MESSAGE);
+		}
+	}
+
 	private void leaveGroup()
 	{
 		LendingGroup g = groupService.getActiveGroup();
 		if (g == null) return;
 		String user = getCurrentUsername();
-		if (groupService.isOwner(g.getId(), user))
+		// A group must always keep an owner, and always someone able to demote one.
+		// With several owners the rest may leave freely; the founder and the last
+		// remaining owner have to hand over first.
+		if (groupService.isFounder(g.getId(), user))
 		{
 			JOptionPane.showMessageDialog(this,
-				"As owner, you cannot leave.\nTransfer ownership or delete the group instead.",
+				"As the group founder, you cannot leave. Use Transfer Ownership first.",
 				"Cannot Leave", JOptionPane.WARNING_MESSAGE);
 			return;
 		}
+		if (groupService.isOwner(g.getId(), user) && groupService.countOwners(g) <= 1)
+		{
+			JOptionPane.showMessageDialog(this,
+				"You are the only owner, so you cannot leave. Transfer ownership, "
+					+ "promote another owner, or delete the group.",
+				"Cannot Leave", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+		// A leave that cannot be published would delete the group here and leave us
+		// a member everywhere else, with no local copy left to retry from. Refuse
+		// rather than lose it.
+		if (!groupService.canPublishRemoval(g.getId()))
+		{
+			JOptionPane.showMessageDialog(this,
+				"Still syncing with the group - try again in a moment.\n"
+					+ "Leaving now would not reach the other members.",
+				"Not Synced Yet", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+
+		// Nobody leaves owing anything, or owed anything. Settling has to happen
+		// first — the only way out with an open loan is to be removed by staff.
+		java.util.List<com.guess34.lendingtracker.model.LendingEntry> unsettled =
+			plugin.getDataService().getUnsettledFor(g.getId(), user);
+		if (!unsettled.isEmpty())
+		{
+			StringBuilder sb = new StringBuilder("<html><b>You can't leave '")
+				.append(g.getName()).append("' yet.</b><br><br>")
+				.append("These are still open:<br><ul>");
+			int shown = 0;
+			for (com.guess34.lendingtracker.model.LendingEntry e : unsettled)
+			{
+				if (shown++ == 8)
+				{
+					sb.append("<li>…and ").append(unsettled.size() - 8).append(" more</li>");
+					break;
+				}
+				boolean lending = user.equalsIgnoreCase(e.getLender());
+				String who = lending ? e.getBorrower() : e.getLender();
+				sb.append("<li>").append(escapeHtml(e.getItemName()))
+					.append(lending ? " — lent to " : " — borrowed from ")
+					.append(escapeHtml(who));
+				if (!e.outstandingCollateralIds().isEmpty() || e.outstandingCollateralGp() > 0)
+				{
+					sb.append(lending ? " (you still hold their collateral)"
+						: " (your collateral is still held)");
+				}
+				sb.append("</li>");
+			}
+			sb.append("</ul>Settle these first, or ask a staff member to remove you.</html>");
+			JOptionPane.showMessageDialog(this, sb.toString(),
+				"Outstanding Loans", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+
 		if (JOptionPane.showConfirmDialog(this,
-			String.format("Leave '%s'?\nYou'll need a new invite to rejoin.", g.getName()),
+			String.format("Leave '%s'?\nYour marketplace listings and open requests will be removed.\n"
+				+ "You'll need a new invite to rejoin.", g.getName()),
 			"Confirm Leave", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION)
 		{
-			groupService.removeMember(g.getId(), user);
-			JOptionPane.showMessageDialog(this, "You have left '" + g.getName() + "'.",
+			String groupId = g.getId();
+			String groupName = g.getName();
+			// Clear our footprint BEFORE leaving: once removeMember drops the group
+			// locally there's nothing left to publish the cleanup from.
+			plugin.getDataService().removeItemsForLender(groupId, user);
+			plugin.getDataService().removeRequestsInvolving(groupId, user);
+			groupService.removeMember(groupId, user);
+			JOptionPane.showMessageDialog(this, "You have left '" + groupName + "'.",
 				"Left Group", JOptionPane.INFORMATION_MESSAGE);
 			plugin.refreshPanel();
 		}
+	}
+
+	/** Minimal escaping so a player or item name can't break the HTML dialog. */
+	private static String escapeHtml(String s)
+	{
+		if (s == null) return "";
+		return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
 	}
 
 	private void deleteGroup()
@@ -643,9 +757,9 @@ public class SettingsPanel extends JPanel
 		LendingGroup g = groupService.getActiveGroup();
 		if (g == null) return;
 		String user = getCurrentUsername();
-		if (!groupService.isOwner(g.getId(), user))
+		if (!groupService.isOwner(g.getId(), user) && !groupService.isFounder(g.getId(), user))
 		{
-			JOptionPane.showMessageDialog(this, "Only the owner can delete the group!",
+			JOptionPane.showMessageDialog(this, "Only an owner can delete the group!",
 				"Permission Denied", JOptionPane.ERROR_MESSAGE);
 			return;
 		}
@@ -659,9 +773,16 @@ public class SettingsPanel extends JPanel
 		String groupName = g.getName();
 		try
 		{
-			plugin.getDataService().clearGroupData(groupId);
-			plugin.getDataService().clearItemSetData(groupId);
-			groupService.deleteGroup(groupId);
+			// deleteGroup owns the whole sequence now: it stops sync FIRST, then clears
+			// the data. Clearing here published an empty snapshot that wiped the group
+			// for every other member.
+			if (!groupService.deleteGroup(groupId))
+			{
+				JOptionPane.showMessageDialog(this,
+					"Still syncing with the group - try again in a moment.",
+					"Not Synced Yet", JOptionPane.WARNING_MESSAGE);
+				return;
+			}
 			JOptionPane.showMessageDialog(this, "Group '" + groupName + "' deleted.",
 				"Deleted", JOptionPane.INFORMATION_MESSAGE);
 			plugin.refreshPanel();
@@ -770,13 +891,35 @@ public class SettingsPanel extends JPanel
 				kick.setBorderPainted(false);
 				kick.setPreferredSize(new Dimension(50, 22));
 				kick.addActionListener(e -> {
-					if (JOptionPane.showConfirmDialog(this,
-						"Kick " + member.getName() + " from the group?",
+					// Staff can still remove someone who owes something - that is the
+					// point of a kick - but say so plainly, because the debt does not
+					// disappear along with them.
+					java.util.List<com.guess34.lendingtracker.model.LendingEntry> owed =
+						plugin.getDataService().getUnsettledFor(groupId, member.getName());
+					String kickPrompt = owed.isEmpty()
+						? "Kick " + member.getName() + " from the group?"
+						: "<html><b>" + escapeHtml(member.getName()) + " has " + owed.size()
+							+ " unsettled loan" + (owed.size() == 1 ? "" : "s") + ".</b><br><br>"
+							+ "Kicking removes them from the group but does NOT settle those.<br>"
+							+ "Their listings and open requests will be deleted.<br><br>"
+							+ "Kick anyway?</html>";
+					if (JOptionPane.showConfirmDialog(this, kickPrompt,
 						"Confirm Kick", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION)
 					{
+						if (!groupService.canPublishRemoval(groupId))
+						{
+							JOptionPane.showMessageDialog(this,
+								"Still syncing with the group - try again in a moment.",
+								"Not Synced Yet", JOptionPane.WARNING_MESSAGE);
+							return;
+						}
+						// Clear their footprint FIRST so the removal snapshot already
+						// excludes it - cleaning up afterwards published a snapshot that
+						// still contained everything.
+						plugin.getDataService().removeItemsForLender(groupId, member.getName());
+						plugin.getDataService().removeRequestsInvolving(groupId, member.getName());
 						if (groupService.removeMemberFromGroup(groupId, currentUser, member.getName()))
 						{
-							plugin.getDataService().removeItemsForLender(groupId, member.getName());
 							plugin.refreshPanel();
 						}
 						else
@@ -832,7 +975,12 @@ public class SettingsPanel extends JPanel
 			else
 			{
 				add(scrollPane, BorderLayout.CENTER);
-				boolean isOwner = groupService.isOwner(g.getId(), currentUser);
+				// The founder holds full control whatever rank they display as, so the
+				// panel has to offer them the owner-level controls - otherwise their
+				// authority exists in the service layer with no way to exercise it. Only
+				// they see their own panel, so this reveals nothing to other members.
+				boolean isOwner = groupService.isOwner(g.getId(), currentUser)
+					|| groupService.isFounder(g.getId(), currentUser);
 				boolean isCoOwner = groupService.isCoOwner(g.getId(), currentUser);
 				boolean isAdmin = groupService.isAdmin(g.getId(), currentUser);
 				boolean isMod = groupService.isMod(g.getId(), currentUser);
@@ -982,8 +1130,26 @@ public class SettingsPanel extends JPanel
 			dangerZonePanel.setVisible(true);
 			deleteGroupButton.setEnabled(isOwner);
 			deleteGroupButton.setVisible(isOwner);
-			leaveGroupButton.setEnabled(!isOwner);
-			leaveGroupButton.setVisible(!isOwner);
+			// Owners may leave now, unless they are the founder or the last owner
+			// standing. leaveGroup() spells out which rule applies.
+			boolean cannotLeave = groupService.isFounder(g.getId(), currentUser)
+				|| (isOwner && groupService.countOwners(g) <= 1);
+			leaveGroupButton.setEnabled(!cannotLeave);
+			leaveGroupButton.setVisible(!cannotLeave);
+			boolean isFounder = groupService.isFounder(g.getId(), currentUser);
+			transferFounderButton.setVisible(isFounder);
+			transferFounderButton.setEnabled(isFounder);
+			transferFounderDropdown.setVisible(isFounder);
+			transferFounderDropdown.setEnabled(isFounder);
+			if (isFounder)
+			{
+				transferFounderDropdown.removeAllItems();
+				transferFounderDropdown.addItem("Select member...");
+				for (com.guess34.lendingtracker.model.GroupMember m : g.getMembers())
+				{
+					if (!m.getName().equalsIgnoreCase(currentUser)) transferFounderDropdown.addItem(m.getName());
+				}
+			}
 			transferOwnershipButton.setEnabled(isOwner);
 			transferOwnershipButton.setVisible(isOwner);
 			transferOwnerDropdown.setEnabled(isOwner);

@@ -1454,6 +1454,7 @@ public class LendingTrackerPlugin extends Plugin
 	public GroupService getGroupService() { return groupService; }
 	public ProofScreenshot getProofScreenshot() { return proofScreenshot; }
 	public boolean isRelaySyncConnected() { return relaySyncService != null && relaySyncService.isConnected(); }
+	public boolean isRelaySyncConnecting() { return relaySyncService != null && relaySyncService.isConnecting(); }
 	public LendingTrackerConfig getConfig() { return config; }
 
 	@Provides

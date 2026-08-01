@@ -95,6 +95,19 @@ public class LendingEntry {
         return collateralValue != null && "GP".equals(collateralType) ? Math.max(0, collateralValue) : 0;
     }
 
+    /**
+     * Close out every running tally. Archiving sets returnedAt, but the
+     * outstanding accessors only fall back to the returned-means-zero shortcut
+     * when the field is NULL - so a partially-returned loan archived with 2 still
+     * outstanding reported 2 forever, and anything asking "is this settled?" said
+     * no for the rest of time. Call this wherever an entry is archived.
+     */
+    public void markSettled() {
+        this.lentOutstanding = 0;
+        this.collateralOutstandingIds = "";
+        this.collateralGpOutstanding = 0L;
+    }
+
     /** True when nothing is outstanding on EITHER side — item home AND collateral home. */
     public boolean isFullySettled() {
         return outstandingLentQty() == 0

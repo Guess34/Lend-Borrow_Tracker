@@ -166,7 +166,12 @@ public class LendingPanel extends PluginPanel
 			}
 			if (connectionLabel != null)
 			{
-				connectionLabel.setText(connected ? "Synced" : "Offline");
+				// "Offline" is wrong while a reconnect is in flight - the relay sleeps
+				// after 15 minutes idle, so a wake can take up to a minute and the
+				// plugin looked broken for the whole of it.
+				String text = connected ? "Synced"
+					: (plugin.isRelaySyncConnecting() ? "Connecting..." : "Offline");
+				connectionLabel.setText(text);
 				connectionLabel.setForeground(connected
 					? new Color(0, 200, 0) : ColorScheme.LIGHT_GRAY_COLOR);
 			}

@@ -354,16 +354,12 @@ public class RosterPanel extends JPanel
 	{
 		JPopupMenu popup = new JPopupMenu();
 
-		// View Activity
-		JMenuItem viewActivity = new JMenuItem("View Activity");
-		viewActivity.addActionListener(e ->
-		{
-			JOptionPane.showMessageDialog(this,
-				"Activity history for " + member.getName() + "\n(Switch to Log tab for full history)",
-				"Player Activity",
-				JOptionPane.INFORMATION_MESSAGE);
-		});
-		popup.add(viewActivity);
+		// "View Activity" lived here. It only ever opened a dialog telling you to
+		// open a "Log tab" that does not exist (the tab is History), and it could not
+		// have worked anyway: HistoryPanel shows only the local player's own history,
+		// has no per-player filter, and other members' completed loans are never
+		// transmitted - only bare tombstone ids are. Removed rather than left as a
+		// dead end. Reinstating it needs completed loans to actually sync.
 
 		// Show world info for online players (informational, not actionable)
 		if (isOnline && world > 0)
@@ -373,6 +369,10 @@ public class RosterPanel extends JPanel
 			popup.add(worldInfo);
 		}
 
+		// With View Activity gone the only entry is the world label, which appears
+		// for online members only - showing an empty popup on right-click would look
+		// broken, so suppress it.
+		if (popup.getComponentCount() == 0) return;
 		popup.show(component, x, y);
 	}
 

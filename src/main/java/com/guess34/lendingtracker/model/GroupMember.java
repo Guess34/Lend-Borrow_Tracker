@@ -18,9 +18,18 @@ public class GroupMember {
     // any tombstone wins for them (correct - they joined before any kick).
     private long joinedAt;
 
+    // When this member's ROLE last changed, epoch millis. Roles used to ride the
+    // single whole-roster stamp, so a demoted owner whose client had not seen the
+    // demotion would republish their old role and the newer roster stamp would
+    // restore it - undoing the demotion for everyone. Versioning each row means a
+    // stale republish loses to the change it never saw. 0 on members saved before
+    // this existed, so any explicit role change beats them.
+    private long roleUpdatedAt;
+
     public GroupMember(String name, String role) {
         this.name = name;
         this.role = role;
         this.joinedAt = System.currentTimeMillis();
+        this.roleUpdatedAt = System.currentTimeMillis();
     }
 }

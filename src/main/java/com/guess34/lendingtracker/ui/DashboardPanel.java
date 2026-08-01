@@ -216,11 +216,25 @@ public class DashboardPanel extends JPanel
 			}
 
 			// Get active loans (items currently lent out)
-			List<LendingEntry> activeLoans = dataService.getActiveEntries();
-			if (activeLoans == null)
+			List<LendingEntry> allActiveLoans = dataService.getActiveEntries();
+			if (allActiveLoans == null)
 			{
-				activeLoans = java.util.Collections.emptyList();
+				allActiveLoans = java.util.Collections.emptyList();
 			}
+			// A loan belongs to the group it was made in. Loans from OTHER groups are
+			// still shown, but separately and only to the two parties - a personal
+			// reminder, not this group's business. Nobody else can see them either way:
+			// the published snapshot is filtered by groupId.
+			final String activeGroupId = groupId;
+			final String selfName = getCurrentPlayerName();
+			List<LendingEntry> activeLoans = allActiveLoans.stream()
+				.filter(e -> activeGroupId != null && activeGroupId.equals(e.getGroupId()))
+				.collect(java.util.stream.Collectors.toList());
+			List<LendingEntry> otherGroupLoans = allActiveLoans.stream()
+				.filter(e -> activeGroupId == null || !activeGroupId.equals(e.getGroupId()))
+				.filter(e -> selfName != null
+					&& (selfName.equalsIgnoreCase(e.getLender()) || selfName.equalsIgnoreCase(e.getBorrower())))
+				.collect(java.util.stream.Collectors.toList());
 
 			// Calculate summary stats from both marketplace and loans
 			long totalMarketplaceValue = marketplaceItems.stream()
@@ -329,6 +343,31 @@ public class DashboardPanel extends JPanel
 				}
 			}
 
+			// Loans living in another group - shown to the lender/borrower only, so an
+			// outstanding item is not forgotten just because a different group is
+			// selected. Labelled with its group so it cannot be mistaken for this one.
+			if (!otherGroupLoans.isEmpty())
+			{
+				boolean otherCollapsed = collapsedSections.contains("otherloans");
+				JPanel otherHeader = createCollapsibleHeader(
+					"Your Loans in Other Groups (" + otherGroupLoans.size() + ")",
+					Color.GRAY, "otherloans", otherCollapsed);
+				loanListPanel.add(otherHeader);
+				if (!otherCollapsed)
+				{
+					for (LendingEntry loan : otherGroupLoans)
+					{
+						String ownerGroup = groupService.getGroupNameById(loan.getGroupId());
+						JLabel tag = new JLabel(ownerGroup != null ? ownerGroup : "another group");
+						tag.setFont(FontManager.getRunescapeSmallFont());
+						tag.setForeground(Color.GRAY);
+						tag.setBorder(new EmptyBorder(2, 6, 0, 0));
+						loanListPanel.add(tag);
+						loanListPanel.add(new LoanCard(loan, true));
+					}
+				}
+			}
+
 			// Then show active loans
 			if (!activeLoans.isEmpty())
 			{
@@ -351,7 +390,7 @@ public class DashboardPanel extends JPanel
 
 			// If all sections are empty, show empty state
 			if (displayItems.isEmpty() && lookingForRequests.isEmpty() && activeLoans.isEmpty()
-				&& incomingRequests.isEmpty() && outgoingRequests.isEmpty())
+				&& incomingRequests.isEmpty() && outgoingRequests.isEmpty() && otherGroupLoans.isEmpty())
 			{
 				String message = (groupId == null || groupId.isEmpty())
 					? "<html><center>No group selected<br><br>Select or create a group to start</center></html>"
@@ -710,6 +749,16 @@ public class DashboardPanel extends JPanel
 
 		public LoanCard(LendingEntry loan)
 		{
+			this(loan, false);
+		}
+
+		/**
+		 * readOnly suppresses the action menu. Loans shown from ANOTHER group are a
+		 * reminder only - offering this group's actions on them would act on a loan
+		 * that does not belong here, and expose its details through those menus.
+		 */
+		public LoanCard(LendingEntry loan, boolean readOnly)
+		{
 			this.loan = loan;
 
 			setLayout(new BorderLayout(10, 0));
@@ -797,7 +846,10 @@ public class DashboardPanel extends JPanel
 			LoanTooltip.apply(loan, this, iconLabel, detailsPanel, itemLabel,
 				borrowerLabel, dueTimeLabel, valuePanel, valueLabel);
 
-			setComponentPopupMenu(buildLoanMenu());
+			if (!readOnly)
+			{
+				setComponentPopupMenu(buildLoanMenu());
+			}
 			addHoverEffect(this, ColorScheme.DARKER_GRAY_HOVER_COLOR, ColorScheme.DARKER_GRAY_COLOR, detailsPanel, valuePanel);
 		}
 
@@ -1547,7 +1599,10 @@ public class DashboardPanel extends JPanel
 						.append(":").append(item.quantity).append(":").append(item.value);
 				}
 				String groupId = activeGroup.getId();
-				String requestId = String.valueOf(System.currentTimeMillis());
+				// Millisecond timestamps collide: two requests made in the same
+				// millisecond shared an id and silently overwrote each other.
+				// Existing ids stay readable - nothing parses this back to a number.
+				String requestId = java.util.UUID.randomUUID().toString();
 				saveLookingForRequest(groupId, requestId, String.format("%s|%s|%d|%d|%s|%s",
 					finalCurrentPlayer, displayName, items.size(), duration, notes, itemsStr.toString()));
 				long totalValue = items.stream().mapToLong(it -> it.value * it.quantity).sum();
@@ -1602,8 +1657,17 @@ public class DashboardPanel extends JPanel
 
 			if (requestIdsStr != null && !requestIdsStr.isEmpty())
 			{
-				String[] requestIds = requestIdsStr.split(",");
-				for (String requestId : requestIds)
+				// Dedupe on read as well as on save: configs written before the upsert
+				// fix already hold repeated ids, and without this they keep rendering as
+				// duplicate cards until that request happens to be saved again. Reading
+				// through a set makes existing damage self-heal.
+				java.util.Set<String> seenIds = new java.util.LinkedHashSet<>();
+				for (String rawId : requestIdsStr.split(","))
+				{
+					String t = rawId.trim();
+					if (!t.isEmpty()) seenIds.add(t);
+				}
+				for (String requestId : seenIds)
 				{
 					String requestKey = "lookingFor." + groupId + "." + requestId;
 					String requestData = plugin.getConfigManager().getConfiguration("lendingtracker", requestKey);
@@ -1639,22 +1703,38 @@ public class DashboardPanel extends JPanel
 		String requestIdsKey = "lookingForIds." + groupId;
 		String existingIds = plugin.getConfigManager().getConfiguration("lendingtracker", requestIdsKey);
 
-		String newIds;
-		if (existingIds == null || existingIds.isEmpty())
+		// Editing an existing request calls this with the SAME id. Appending it
+		// unconditionally listed that id twice, so the panel drew the request once
+		// per copy - and deleting any one of them removed the single underlying
+		// record, making every copy vanish at once.
+		java.util.List<String> ids = new java.util.ArrayList<>();
+		if (existingIds != null && !existingIds.isEmpty())
 		{
-			newIds = requestId;
+			for (String id : existingIds.split(","))
+			{
+				String trimmed = id.trim();
+				if (!trimmed.isEmpty() && !ids.contains(trimmed)) ids.add(trimmed);
+			}
 		}
-		else
-		{
-			newIds = existingIds + "," + requestId;
-		}
-		plugin.getConfigManager().setConfiguration("lendingtracker", requestIdsKey, newIds);
+		if (!ids.contains(requestId)) ids.add(requestId);
+		plugin.getConfigManager().setConfiguration("lendingtracker", requestIdsKey,
+			String.join(",", ids));
 
 		// Also update in-memory cache for immediate display
 		LookingForRequest newRequest = LookingForRequest.parse(requestId, requestData);
 		if (newRequest != null)
 		{
-			lookingForCache.computeIfAbsent(groupId, k -> new java.util.ArrayList<>()).add(newRequest);
+			// Replace in place when this id is already cached; appending would leave
+			// the stale copy next to the edited one, and the cache is what the panel
+			// displays ("source of truth once populated").
+			java.util.List<LookingForRequest> cached =
+				lookingForCache.computeIfAbsent(groupId, k -> new java.util.ArrayList<>());
+			int at = -1;
+			for (int i = 0; i < cached.size(); i++)
+			{
+				if (cached.get(i) != null && requestId.equals(cached.get(i).id)) { at = i; break; }
+			}
+			if (at >= 0) cached.set(at, newRequest); else cached.add(newRequest);
 		}
 	}
 

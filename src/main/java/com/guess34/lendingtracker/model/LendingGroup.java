@@ -51,6 +51,21 @@ public class LendingGroup {
     // stale roster can't erase someone who just joined on another client.
     private long membersUpdatedAt;
 
+    // The player who created this group. A group may have up to 5 owners, and
+    // owners can promote each other but never DEMOTE each other - without a
+    // founder a single rogue owner could promote allies without limit and nobody
+    // could undo it. The founder is the one member who can demote an owner, and
+    // cannot themselves be demoted. Null on groups made before this existed;
+    // backfilled to the sole owner on load.
+    private String founderName;
+
+    // Version stamp for founderName alone. It must NOT ride membersUpdatedAt: that
+    // is bumped by every roster action (join, kick, role change, permission toggle,
+    // invite redemption), so a peer who merely flipped a checkbox would out-stamp a
+    // founder transfer and silently restore the previous founder. Set only where the
+    // founder actually changes.
+    private long founderUpdatedAt;
+
     // ADDED: Shared secret for HMAC-SHA256 message signing on relay sync
     private String syncSecret;
 
@@ -160,16 +175,21 @@ public class LendingGroup {
     }
 
     /** Record a kick tombstone so the removal propagates across machines. */
+    /** Names appear with spaces or underscores; key tombstones on one form. */
+    private static String nameKey(String s) {
+        return s == null ? null : s.toLowerCase().replace('_', ' ').trim();
+    }
+
     public void recordRemoval(String memberName) {
         if (memberName == null || memberName.isEmpty()) return;
         if (removedMembers == null) removedMembers = new HashMap<>();
-        removedMembers.put(memberName.toLowerCase(), System.currentTimeMillis());
+        removedMembers.put(nameKey(memberName), System.currentTimeMillis());
     }
 
     /** Drop the kick tombstone for a name (member re-joined). */
     public void clearRemoval(String memberName) {
         if (memberName == null || removedMembers == null) return;
-        removedMembers.remove(memberName.toLowerCase());
+        removedMembers.remove(nameKey(memberName));
     }
 
     /** Null-safe view of the kick tombstones (name may predate this field in saved data). */

@@ -113,6 +113,19 @@ public class RelaySyncService
 
 	// --- Connection Lifecycle ---
 
+	/**
+	 * True while a connection attempt is in flight or a retry is queued. The relay
+	 * sleeps after 15 minutes idle and takes 30-60s to wake, so reporting a flat
+	 * "Offline" during that window made a perfectly healthy setup look broken.
+	 */
+	public boolean isConnecting()
+	{
+		synchronized (connLock)
+		{
+			return !connected && !intentionalClose && (webSocket != null || pendingReconnect != null);
+		}
+	}
+
 	public void connect()
 	{
 		if (config == null || !config.enableRelaySync()) return;
@@ -595,7 +608,31 @@ public class RelaySyncService
 	 * the server". The old String-returning lookupInviteCode collapsed both into null, so a
 	 * cold-start timeout looked identical to a genuinely invalid code.
 	 */
+	/**
+	 * Joining hits a single blocking call, and the relay sleeps after 15 minutes
+	 * idle - so the first person to touch it waits out a 30-60s cold start. One
+	 * attempt meant a join simply failed while the server was waking up. Retry a
+	 * few times before giving up; only a genuinely unreachable relay should read
+	 * as unreachable.
+	 */
 	public InviteLookupResult lookupInvite(String code)
+	{
+		// No sleep between attempts: Thread.sleep is not permitted in Plugin Hub
+		// plugins, and the REST client already carries a 30s connect / 60s read
+		// timeout which holds the request open right through a Render cold start.
+		// Retrying immediately covers the case where the first call fails outright
+		// (socket refused while the instance is still spinning up) rather than
+		// waiting - the same pattern publishInviteBlocking already uses.
+		InviteLookupResult result = lookupInviteOnce(code);
+		for (int attempt = 1; attempt < 4 && result.status == InviteStatus.UNREACHABLE; attempt++)
+		{
+			log.debug("Invite lookup retry {} (relay may be cold-starting)", attempt);
+			result = lookupInviteOnce(code);
+		}
+		return result;
+	}
+
+	private InviteLookupResult lookupInviteOnce(String code)
 	{
 		if (config == null || !config.enableRelaySync()) return new InviteLookupResult(InviteStatus.UNREACHABLE, null);
 

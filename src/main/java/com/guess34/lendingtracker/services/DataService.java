@@ -8,6 +8,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import net.runelite.client.config.ConfigManager;
@@ -597,6 +598,72 @@ public class DataService
 		return new ArrayList<>(historyEntries);
 	}
 
+	/**
+	 * Loans in this group that still owe something in either direction and that
+	 * the named player is a party to — as lender or borrower.
+	 *
+	 * Uses isFullySettled() rather than isReturned() on purpose: a loan can have
+	 * the item home while the lender still holds collateral, and walking away
+	 * from that is exactly what this is meant to prevent. History is checked too,
+	 * as a safety net in case any path archives an entry before it settles.
+	 */
+	public List<LendingEntry> getUnsettledFor(String groupId, String playerName)
+	{
+		if (groupId == null || playerName == null)
+		{
+			return new ArrayList<>();
+		}
+		Map<String, LendingEntry> byId = new LinkedHashMap<>();
+		Stream.concat(allEntries.values().stream(), historyEntries.stream())
+			.filter(e -> e != null && groupId.equals(e.getGroupId()))
+			.filter(e -> playerName.equalsIgnoreCase(e.getLender())
+				|| playerName.equalsIgnoreCase(e.getBorrower()))
+			.filter(e -> !e.isFullySettled())
+			.forEach(e -> byId.putIfAbsent(e.getId(), e));
+		return new ArrayList<>(byId.values());
+	}
+
+	/**
+	 * Drop every request this player is a party to when they leave or are removed.
+	 * Both directions matter: a request addressed TO someone who is gone leaves
+	 * the other party waiting on a reply that can never come.
+	 */
+	public int removeRequestsInvolving(String groupId, String playerName)
+	{
+		if (groupId == null || playerName == null)
+		{
+			return 0;
+		}
+		List<LendingRequest> requests = groupRequests.get(groupId);
+		if (requests == null)
+		{
+			return 0;
+		}
+		int removed;
+		synchronized (requests)
+		{
+			int before = requests.size();
+			requests.removeIf(r -> r != null
+				&& (playerName.equalsIgnoreCase(r.getFrom()) || playerName.equalsIgnoreCase(r.getTo())));
+			removed = before - requests.size();
+		}
+		if (removed > 0)
+		{
+			persist(groupId, "requests");
+			saveEntries();
+			// Publish, or the deletion never leaves this machine and peers keep the
+			// dangling requests. NOTE: mergeRequests is a union by id with no delete
+			// semantics, so a peer that still holds them can merge them back - request
+			// tombstones are R3 work. This at least stops OUR copy being the source.
+			if (groupService != null)
+			{
+				groupService.publishEvent(GroupService.SyncEventType.ITEM_UPDATED,
+					groupId + ":requests", null);
+			}
+		}
+		return removed;
+	}
+
 	public int removeOldHistoryEntries(long olderThanMs)
 	{
 		int sizeBefore = historyEntries.size();
@@ -658,7 +725,8 @@ public class DataService
 				entry.setReturnedAt(Instant.now().toEpochMilli());
 			}
 			entry.setUpdatedAt(System.currentTimeMillis());
-			historyEntries.add(new LendingEntry(entry));
+			entry.markSettled();
+		historyEntries.add(new LendingEntry(entry));
 			if (returned)
 			{
 				allEntries.remove(entryId);
@@ -718,6 +786,7 @@ public class DataService
 		entry.setNotes(entry.getNotes() == null || entry.getNotes().isEmpty()
 			? stamp : entry.getNotes() + " " + stamp);
 
+		entry.markSettled();
 		historyEntries.add(new LendingEntry(entry));
 		allEntries.remove(entryId);
 		removeEntryFromCategory(groupLent, entryId);
@@ -770,6 +839,7 @@ public class DataService
 		entry.setNotes(entry.getNotes() == null || entry.getNotes().isEmpty()
 			? auditStamp : entry.getNotes() + " " + auditStamp);
 
+		entry.markSettled();
 		historyEntries.add(new LendingEntry(entry));
 		allEntries.remove(entryId);
 		removeEntryFromCategory(groupLent, entryId);
@@ -914,6 +984,13 @@ public class DataService
 		groupLent.remove(groupId);
 		groupBorrowed.remove(groupId);
 		groupAvailable.remove(groupId);
+		// Also purge the flat stores, or the deleted group's loans stay in allEntries:
+		// borrowed-item guards keep firing and overdue alerts keep arriving for a group
+		// that no longer exists anywhere in the UI.
+		allEntries.values().removeIf(e -> e != null && groupId.equals(e.getGroupId()));
+		historyEntries.removeIf(e -> e != null && groupId.equals(e.getGroupId()));
+		groupRequests.remove(groupId);
+		saveEntries();
 		configManager.unsetConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId);
 		if (groupService != null)
 		{
@@ -1229,6 +1306,14 @@ public class DataService
 			{
 				continue;
 			}
+			// A group's snapshot may only carry that group's loans. Publishers already
+			// filter on the way out, so anything else here is a stale or malformed
+			// peer — accepting it would file another group's loan under this one and
+			// expose it to members who have no business seeing it.
+			if (remote.getGroupId() != null && !groupId.equals(remote.getGroupId()))
+			{
+				continue;
+			}
 			if (applyRemoteEntry(remote))
 			{
 				changed = true;
@@ -1261,6 +1346,10 @@ public class DataService
 			boolean changed = false;
 			if (!alreadyInHistory)
 			{
+				// Settle it here too, or an un-updated peer republishing a partially
+				// returned loan reintroduces the never-settles condition on a client
+				// that already migrated.
+				remote.markSettled();
 				historyEntries.add(remote);
 				changed = true;
 			}
@@ -1359,7 +1448,8 @@ public class DataService
 			{
 				entry.setReturnedAt(Instant.now().toEpochMilli());
 			}
-			historyEntries.add(new LendingEntry(entry));
+			entry.markSettled();
+		historyEntries.add(new LendingEntry(entry));
 		}
 		return true;
 	}
@@ -1506,6 +1596,30 @@ public class DataService
 				if (loaded != null)
 				{
 					historyEntries.addAll(loaded);
+					// One-time migration. Builds before markSettled archived partially
+					// returned loans with their tallies intact, so isFullySettled() stayed
+					// false forever - and getUnsettledFor would refuse to let those members
+					// leave, listing a loan they had already closed, for at least the 30-day
+					// retention window. Anything archived is settled by definition.
+					boolean migrated = false;
+					for (LendingEntry h : historyEntries)
+					{
+						// Being in historyEntries IS the archive predicate - do not also
+						// require isReturned(). A row archived without returnedAt would
+						// otherwise stay unsettled forever and block leaving permanently,
+						// which is the exact failure this migration exists to clear.
+						if (h != null && !h.isFullySettled())
+						{
+							if (!h.isReturned()) h.setReturnedAt(System.currentTimeMillis());
+							h.markSettled();
+							migrated = true;
+						}
+					}
+					if (migrated)
+					{
+						log.debug("Settled legacy history entries that could never clear");
+						saveEntries();
+					}
 				}
 			}
 		}

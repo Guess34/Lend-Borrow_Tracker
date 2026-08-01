@@ -232,6 +232,8 @@ public class GroupService
 		LendingGroup g = new LendingGroup(id, name, description);
 
 		GroupMember owner = new GroupMember(ownerName, "owner");
+		g.setFounderName(ownerName);
+		g.setFounderUpdatedAt(System.currentTimeMillis());
 		g.addMember(owner);
 		touchRoster(g);
 
@@ -242,15 +244,60 @@ public class GroupService
 		return id;
 	}
 
-	public void deleteGroup(String id)
+	/**
+	 * Delete our copy of a group. Returns false when the departure could not be
+	 * published - deleting silently would leave us a live member (and possibly the
+	 * founder) of a group we no longer hold, with no local copy to fix it from.
+	 */
+	public boolean deleteGroup(String id)
 	{
+		LendingGroup doomed = groups.get(id);
+		String self = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
+		if (doomed != null && self != null && doomed.hasMember(self))
+		{
+			if (!canPublishRemoval(id)) return false;
+			dataService.removeItemsForLender(id, self);
+			dataService.removeRequestsInvolving(id, self);
+			doomed.getMembers().removeIf(m -> m.getName().equalsIgnoreCase(self));
+			doomed.recordRemoval(self);
+			touchRoster(doomed);
+			publishEvent(SyncEventType.MEMBER_LEFT, id + ":" + self, null);
+		}
+		// Stop syncing FIRST. Clearing the group while still caught up lets a later
+		// push publish an empty snapshot, which overwrites the stored catch-up record
+		// on the relay and wipes the group for every remaining member.
+		// Capture before stopSync nulls it - the replacement group needs it.
+		String me = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
+		// Clear the DATA here, after sync has stopped - not in the caller. Doing it
+		// first published an empty snapshot (clearGroupData fires ITEM_REMOVED, which
+		// pushes state while still caught up), overwriting the stored record and
+		// wiping the group for every remaining member.
+		if (id != null && id.equals(currentSyncGroupId))
+		{
+			stopSync();
+		}
+		if (dataService != null)
+		{
+			dataService.clearGroupData(id);
+			dataService.clearItemSetData(id);
+		}
 		groups.remove(id);
+		String replacement = null;
 		if (Objects.equals(activeGroupId, id))
 		{
 			activeGroupId = groups.isEmpty() ? null : groups.keySet().iterator().next();
+			replacement = activeGroupId;
 			saveActiveGroup();
 		}
 		saveGroups();
+		// Same omission the leave path had: without this the client sits on a group
+		// that is selected but neither loaded nor syncing, until the user relogs.
+		if (replacement != null && me != null)
+		{
+			dataService.loadGroupData(replacement);
+			startSync(replacement, me);
+		}
+		return true;
 	}
 
 	public LendingGroup getGroup(String id)
@@ -366,7 +413,7 @@ public class GroupService
 				// Don't adopt a member who was kicked after they joined — that's a
 				// stale roster echoing someone we removed. (A re-join carries a
 				// fresh joinedAt newer than the tombstone, so it survives.)
-				Long removedAt = tombstones.get(rm.getName().toLowerCase());
+				Long removedAt = tombstones.get(nameKey(rm.getName()));
 				if (removedAt != null && removedAt > rm.getJoinedAt())
 				{
 					continue;
@@ -379,9 +426,21 @@ public class GroupService
 				{
 					merged.add(rm);
 				}
-				else if (remoteIsNewer && rm.getRole() != null)
+				// Strict > only. Treating a remote 0 as "unversioned, defer to the roster
+				// stamp" let any peer holding a legacy row overwrite a REAL stamp with 0,
+				// zeroing the whole group within one sync round and switching per-row
+				// versioning back off. loadGroups now backfills legacy rows to 1, so 0
+				// never appears here and any genuine change (now()) outranks them. Cost: a
+				// role change made on a not-yet-updated client does not reach updated
+				// clients during rollout - the safe direction, since it can never REVERT.
+				else if (rm.getRole() != null && rm.getRoleUpdatedAt() > existing.getRoleUpdatedAt())
 				{
+					// Per-row versioning, NOT the whole-roster stamp: a demoted owner who
+					// has not seen the demotion republishes their old role, and under the
+					// shared stamp that restored it for everyone. Their stale row now
+					// loses to the change it never saw.
 					existing.setRole(rm.getRole());
+					existing.setRoleUpdatedAt(Math.max(rm.getRoleUpdatedAt(), existing.getRoleUpdatedAt()));
 				}
 			}
 		}
@@ -390,7 +449,7 @@ public class GroupService
 		// kick performed on another machine.
 		merged.removeIf(m ->
 		{
-			Long removedAt = tombstones.get(m.getName().toLowerCase());
+			Long removedAt = tombstones.get(nameKey(m.getName()));
 			return removedAt != null && removedAt > m.getJoinedAt();
 		});
 
@@ -398,14 +457,46 @@ public class GroupService
 		// stale entries forever.
 		for (GroupMember m : merged)
 		{
-			Long removedAt = tombstones.get(m.getName().toLowerCase());
+			Long removedAt = tombstones.get(nameKey(m.getName()));
 			if (removedAt != null && m.getJoinedAt() >= removedAt)
 			{
-				tombstones.remove(m.getName().toLowerCase());
+				tombstones.remove(nameKey(m.getName()));
 			}
 		}
 		local.setRemovedMembers(tombstones);
 
+		// Founder carries its OWN stamp. Riding membersUpdatedAt was wrong: that is
+		// bumped by every roster action, so a peer who only toggled a permission would
+		// out-stamp a founder transfer and restore the previous founder permanently.
+		// Ties break on the name so two clients cannot ping-pong forever.
+		long remoteFounderAt = remote.getFounderUpdatedAt();
+		long localFounderAt = local.getFounderUpdatedAt();
+		boolean takeRemoteFounder;
+		// Never adopt a founder who is not actually in the roster: isFounder requires
+		// membership, so taking an orphan name strands the group with nobody able to
+		// demote an owner and no way to recover.
+		if (remote.getFounderName() == null
+			|| !isMemberIn(merged, remote.getFounderName())) takeRemoteFounder = false;
+		else if (remoteFounderAt > localFounderAt) takeRemoteFounder = true;
+		else if (remoteFounderAt < localFounderAt) takeRemoteFounder = false;
+		else if (local.getFounderName() == null) takeRemoteFounder = true;
+		else
+		{
+			// Equal stamps means both sides guessed via the backfill. Prefer whoever
+			// the MERGED roster actually shows as an owner - deciding by name could
+			// hand permanent, undemotable authority to someone who never held the role
+			// (two clients disagreeing about the owner backfill different names).
+			boolean remoteIsOwner = isOwnerIn(merged, remote.getFounderName());
+			boolean localIsOwner = isOwnerIn(merged, local.getFounderName());
+			takeRemoteFounder = (remoteIsOwner != localIsOwner)
+				? remoteIsOwner
+				: remote.getFounderName().compareToIgnoreCase(local.getFounderName()) > 0;
+		}
+		if (takeRemoteFounder)
+		{
+			local.setFounderName(remote.getFounderName());
+			local.setFounderUpdatedAt(remoteFounderAt);
+		}
 		local.setMembers(merged);
 		local.setMembersUpdatedAt(Math.max(local.getMembersUpdatedAt(), remote.getMembersUpdatedAt()));
 
@@ -554,6 +645,23 @@ public class GroupService
 		publishEvent(SyncEventType.MEMBER_JOINED, groupId + ":" + backupMember.getName(), null);
 	}
 
+	/**
+	 * True when a removal published right now would actually reach the relay.
+	 *
+	 * Leaving and kicking both write a tombstone and then rely on pushStateToRelay
+	 * to carry it. That push is gated on having reconciled first, so during a cold
+	 * start or a reconnect the tombstone is silently dropped - and the leaver then
+	 * deletes the group locally, leaving no copy to republish from. They would be
+	 * gone on their own machine and still a member everywhere else, permanently.
+	 * Callers check this and refuse rather than lose the removal.
+	 */
+	public boolean canPublishRemoval(String groupId)
+	{
+		if (relaySyncService == null || !config.enableRelaySync()) return true;  // local-only setup
+		if (!relaySyncService.isConnected()) return false;
+		return groupId != null && groupId.equals(caughtUpGroupId);
+	}
+
 	public void removeMember(String groupId, String name)
 	{
 		LendingGroup g = groups.get(groupId);
@@ -564,7 +672,100 @@ public class GroupService
 		g.recordRemoval(name);
 		touchRoster(g);
 		saveGroups();
+		// Publish BEFORE forgetting the group locally: dropping it first would clear
+		// currentSyncGroupId and leave publishEvent with nothing to send, so the
+		// tombstone would never reach the relay and peers would keep showing us as
+		// a member forever.
 		publishEvent(SyncEventType.MEMBER_LEFT, groupId + ":" + name, null);
+		forgetGroupIfRemoved(groupId, name);
+	}
+
+	/**
+	 * Drop a group from local state once the named player is tombstoned out of it
+	 * and that player is us. Without this the group stayed in the dropdown after
+	 * leaving (and after being kicked from another machine), still selectable and
+	 * still syncing a group we are no longer in.
+	 *
+	 * Deliberately gated on the TOMBSTONE rather than on mere absence from the
+	 * roster: a snapshot that simply predates our join would otherwise delete the
+	 * group out from under us. Same test the roster merge uses.
+	 */
+	private void forgetGroupIfRemoved(String groupId, String name)
+	{
+		String me = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
+		if (me == null || name == null || !me.equalsIgnoreCase(name)) return;
+		forgetGroupIfRemovedReturnsGone(groupId);
+	}
+
+	/**
+	 * True when an incoming group copy carries a tombstone removing US that we
+	 * haven't out-joined. Used to refuse re-adopting a group we left or were
+	 * kicked from. Mirrors the test in mergeRoster so both agree on what "removed"
+	 * means; a genuine re-join carries a fresh joinedAt and is not blocked.
+	 */
+	private boolean wasRemovedFrom(LendingGroup remote)
+	{
+		String me = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
+		if (me == null || remote == null) return false;
+		Long removedAt = remote.getRemovedMembersSafe().get(nameKey(me));
+		if (removedAt == null) return false;
+		long myJoinedAt = 0L;
+		if (remote.getMembers() != null)
+		{
+			for (GroupMember m : remote.getMembers())
+			{
+				if (m.getName() != null && m.getName().equalsIgnoreCase(me))
+				{
+					myJoinedAt = m.getJoinedAt();
+					break;
+				}
+			}
+		}
+		return removedAt > myJoinedAt;
+	}
+
+	/**
+	 * Same check keyed on the local player rather than a named one, for the paths
+	 * where a removal arrives from a peer. Returns true when the group was
+	 * dropped, so callers can stop touching state that no longer exists.
+	 */
+	private boolean forgetGroupIfRemovedReturnsGone(String groupId)
+	{
+		if (groupId == null) return false;
+		String me = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
+		if (me == null) return false;
+
+		LendingGroup g = groups.get(groupId);
+		if (g == null) return false;
+		Long removedAt = g.getRemovedMembersSafe().get(nameKey(me));
+		if (removedAt == null) return false;
+		if (g.hasMember(me)) return false;   // a re-join outdated the tombstone
+
+		if (groupId.equals(currentSyncGroupId))
+		{
+			stopSync();
+		}
+		// Capture the player name BEFORE stopSync above nulls it - the replacement
+		// group needs it to start syncing again.
+		groups.remove(groupId);
+		String replacement = null;
+		if (Objects.equals(activeGroupId, groupId))
+		{
+			activeGroupId = groups.isEmpty() ? null : groups.keySet().iterator().next();
+			replacement = activeGroupId;
+			saveActiveGroup();
+		}
+		saveGroups();
+		// Without this the client sits on a group that is selected but neither loaded
+		// nor syncing: no updates in or out for ANY group, and an empty-looking panel,
+		// until the user happens to relog.
+		if (replacement != null && me != null)
+		{
+			dataService.loadGroupData(replacement);
+			startSync(replacement, me);
+		}
+		log.debug("Forgot group {} - no longer a member", groupId);
+		return true;
 	}
 
 	public boolean removeMemberFromGroup(String groupId, String requesterName, String targetName)
@@ -596,14 +797,33 @@ public class GroupService
 		if (group == null) return false;
 
 		if (!canChangeRole(groupId, requesterName, targetName)) return false;
-		if ("owner".equalsIgnoreCase(newRole)) return false;
-		if ("co-owner".equalsIgnoreCase(newRole) && !isOwner(groupId, requesterName)) return false;
+
+		boolean promotingToOwner = "owner".equalsIgnoreCase(newRole);
+		boolean targetIsOwner = "owner".equalsIgnoreCase(getMemberRole(groupId, targetName));
+
+		if (promotingToOwner)
+		{
+			// Only an owner makes another owner, and never past the ceiling.
+			if (!isOwner(groupId, requesterName) && !hasFounderPower(groupId, requesterName)) return false;
+			if (countOwners(group) >= MAX_OWNERS) return false;
+		}
+		else if (targetIsOwner)
+		{
+			// Demoting an owner is the founder's privilege alone, and the founder
+			// is not demotable - otherwise owners could strip each other and the
+			// anti-flooding guarantee disappears.
+			if (!hasFounderPower(groupId, requesterName)) return false;
+			if (isFounder(groupId, targetName)) return false;
+		}
+		if ("co-owner".equalsIgnoreCase(newRole) && !isOwner(groupId, requesterName)
+			&& !hasFounderPower(groupId, requesterName)) return false;
 
 		for (GroupMember member : group.getMembers())
 		{
 			if (member.getName().equalsIgnoreCase(targetName))
 			{
 				member.setRole(newRole.toLowerCase());
+				member.setRoleUpdatedAt(System.currentTimeMillis());
 				touchRoster(group);
 				saveGroups();
 				publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
@@ -618,7 +838,7 @@ public class GroupService
 	{
 		LendingGroup group = groups.get(groupId);
 		if (group == null) return false;
-		if (!isOwner(groupId, currentOwnerName)) return false;
+		if (!isOwner(groupId, currentOwnerName) && !hasFounderPower(groupId, currentOwnerName)) return false;
 		if (currentOwnerName.equalsIgnoreCase(newOwnerName)) return false;
 
 		GroupMember currentOwnerMember = null;
@@ -632,8 +852,15 @@ public class GroupService
 
 		if (currentOwnerMember == null || newOwnerMember == null) return false;
 
+		// Only the caller's own ownership moves. Any other owners keep theirs.
+		long now = System.currentTimeMillis();
 		newOwnerMember.setRole("owner");
+		newOwnerMember.setRoleUpdatedAt(now);
 		currentOwnerMember.setRole("co-owner");
+		currentOwnerMember.setRoleUpdatedAt(now);
+		// Founder status deliberately does NOT move here. A founder who hands over
+		// the owner role keeps their authority at any rank, right down to plain
+		// member; only transferFounder() gives it away.
 
 		touchRoster(group);
 		saveGroups();
@@ -660,7 +887,9 @@ public class GroupService
 
 	public static String[] getAvailableRoles()
 	{
-		return new String[] {"co-owner", "admin", "mod", "member"};
+		// "owner" is assignable now that a group may have up to MAX_OWNERS of them;
+		// setMemberRole enforces who may grant it and the ceiling.
+		return new String[] {"owner", "co-owner", "admin", "mod", "member"};
 	}
 
 	public static int getRoleRank(String role)
@@ -705,6 +934,66 @@ public class GroupService
 		}
 	}
 
+	/** Hard ceiling on owners. Co-owner and below are uncapped. */
+	public static final int MAX_OWNERS = 5;
+
+	/** How many members currently hold the owner role. */
+	public int countOwners(LendingGroup group)
+	{
+		if (group == null || group.getMembers() == null) return 0;
+		int n = 0;
+		for (GroupMember m : group.getMembers())
+		{
+			if ("owner".equalsIgnoreCase(m.getRole())) n++;
+		}
+		return n;
+	}
+
+	/**
+	 * The founder is the only member who may demote an owner, and may not be
+	 * demoted themselves. Groups created before the field existed are backfilled
+	 * on load to their sole owner.
+	 */
+	/**
+	 * RuneScape display names use spaces, but many stored forms use underscores;
+	 * a tombstone written under one and looked up under the other silently misses.
+	 */
+	/** Does this roster show the named player as an owner? */
+	private static boolean isMemberIn(List<GroupMember> roster, String name)
+	{
+		if (roster == null || name == null) return false;
+		for (GroupMember m : roster)
+		{
+			if (name.equalsIgnoreCase(m.getName())) return true;
+		}
+		return false;
+	}
+
+	private static boolean isOwnerIn(List<GroupMember> roster, String name)
+	{
+		if (roster == null || name == null) return false;
+		for (GroupMember m : roster)
+		{
+			if (name.equalsIgnoreCase(m.getName())) return "owner".equalsIgnoreCase(m.getRole());
+		}
+		return false;
+	}
+
+	private static String nameKey(String s)
+	{
+		return s == null ? null : s.toLowerCase().replace('_', ' ').trim();
+	}
+
+	public boolean isFounder(String groupId, String playerName)
+	{
+		LendingGroup g = groups.get(groupId);
+		if (g == null || playerName == null) return false;
+		if (!playerName.equalsIgnoreCase(g.getFounderName())) return false;
+		// A founder who is no longer in the group holds nothing. Without this a
+		// kicked founder would keep full authority over a group they had left.
+		return g.hasMember(playerName);
+	}
+
 	public boolean isOwner(String groupId, String playerName)
 	{
 		return hasRole(groupId, playerName, "owner");
@@ -731,6 +1020,12 @@ public class GroupService
 	{
 		if (groupId == null || kickerName == null || targetName == null) return false;
 		if (kickerName.equalsIgnoreCase(targetName)) return false;
+		// The founder cannot be removed by anyone. Kicking them would destroy the
+		// only authority able to demote an owner - exactly the takeover the founder
+		// role exists to prevent. Removal is the R4 vote, deliberately not built yet.
+		if (isFounder(groupId, targetName)) return false;
+		// Founder authority is otherwise rank-independent (see hasFounderPower).
+		if (hasFounderPower(groupId, kickerName)) return true;
 
 		LendingGroup group = groups.get(groupId);
 		if (group == null) return false;
@@ -769,14 +1064,17 @@ public class GroupService
 		LendingGroup group = groups.get(groupId);
 		if (group == null) return false;
 
+		// The founder holds full control whatever rank they display as, and the
+		// settings panel already offers them these controls.
+		boolean founder = hasFounderPower(groupId, requesterName);
 		String requesterRole = getMemberRole(groupId, requesterName);
-		if (requesterRole == null || getRoleRank(requesterRole) < 4) return false;
+		if (!founder && (requesterRole == null || getRoleRank(requesterRole) < 4)) return false;
 
 		boolean isKick = "kick".equals(permType);
 		switch (role.toLowerCase())
 		{
 			case "co-owner":
-				if (getRoleRank(requesterRole) < 5) return false;
+				if (!founder && getRoleRank(requesterRole) < 5) return false;
 				if (isKick) group.setCoOwnerCanKick(value); else group.setCoOwnerCanInvite(value);
 				break;
 			case "admin":
@@ -804,6 +1102,9 @@ public class GroupService
 		LendingGroup group = groups.get(groupId);
 		if (group == null) return false;
 
+		// Founder authority is rank-independent (see hasFounderPower).
+		if (hasFounderPower(groupId, playerName)) return true;
+
 		String role = getMemberRole(groupId, playerName);
 		if (role == null) return false;
 
@@ -819,10 +1120,45 @@ public class GroupService
 		}
 	}
 
+	/**
+	 * The founder keeps full authority regardless of the role they currently hold -
+	 * owner, co-owner or plain member. Their rank is not shown anywhere in the UI,
+	 * so treat this as a deliberate hidden capability rather than a visible rank.
+	 * Note founderName travels in the synced group payload, so it is not a secret
+	 * from anyone reading relay data directly.
+	 */
+	public boolean hasFounderPower(String groupId, String playerName)
+	{
+		return isFounder(groupId, playerName);
+	}
+
+	/**
+	 * Hand the founder role to another member. The only way to give it up, and
+	 * what a founder must do before they can leave the group.
+	 */
+	public boolean transferFounder(String groupId, String currentFounderName, String newFounderName)
+	{
+		LendingGroup group = groups.get(groupId);
+		if (group == null) return false;
+		if (!isFounder(groupId, currentFounderName)) return false;
+		if (currentFounderName == null || currentFounderName.equalsIgnoreCase(newFounderName)) return false;
+		if (!group.hasMember(newFounderName)) return false;
+
+		group.setFounderName(newFounderName);
+		group.setFounderUpdatedAt(System.currentTimeMillis());
+		touchRoster(group);
+		saveGroups();
+		log.info("Founder of group {} transferred", groupId);
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
+		return true;
+	}
+
 	public boolean canChangeRole(String groupId, String changerName, String targetName)
 	{
 		if (groupId == null || changerName == null || targetName == null) return false;
 		if (changerName.equalsIgnoreCase(targetName)) return false;
+		// The founder outranks everyone whatever their displayed role.
+		if (hasFounderPower(groupId, changerName)) return true;
 
 		String changerRole = getMemberRole(groupId, changerName);
 		String targetRole = getMemberRole(groupId, targetName);
@@ -1733,6 +2069,16 @@ public class GroupService
 					mergeRoster(localGroup, remoteGroup);
 				}
 				saveGroups();
+				// A kick performed on another machine arrives as a tombstone in this
+				// merge. If it names us, stop syncing a group we're no longer in and
+				// take it out of the dropdown.
+				if (forgetGroupIfRemovedReturnsGone(groupId))
+				{
+					// Refresh before bailing, or the panel keeps showing the group we were
+					// just removed from until something else redraws it.
+					if (onSyncCallback != null) onSyncCallback.run();
+					return;
+				}
 			}
 
 			// Reconcile data (marketplace, loans, requests). Pass this player's name
@@ -1946,10 +2292,21 @@ public class GroupService
 			}
 			else
 			{
-				// Group doesn't exist locally yet — add it
+				// Group doesn't exist locally yet — add it, UNLESS we were removed
+				// from it. Without this check, leaving a group put it straight back
+				// on the next sync: we drop it locally, this path finds it missing,
+				// and re-adopts the shared copy — dropdown entry and all.
+				if (wasRemovedFrom(remoteGroup))
+				{
+					return;
+				}
 				groups.put(remoteGroup.getId(), ensureCowMembers(remoteGroup));
 			}
 			saveGroups();
+			// Same merge as the relay path, so a kick arriving here must drop the group
+			// too - otherwise being removed while THIS path handles the event leaves it
+			// sitting in the dropdown.
+			forgetGroupIfRemovedReturnsGone(groupId);
 		}
 		catch (Exception e)
 		{
@@ -1999,11 +2356,58 @@ public class GroupService
 							log.warn("Skipping malformed saved group (missing id)");
 							continue;
 						}
+						// Legacy rows deserialize roleUpdatedAt to 0. Stamp them once so 0
+						// stops existing here - it is otherwise a value two rows tie on, and a
+						// peer republishing 0 could erase a real version.
+						if (g.getMembers() != null)
+						{
+							for (GroupMember m : g.getMembers())
+							{
+								if (m.getRoleUpdatedAt() == 0) { m.setRoleUpdatedAt(1L); needsSave = true; }
+							}
+						}
 						// ADDED: Ensure existing groups have a sync secret (backwards compat)
 						if (g.getSyncSecret() == null || g.getSyncSecret().isEmpty())
 						{
 							g.ensureSyncSecret();
 							needsSave = true;
+						}
+						// Groups made before founders existed: the sole owner becomes the
+						// founder. Skipped when the roster already somehow has several, so
+						// we never crown one arbitrarily.
+						// Also re-derive when founderName names somebody who is no longer in
+						// the roster: isFounder requires membership, so an orphaned name means
+						// NOBODY holds founder authority and nothing can ever restore it -
+						// transferFounder itself requires being the founder.
+						// Re-derive when founderName is absent OR names a non-member. An
+						// orphaned name means NOBODY holds founder authority and nothing can
+						// restore it, since transferFounder itself requires being the founder.
+						boolean founderMissing = g.getFounderName() != null
+							&& !g.hasMember(g.getFounderName());
+						if ((g.getFounderName() == null || founderMissing) && g.getMembers() != null)
+						{
+							// Earliest-joined owner, so multi-owner groups recover too and every
+							// client picks the same one.
+							GroupMember pick = null;
+							for (GroupMember m : g.getMembers())
+							{
+								if (!"owner".equalsIgnoreCase(m.getRole()) || m.getName() == null) continue;
+								if (pick == null || m.getJoinedAt() < pick.getJoinedAt()
+									|| (m.getJoinedAt() == pick.getJoinedAt()
+										&& m.getName().compareToIgnoreCase(pick.getName()) < 0))
+								{
+									pick = m;
+								}
+							}
+							if (pick != null)
+							{
+								g.setFounderName(pick.getName());
+								// A first backfill is a guess and must lose to any real transfer,
+								// so it stamps 1. REPAIRING an orphan is a genuine correction and
+								// must BEAT the peers still holding the orphan record - stamp now.
+								g.setFounderUpdatedAt(founderMissing ? System.currentTimeMillis() : 1L);
+								needsSave = true;
+							}
 						}
 						// Gson deserializes members as a plain ArrayList; wrap it so
 						// concurrent roster reads/writes are CME-safe like new groups.
