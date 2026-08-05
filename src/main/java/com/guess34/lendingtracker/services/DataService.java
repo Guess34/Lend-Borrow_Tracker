@@ -51,6 +51,39 @@ public class DataService
 	// Direct lending requests (borrow requests / lend offers): groupId -> requests
 	private final Map<String, List<LendingRequest>> groupRequests = new ConcurrentHashMap<>();
 
+	// Delisting tombstones: groupId -> "lender:itemId" -> when it was removed.
+	//
+	// A removal used to be communicated only by ABSENCE from the snapshot, and
+	// absence does not survive a union merge - any peer still holding the row put
+	// it straight back, and with every client republishing its whole state on a
+	// timer the two sides took turns undoing each other. Saying "this was removed,
+	// at this time" is a statement a merge can actually honour.
+	//
+	// Same shape as LendingGroup.removedMembers, which solved the same problem for
+	// kicks: union by newest time, and a re-listing newer than the tombstone wins.
+	private final Map<String, Map<String, Long>> removedListings = new ConcurrentHashMap<>();
+
+	// How far apart two players' clocks may be before we stop trusting a
+	// comparison between them. Player PCs aren't guaranteed to run NTP, and a
+	// tombstone stamped by one machine is compared against a row stamped by
+	// another - without slack, a few minutes of drift silently eats a listing
+	// somebody created seconds ago.
+	private static final long CLOCK_SKEW_ALLOWANCE_MS = 10L * 60000L;
+
+	/** Stable key for one member's listing of one item. */
+	private static String listingKey(String lender, int itemId)
+	{
+		return (lender == null ? "" : lender.toLowerCase().replace('_', ' ').trim()) + ":" + itemId;
+	}
+
+	/** Record that a listing was removed, so the removal can propagate. */
+	private void tombstoneListing(String groupId, String lender, int itemId)
+	{
+		if (groupId == null) return;
+		removedListings.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>())
+			.put(listingKey(lender, itemId), System.currentTimeMillis());
+	}
+
 	// Item sets: groupId -> setId -> ItemSet
 	private final Map<String, Map<String, ItemSet>> groupItemSets = new ConcurrentHashMap<>();
 
@@ -117,6 +150,11 @@ public class DataService
 				if (existing.getItemId() == entry.getItemId())
 				{
 					existing.setQuantity(existing.getQuantity() + entry.getQuantity());
+					// Restocking is a change, so the stored row has to say so. Without
+					// this the row keeps its original time, which both loses the merge
+					// against a peer's older copy and leaves it looking old enough for
+					// any later delisting tombstone to delete it.
+					existing.setUpdatedAt(entry.getUpdatedAt());
 					break;
 				}
 			}
@@ -177,6 +215,7 @@ public class DataService
 				ownerItems.removeIf(entry ->
 					entry.getItem().equals(itemName) && entry.getItemId() == itemId
 				);
+				tombstoneListing(groupId, owner, itemId);
 				persist(groupId, "available");
 
 				if (groupService != null)
@@ -295,6 +334,13 @@ public class DataService
 						}
 						removed.addAll(hit);
 					}
+				}
+			}
+			if (removed != null)
+			{
+				for (LendingEntry e : removed)
+				{
+					tombstoneListing(groupId, lenderName, e.getItemId());
 				}
 			}
 			if (removed != null && !removed.isEmpty())
@@ -455,6 +501,10 @@ public class DataService
 			if (requestId.equals(r.getId()))
 			{
 				r.setStatus(status);
+				// Somebody actually decided, so this is no longer an expiry. Left
+				// set, the flag outranks the status when notifying and the requester
+				// is told nobody answered a request that was in fact answered.
+				r.setExpired(false);
 				r.setUpdatedAt(System.currentTimeMillis());
 				persist(groupId, "requests");
 
@@ -628,40 +678,121 @@ public class DataService
 	 * Both directions matter: a request addressed TO someone who is gone leaves
 	 * the other party waiting on a reply that can never come.
 	 */
+	/**
+	 * Cancel every request this player is a party to when they leave or are removed.
+	 *
+	 * CANCELS rather than deletes on purpose. Deleting communicates the change only
+	 * by absence, and mergeRequests is a union - any peer still holding the request
+	 * puts it straight back. A cancelled status is a statement the merge already
+	 * understands (it adopts a newer status), so it actually propagates. The rows
+	 * then fall away on their own via the normal retention sweep.
+	 *
+	 * Both directions matter: a request addressed TO someone who is gone leaves the
+	 * other party waiting on a reply that can never come.
+	 */
 	public int removeRequestsInvolving(String groupId, String playerName)
 	{
-		if (groupId == null || playerName == null)
-		{
-			return 0;
-		}
+		if (groupId == null || playerName == null) return 0;
 		List<LendingRequest> requests = groupRequests.get(groupId);
-		if (requests == null)
-		{
-			return 0;
-		}
-		int removed;
+		if (requests == null) return 0;
+
+		int changed = 0;
+		long now = System.currentTimeMillis();
 		synchronized (requests)
 		{
-			int before = requests.size();
-			requests.removeIf(r -> r != null
-				&& (playerName.equalsIgnoreCase(r.getFrom()) || playerName.equalsIgnoreCase(r.getTo())));
-			removed = before - requests.size();
+			for (LendingRequest r : requests)
+			{
+				if (r == null || !r.isPending()) continue;
+				if (playerName.equalsIgnoreCase(r.getFrom()) || playerName.equalsIgnoreCase(r.getTo()))
+				{
+					r.setStatus(LendingRequest.STATUS_CANCELLED);
+					r.setUpdatedAt(now);
+					changed++;
+				}
+			}
 		}
-		if (removed > 0)
+		if (changed > 0)
 		{
 			persist(groupId, "requests");
 			saveEntries();
-			// Publish, or the deletion never leaves this machine and peers keep the
-			// dangling requests. NOTE: mergeRequests is a union by id with no delete
-			// semantics, so a peer that still holds them can merge them back - request
-			// tombstones are R3 work. This at least stops OUR copy being the source.
 			if (groupService != null)
 			{
 				groupService.publishEvent(GroupService.SyncEventType.ITEM_UPDATED,
 					groupId + ":requests", null);
 			}
 		}
-		return removed;
+		return changed;
+	}
+
+	/** How long a request may sit unanswered before it is auto-expired. */
+	public static final long PENDING_REQUEST_EXPIRY_MS = 14L * 86400000L;
+
+	/** When a request was raised. Falls back to updatedAt for rows predating createdAt. */
+	private static long requestAge(LendingRequest r)
+	{
+		return r.getCreatedAt() > 0 ? r.getCreatedAt() : r.getUpdatedAt();
+	}
+
+	/**
+	 * How settled a request is, for merging. Somebody answering it beats the
+	 * clock running out on it, which beats nobody having touched it yet.
+	 *
+	 * Cancelled shares a rank whether a person did it or the timer did, because
+	 * the two are indistinguishable to a client that predates the expiry flag -
+	 * it relays a timed-out request as a plain cancellation. Ranking on the flag
+	 * would let whichever copy arrived last decide, which is the coin-flip this
+	 * exists to remove.
+	 */
+	private static int outcomeRank(LendingRequest r)
+	{
+		if (r.isPending()) return 0;
+		if (LendingRequest.STATUS_CANCELLED.equals(r.getStatus())) return 1;
+		return 2;
+	}
+
+	/**
+	 * Auto-expire requests nobody ever answered. pruneResolvedRequests only touches
+	 * non-pending rows, so an unanswered request lived forever and was re-added by
+	 * every peer that still had it - the single largest source of payload growth.
+	 * Marking it (not deleting it) means the expiry propagates; retention clears it later.
+	 *
+	 * Cancelled AND flagged expired. The flag is what lets the requester be told:
+	 * a cancellation is somebody's decision and they already know, but an expiry is
+	 * the plugin quietly giving up on their behalf, and going silent there is how a
+	 * dispute vanishes with nobody ever learning it died.
+	 *
+	 * @return the requests that were expired, so the caller can notify.
+	 */
+	public List<LendingRequest> expirePendingRequests(long olderThanMs)
+	{
+		List<LendingRequest> expired = new ArrayList<>();
+		long now = System.currentTimeMillis();
+		for (Map.Entry<String, List<LendingRequest>> g : groupRequests.entrySet())
+		{
+			int changed = 0;
+			synchronized (g.getValue())
+			{
+				for (LendingRequest r : g.getValue())
+				{
+					if (r == null || !r.isPending()) continue;
+					long born = requestAge(r);
+					if (born > 0 && born < olderThanMs)
+					{
+						r.setStatus(LendingRequest.STATUS_CANCELLED);
+						r.setExpired(true);
+						r.setUpdatedAt(now);
+						expired.add(r);
+						changed++;
+					}
+				}
+			}
+			if (changed > 0)
+			{
+				persist(g.getKey(), "requests");
+			}
+		}
+		if (!expired.isEmpty()) saveEntries();
+		return expired;
 	}
 
 	public int removeOldHistoryEntries(long olderThanMs)
@@ -887,6 +1018,49 @@ public class DataService
 	 * owner or co-owner of the group, must not be the requester, and must not be a
 	 * party (lender/borrower) to the loan — nobody clears their own loan.
 	 */
+	/** Is there any owner/co-owner who could adjudicate this request? */
+	private boolean hasEligibleSeniorReviewer(String groupId,
+		com.guess34.lendingtracker.model.LendingGroup group, LendingRequest r, LendingEntry entry)
+	{
+		if (group == null || group.getMembers() == null || groupService == null) return false;
+		for (com.guess34.lendingtracker.model.GroupMember m : group.getMembers())
+		{
+			String n = m.getName();
+			if (n == null) continue;
+			if (!groupService.isOwner(groupId, n) && !groupService.isCoOwner(groupId, n)) continue;
+			if (r != null && n.equalsIgnoreCase(r.getFrom())) continue;
+			if (entry != null
+				&& (n.equalsIgnoreCase(entry.getLender()) || n.equalsIgnoreCase(entry.getBorrower()))) continue;
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Can a staff-removal for this loan actually be reviewed by anyone? The UI asks
+	 * before offering the option, so a member is not left waiting on adjudication
+	 * that cannot happen.
+	 */
+	public boolean hasAnyStaffReviewerFor(String groupId,
+		com.guess34.lendingtracker.model.LendingGroup group, String requester, String entryId)
+	{
+		if (group == null || group.getMembers() == null || groupService == null) return false;
+		LendingEntry entry = getActiveEntry(entryId);
+		LendingRequest probe = new LendingRequest();
+		probe.setFrom(requester);
+		if (hasEligibleSeniorReviewer(groupId, group, probe, entry)) return true;
+		for (com.guess34.lendingtracker.model.GroupMember m : group.getMembers())
+		{
+			String n = m.getName();
+			if (n == null || !groupService.isAdmin(groupId, n)) continue;
+			if (requester != null && n.equalsIgnoreCase(requester)) continue;
+			if (entry != null
+				&& (n.equalsIgnoreCase(entry.getLender()) || n.equalsIgnoreCase(entry.getBorrower()))) continue;
+			return true;
+		}
+		return false;
+	}
+
 	public List<LendingRequest> getPendingStaffRemovalsFor(String groupId, String viewer,
 		com.guess34.lendingtracker.model.LendingGroup group)
 	{
@@ -895,8 +1069,9 @@ public class DataService
 		{
 			return result;
 		}
-		boolean isStaff = groupService.isOwner(groupId, viewer) || groupService.isCoOwner(groupId, viewer);
-		if (!isStaff)
+		boolean senior = groupService.isOwner(groupId, viewer) || groupService.isCoOwner(groupId, viewer);
+		boolean admin = groupService.isAdmin(groupId, viewer);
+		if (!senior && !admin)
 		{
 			return result;
 		}
@@ -910,8 +1085,19 @@ public class DataService
 			if (entry != null
 				&& (viewer.equalsIgnoreCase(entry.getLender()) || viewer.equalsIgnoreCase(entry.getBorrower())))
 			{
-				continue; // party to the loan — conflict of interest
+				continue; // party to the loan - conflict of interest
 			}
+			// Admins only see it when no owner or co-owner is eligible. In a group with
+			// one owner and no co-owners, that owner is often the requester or a party
+			// to the loan - and then NOBODY could adjudicate, so the request sat unseen
+			// until it expired. Widening one rank keeps the conflict-of-interest rule
+			// intact while giving the dispute somewhere to go.
+			if (!senior && !hasEligibleSeniorReviewer(groupId, group, r, entry))
+			{
+				result.add(r);
+				continue;
+			}
+			if (!senior) continue;
 			result.add(r);
 		}
 		return result;
@@ -990,6 +1176,10 @@ public class DataService
 		allEntries.values().removeIf(e -> e != null && groupId.equals(e.getGroupId()));
 		historyEntries.removeIf(e -> e != null && groupId.equals(e.getGroupId()));
 		groupRequests.remove(groupId);
+		removedListings.remove(groupId);
+		// Forget that we read this group's file, so rejoining reads it fresh
+		// instead of writing our now-empty maps over whatever is there.
+		hydratedGroups.remove(groupId);
 		saveEntries();
 		configManager.unsetConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId);
 		if (groupService != null)
@@ -1057,8 +1247,27 @@ public class DataService
 
 	// Persistence -- group data (lent/borrowed/available per group)
 
+	// Groups whose stored snapshot has been read into memory this session.
+	//
+	// persist() serialises the in-memory maps over the stored file, so writing
+	// before that file has been read replaces real data with empty maps. That is
+	// not hypothetical: the local-backup restore at login calls restoreAvailable
+	// (which persists) BEFORE startSync gets around to loadGroupData, so the very
+	// first write of every session used to blank out the group's requests and
+	// delisting tombstones. Returned-loan tombstones happened to survive only
+	// because they are rebuilt from historyEntries, which does load early - which
+	// is why this stayed hidden.
+	private final Set<String> hydratedGroups = ConcurrentHashMap.newKeySet();
+
 	private void persist(String groupId, String kind)
 	{
+		if (groupId == null || groupId.isEmpty()) return;
+		if (!hydratedGroups.contains(groupId))
+		{
+			// Read what's on disk before writing over it. loadGroupData marks the
+			// group hydrated itself, so this runs at most once per group.
+			loadGroupData(groupId);
+		}
 		configManager.setConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId, buildGroupSnapshotJson(groupId));
 	}
 
@@ -1070,6 +1279,10 @@ public class DataService
 	// How long a returned-loan tombstone stays in the snapshot so members who were
 	// offline at return time still learn the loan was returned when they catch up.
 	private static final long RETURNED_TOMBSTONE_MS = 30L * 86400000L;
+
+	// Snapshot format version. 1 = the original keys; 2 adds removedListings and
+	// cancelled-request tombstones. Bump when the SHAPE changes, not the contents.
+	private static final int SNAPSHOT_VERSION = 2;
 
 	private String buildGroupSnapshotJson(String groupId)
 	{
@@ -1096,6 +1309,25 @@ public class DataService
 			}
 		}
 		snapshot.put("returnedIds", returnedIds);
+
+		// Delisting tombstones, same 30-day window. Pruned as we build so the map
+		// cannot grow forever, and so a re-listing eventually stops being suppressed.
+		// Pruned at BOTH ends: a nonsense future date can't be aged out by waiting,
+		// so it would otherwise suppress that listing for good.
+		Map<String, Long> live = new LinkedHashMap<>();
+		Map<String, Long> stones = removedListings.get(groupId);
+		if (stones != null)
+		{
+			long ceiling = System.currentTimeMillis() + CLOCK_SKEW_ALLOWANCE_MS;
+			stones.entrySet().removeIf(e -> e.getValue() == null
+				|| e.getValue() <= cutoff || e.getValue() > ceiling);
+			live.putAll(stones);
+		}
+		snapshot.put("removedListings", live);
+
+		// Snapshot format version. Old clients ignore it; from here on a reader can
+		// tell what a payload is expected to contain instead of guessing.
+		snapshot.put("v", SNAPSHOT_VERSION);
 		return gson.toJson(snapshot);
 	}
 
@@ -1159,7 +1391,7 @@ public class DataService
 				loadGroupEntries(getCategory(snapshot, "available"), groupId, groupAvailable, selfOwner);
 				loadGroupEntries(getCategory(snapshot, "lent"), groupId, groupLent, selfOwner);
 				loadGroupEntries(getCategory(snapshot, "borrowed"), groupId, groupBorrowed, selfOwner);
-				mergeRequests(groupId, snapshot.get("requests"));
+				mergeRequests(groupId, snapshot.get("requests"), true);
 				mergeActiveEntries(groupId, snapshot.get("entries"));
 			}
 			else
@@ -1173,13 +1405,14 @@ public class DataService
 				// rows other lenders filed under the publisher's borrower key. Borrowed
 				// rows still arrive via the catch-up merge, which handles keying
 				// correctly; live borrowed sync needs its own merge rule.
-				mergeRequests(groupId, snapshot.get("requests"));
+				mergeRequests(groupId, snapshot.get("requests"), true);
 				mergeActiveEntries(groupId, snapshot.get("entries"));
 			}
 
 			// Apply returned-loan tombstones (both paths) so returns propagate to
 			// members who were offline when the loan came back.
 			applyReturnedTombstones(snapshot.get("returnedIds"));
+			applyRemovedListings(groupId, snapshot.get("removedListings"));
 
 			// Persist the reconciled state locally so it survives a restart.
 			persist(groupId, "sync");
@@ -1253,7 +1486,7 @@ public class DataService
 	}
 
 	/** Merge direct requests from a remote snapshot (union by id, newest update wins). */
-	private void mergeRequests(String groupId, Object rawRequests)
+	private void mergeRequests(String groupId, Object rawRequests, boolean fromPeer)
 	{
 		if (!(rawRequests instanceof List))
 		{
@@ -1262,6 +1495,7 @@ public class DataService
 
 		List<LendingRequest> localRequests = groupRequests
 			.computeIfAbsent(groupId, k -> new CopyOnWriteArrayList<>());
+		long staleBefore = System.currentTimeMillis() - PENDING_REQUEST_EXPIRY_MS;
 
 		for (Object raw : (List<?>) rawRequests)
 		{
@@ -1278,13 +1512,64 @@ public class DataService
 					.findFirst().orElse(null);
 				if (local == null)
 				{
+					// A pending request older than the expiry age is one everybody
+					// else already retired and pruned. Re-adding it hands the
+					// recipient a live, actionable request from months ago, which
+					// they answer into a loan that may involve someone long gone -
+					// and re-stamping it on expiry buys it another full retention
+					// window, so the same peer resurrects it again on every login.
+					//
+					// PEERS ONLY. "local == null" means "not in memory", and at
+					// startup nothing has been loaded yet - so on the config reload
+					// every one of our OWN saved requests looks unknown. Dropping
+					// them there deletes the user's own unanswered disputes instead
+					// of expiring them, which loses the record and the notification
+					// with it. Our own file is reloaded as-is; expiry retires it.
+					long born = requestAge(remote);
+					if (fromPeer && remote.isPending() && born > 0 && born < staleBefore)
+					{
+						continue;
+					}
 					localRequests.add(remote);
+					// Nothing to reconcile - the row we just took carries its own
+					// status and flags. Everything below compares against a local
+					// copy that does not exist here.
+					continue;
 				}
-				else if (remote.getUpdatedAt() > local.getUpdatedAt()
-					|| (remote.getUpdatedAt() == local.getUpdatedAt() && local.isPending() && !remote.isPending()))
+
+				// Outcome first, timestamp second. Expiry runs on a timer against
+				// whatever that client last knew, so a member who has not synced
+				// recently will happily expire a request somebody already answered -
+				// and it stamps a fresh time doing it, so plain last-write-wins would
+				// hand that stale non-answer to the whole group and quietly undo an
+				// approved loan removal. A decision outranks an expiry outranks
+				// still-pending; only within one rank does the newer copy win.
+				int remoteRank = outcomeRank(remote);
+				int localRank = outcomeRank(local);
+				if (remoteRank > localRank
+					|| (remoteRank == localRank && remote.getUpdatedAt() > local.getUpdatedAt()))
 				{
 					local.setStatus(remote.getStatus());
 					local.setUpdatedAt(remote.getUpdatedAt());
+					// Moving to a real decision retires the expiry; a move to
+					// cancelled leaves the flag to the one-way union below.
+					if (!LendingRequest.STATUS_CANCELLED.equals(remote.getStatus()))
+					{
+						local.setExpired(false);
+					}
+				}
+
+				// The expiry flag unions separately from the status, one way only.
+				// It has to: a client that predates the field drops it when it
+				// relays the row, and since it keeps the same updatedAt, the rank
+				// and time above are both ties and never fire - so an expiry
+				// laundered through one older peer would be lost for good. Only
+				// adopted onto a cancellation, so a leftover flag can't overwrite
+				// somebody's actual decision.
+				if (remote.isExpired() && !local.isExpired()
+					&& LendingRequest.STATUS_CANCELLED.equals(local.getStatus()))
+				{
+					local.setExpired(true);
 				}
 			}
 		}
@@ -1397,6 +1682,86 @@ public class DataService
 	}
 
 	/**
+	 * Adopt a peer's delisting tombstones and drop any listing they retire.
+	 *
+	 * Union by newest time, so a tombstone survives being merged with a peer that
+	 * never saw the removal. A row is only dropped when the removal is NEWER than
+	 * the row itself - re-listing an item you previously pulled therefore wins,
+	 * because the fresh row carries a later updatedAt than the tombstone.
+	 *
+	 * Two things this has to get right, both learned the hard way:
+	 *
+	 * ADOPTION IS OPTIONAL, ENFORCEMENT IS NOT. A snapshot from a client that
+	 * predates this format carries no tombstones at all. That is a reason to skip
+	 * the adoption loop, NOT a reason to skip the sweep - the tombstones we already
+	 * hold still have to be honoured, or a stale peer's copy of a row we deleted
+	 * walks straight back in and the whole mechanism does nothing.
+	 *
+	 * THE TWO TIMES COME FROM DIFFERENT MACHINES. The tombstone is stamped by
+	 * whoever removed the listing; updatedAt by whoever created it. Nothing keeps
+	 * two players' clocks in step, so the comparison gets a skew allowance - a few
+	 * minutes of drift must not be enough to delete a listing somebody created
+	 * seconds ago.
+	 *
+	 * The allowance is the ONLY protection, deliberately. Exempting the local
+	 * player's own rows outright looks safer and is worse: play on two machines,
+	 * delist an item on the desktop, and the laptop would keep the row, keep
+	 * republishing it, and put it back in front of the whole group the moment the
+	 * tombstone aged out. A removal has to be enforceable against the person who
+	 * made it, or it isn't a removal.
+	 */
+	private void applyRemovedListings(String groupId, Object raw)
+	{
+		if (groupId == null) return;
+		Map<String, Long> mine = removedListings.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>());
+		boolean changed = adoptRemovedListings(mine, raw);
+
+		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
+		if (groupData != null && !mine.isEmpty())
+		{
+			for (Map.Entry<String, List<LendingEntry>> owner : groupData.entrySet())
+			{
+				changed |= owner.getValue().removeIf(row ->
+				{
+					String lender = row.getLender() != null ? row.getLender() : owner.getKey();
+					Long at = mine.get(listingKey(lender, row.getItemId()));
+					return at != null && at > row.getUpdatedAt() + CLOCK_SKEW_ALLOWANCE_MS;
+				});
+			}
+		}
+		if (changed) persist(groupId, "available");
+	}
+
+	/**
+	 * Union an incoming tombstone map into ours, newest wins. Returns true if
+	 * anything changed.
+	 *
+	 * Times are clamped to our own clock on the way in. A member whose PC has the
+	 * wrong year would otherwise hand us a tombstone dated far in the future, which
+	 * no re-listing could ever outrank and no prune could ever reach - that item
+	 * would be permanently unlistable for everyone, with no way to clear it.
+	 */
+	private boolean adoptRemovedListings(Map<String, Long> mine, Object raw)
+	{
+		if (!(raw instanceof Map)) return false;
+		boolean changed = false;
+		long ceiling = System.currentTimeMillis() + CLOCK_SKEW_ALLOWANCE_MS;
+		for (Map.Entry<?, ?> e : ((Map<?, ?>) raw).entrySet())
+		{
+			if (e.getKey() == null || !(e.getValue() instanceof Number)) continue;
+			String key = e.getKey().toString();
+			long at = Math.min(((Number) e.getValue()).longValue(), ceiling);
+			Long known = mine.get(key);
+			if (known == null || at > known)
+			{
+				mine.put(key, at);
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	/**
 	 * Apply a batch of returned-loan tombstones from a snapshot: archive each id
 	 * that's still active locally so returns reach members who were offline.
 	 */
@@ -1477,6 +1842,9 @@ public class DataService
 		{
 			return;
 		}
+		// Marked before reading, not after: anything below that persists would
+		// otherwise come back through persist's hydrate check and recurse.
+		hydratedGroups.add(groupId);
 
 		String json = configManager.getConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId);
 		if (json != null && !json.isEmpty())
@@ -1489,8 +1857,21 @@ public class DataService
 				loadGroupEntries(getCategory(snapshot, "available"), groupId, groupAvailable);
 				loadGroupEntries(getCategory(snapshot, "lent"), groupId, groupLent);
 				loadGroupEntries(getCategory(snapshot, "borrowed"), groupId, groupBorrowed);
-				mergeRequests(groupId, snapshot.get("requests"));
+				mergeRequests(groupId, snapshot.get("requests"), false);
 				mergeActiveEntries(groupId, snapshot.get("entries"));
+				// Tombstones have to come back with everything else. Held only in
+				// memory they died on every logout, which made the 30-day window
+				// really "until you next close the client" - and a client that has
+				// forgotten a removal goes right back to publishing the row.
+				//
+				// Rehydrate only, never sweep. This file is our own state, already
+				// swept before it was written, so there is nothing here to
+				// reconcile - and sweeping it would run without knowing who we are,
+				// which is exactly the case the "never drop your own rows" rule
+				// exists to prevent.
+				adoptRemovedListings(
+					removedListings.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>()),
+					snapshot.get("removedListings"));
 			}
 			catch (Exception e)
 			{

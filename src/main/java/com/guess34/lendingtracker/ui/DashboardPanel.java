@@ -951,6 +951,13 @@ public class DashboardPanel extends JPanel
 						"A removal request for this loan is already awaiting approval.",
 						"Already Requested", JOptionPane.INFORMATION_MESSAGE);
 					break;
+				case NO_REVIEWER:
+					JOptionPane.showMessageDialog(DashboardPanel.this,
+						"Nobody in this group can review this removal — the only staff\n"
+							+ "are involved in the loan themselves. Ask an owner to add a\n"
+							+ "co-owner or admin who isn't part of it, then try again.",
+						"No Reviewer Available", JOptionPane.WARNING_MESSAGE);
+					break;
 				default:
 					JOptionPane.showMessageDialog(DashboardPanel.this,
 						"Only the lender or borrower of a loan can request its removal.",

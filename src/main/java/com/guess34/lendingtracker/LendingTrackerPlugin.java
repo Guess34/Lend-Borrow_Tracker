@@ -187,6 +187,14 @@ public class LendingTrackerPlugin extends Plugin
 	private void triggerLoginFlow(String playerName)
 	{
 		groupService.onAccountLogin(playerName);
+		// Read every group's stored data before the local backup restore runs. The
+		// restore only fills in what's missing, so it needs to see what we already
+		// have - and it writes as it goes, which without this would save our empty
+		// in-memory state over the real file.
+		for (LendingGroup g : groupService.getAllGroups())
+		{
+			if (g != null) { dataService.loadGroupData(g.getId()); }
+		}
 		localDataSyncService.onAccountLogin();
 		configManager.setConfiguration("lendingtracker", "currentAccount", playerName);
 		LendingGroup activeGroup = groupService.getActiveGroup();
@@ -552,13 +560,32 @@ public class LendingTrackerPlugin extends Plugin
 	// least this long regardless of dataRetentionDays, so a low retention setting
 	// can't prune a request before an offline requester ever syncs the result.
 	private static final long REQUEST_RETENTION_MS = 14L * 86400000L;
-
 	private void cleanupOldRecords()
 	{
+		long now = System.currentTimeMillis();
+
+		// Expiry runs regardless of the retention setting. It uses its own fixed
+		// window, and "keep forever" is a promise about returned LOAN RECORDS - the
+		// users who set it are the ones most likely to have years of unanswered
+		// requests piling up, so exempting them fixes nothing for exactly the people
+		// who need it most.
+		if (!dataService.expirePendingRequests(now - DataService.PENDING_REQUEST_EXPIRY_MS).isEmpty())
+		{
+			// Announce them through the normal path so the persisted de-dup set
+			// applies. Whichever member's timer fires first does the expiring, and
+			// everyone else learns about it as a synced status change - one route
+			// for both, so the requester is told exactly once either way.
+			checkForRequestNotifications();
+			// Cards for the expired requests are still on screen and still look
+			// actionable until the panel is redrawn.
+			refreshPanel();
+		}
+
 		int days = config.dataRetentionDays();
 		if (days <= 0) { return; }
-		long now = System.currentTimeMillis();
 		dataService.deleteOldReturnedEntries(now - (days * 86400000L));
+		// Runs after the expiry above: a request only becomes prunable once it stops
+		// being pending, so this is what eventually clears what expiry marked.
 		dataService.pruneResolvedRequests(now - Math.max(days * 86400000L, REQUEST_RETENTION_MS));
 	}
 
@@ -568,28 +595,38 @@ public class LendingTrackerPlugin extends Plugin
 		{
 			String groupId = groupService.getCurrentGroupIdUnchecked();
 			if (groupId == null || groupId.isEmpty()) { return; }
+			String me = getCurrentPlayerName();
+			if (me == null) { return; }
 			List<LendingEntry> available = dataService.getAvailable(groupId);
 			if (available == null || available.isEmpty()) { return; }
 
+			// Our own listings only. getAvailable returns the whole group, and
+			// writing another member's row back stamps it with OUR clock - which
+			// both fights their edits and lets a routine price refresh out-rank a
+			// removal they made, putting the listing back permanently.
 			List<LendingEntry> toUpdate = available.stream()
+				.filter(e -> me.equalsIgnoreCase(e.getLender()))
 				.filter(e -> e.getBorrower() == null || e.getBorrower().isEmpty())
 				.collect(Collectors.toList());
 			if (toUpdate.isEmpty()) { return; }
 
 			clientThread.invokeLater(() ->
 			{
-				int updated = 0;
+				// Only rows whose price actually moved get written. Writing all of
+				// them because one changed re-dates the whole marketplace every
+				// twelve hours for no reason.
+				List<LendingEntry> changed = new ArrayList<>();
 				for (LendingEntry entry : toUpdate)
 				{
 					if (entry.getItemId() > 0)
 					{
 						int p = itemManager.getItemPrice(entry.getItemId());
-						if (p > 0 && p != entry.getValue()) { entry.setValue(p); updated++; }
+						if (p > 0 && p != entry.getValue()) { entry.setValue(p); changed.add(entry); }
 					}
 				}
-				if (updated > 0)
+				if (!changed.isEmpty())
 				{
-					for (LendingEntry e : toUpdate)
+					for (LendingEntry e : changed)
 					{
 						dataService.updateAvailable(groupId, e.getLender(), e.getItem(), e.getItemId(), e);
 					}
@@ -1145,7 +1182,7 @@ public class LendingTrackerPlugin extends Plugin
 	/**
 	 * Outcome of proposing a loan removal, so the UI can explain the routing.
 	 */
-	public enum RemovalRoute { MUTUAL, STAFF, ALREADY_PENDING, NOT_ALLOWED }
+	public enum RemovalRoute { MUTUAL, STAFF, ALREADY_PENDING, NOT_ALLOWED, NO_REVIEWER }
 
 	/**
 	 * Propose removing an active loan (accidental Loan-mode, mis-recorded trade…).
@@ -1195,6 +1232,14 @@ public class LendingTrackerPlugin extends Plugin
 		}
 		else
 		{
+			// Don't file a dispute nobody in this group is allowed to rule on. In a
+			// small group the only owner is often the other party to the loan, and
+			// then there is no eligible reviewer at all - the request would just sit
+			// there until it expired, which is a worse answer than saying so now.
+			if (!dataService.hasAnyStaffReviewerFor(groupId, group, me, loan.getId()))
+			{
+				return RemovalRoute.NO_REVIEWER;
+			}
 			type = LendingRequest.TYPE_REMOVAL_STAFF;
 			to = ""; // adjudicated by any eligible (uninvolved) owner/co-owner
 		}
@@ -1374,7 +1419,26 @@ public class LendingTrackerPlugin extends Plugin
 
 			for (LendingRequest r : dataService.getRequestsFrom(groupId, me))
 			{
-				if (r.isPending() || LendingRequest.STATUS_CANCELLED.equals(r.getStatus())) { continue; }
+				if (r.isPending()) { continue; }
+				// An expiry has to be reported wherever it happened. Any member's
+				// client may be the one whose cleanup timer fires first, and the
+				// result reaches us as an ordinary status change - so keying off
+				// the flag here, rather than off our own expiry run, is the only
+				// way the requester reliably hears about it.
+				if (r.isExpired() && LendingRequest.STATUS_CANCELLED.equals(r.getStatus()))
+				{
+					String key = r.getId() + ":EXPIRED";
+					seen.add(key);
+					if (notified.add(key))
+					{
+						notifier.notify("[Lending Tracker] Your request for " + r.getItemName()
+							+ " expired — nobody answered it.");
+						changed = true;
+					}
+					continue;
+				}
+				// A plain cancellation is the requester's own doing; they know.
+				if (LendingRequest.STATUS_CANCELLED.equals(r.getStatus())) { continue; }
 				String key = r.getId() + ":" + r.getStatus();
 				seen.add(key);
 				if (notified.add(key))

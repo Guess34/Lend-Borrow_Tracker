@@ -42,6 +42,12 @@ public class LendingRequest
 	private int durationDays;
 	private String message;
 	private String status;       // STATUS_* constants
+	// Cancelled because nobody ever answered it, rather than because somebody
+	// decided to. A separate flag rather than a new STATUS_ value on purpose:
+	// a status they don't recognise makes older clients announce "declined your
+	// request", inventing a decision nobody made. An unknown FIELD they simply
+	// ignore, and they read the status as a plain cancellation, which is true.
+	private boolean expired;
 	private long createdAt;
 	private long updatedAt;
 
