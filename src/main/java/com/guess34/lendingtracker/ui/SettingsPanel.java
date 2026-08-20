@@ -316,13 +316,18 @@ public class SettingsPanel extends JPanel
 		JPanel content = boxPanel();
 		content.add(smallLabel("Proof screenshots are saved locally:"));
 		content.add(Box.createVerticalStrut(5));
-		JButton btn = smallButton("Open Screenshot Folder", ColorScheme.BRAND_ORANGE);
+		JButton btn = smallButton("Show Screenshot Folder", ColorScheme.BRAND_ORANGE);
 		btn.setAlignmentX(LEFT_ALIGNMENT);
 		btn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 26));
 		btn.addActionListener(e -> {
 			LendingGroup g = groupService.getActiveGroup();
-			plugin.getProofScreenshot().openScreenshotFolder(
+			String path = plugin.getProofScreenshot().getScreenshotFolderPath(
 				getCurrentUsername(), g != null ? g.getName() : "default");
+			JTextField field = new JTextField(path);
+			field.setEditable(false);
+			field.setCaretPosition(0);
+			JOptionPane.showMessageDialog(this, field, "Screenshot Folder",
+				JOptionPane.INFORMATION_MESSAGE);
 		});
 		content.add(btn);
 		content.add(Box.createVerticalStrut(3));

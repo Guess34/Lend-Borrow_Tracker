@@ -15,7 +15,6 @@ import javax.inject.Singleton;
 import javax.imageio.ImageIO;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.ui.DrawManager;
-import net.runelite.client.util.LinkBrowser;
 import com.guess34.lendingtracker.LendingTrackerConfig;
 import com.guess34.lendingtracker.model.LendingEntry;
 
@@ -55,21 +54,19 @@ public class ProofScreenshot
 	}
 
 	/**
-	 * Open the screenshot folder in the system file explorer
+	 * Where this user's proof screenshots are kept, created if it isn't there yet.
+	 *
+	 * The panel shows this as text instead of opening it. Launching the folder
+	 * means handing a local path to whatever the OS decides should handle it,
+	 * which the Plugin Hub doesn't allow.
 	 */
-	public void openScreenshotFolder(String username, String groupName)
+	public String getScreenshotFolderPath(String username, String groupName)
 	{
-		try
-		{
-			Path dir = getScreenshotDirectory(username, groupName);
-			Files.createDirectories(dir);
-
-			LinkBrowser.open(dir.toString());
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to open screenshot folder: {}", e.getMessage());
-		}
+		// Deliberately does NOT create the folder. It only needed to exist so it
+		// could be opened; saving a screenshot makes it when there's something to
+		// put in it. Creating it here just leaves empty folders behind for anyone
+		// who presses the button.
+		return getScreenshotDirectory(username, groupName).toString();
 	}
 
 	/** Screenshot phases captured across a loan trade's lifecycle. */
