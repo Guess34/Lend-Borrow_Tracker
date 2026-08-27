@@ -41,6 +41,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -60,6 +61,20 @@ public class LendingTrackerPlugin extends Plugin
 	@Inject private ClientToolbar clientToolbar;
 	@Inject private ItemManager itemManager;
 	@Inject private ScheduledExecutorService executor;
+
+	// The executor above is the CLIENT'S, shared with every other plugin - we must
+	// never shut it down. But that also means nothing stops our tasks when the
+	// plugin is disabled: they kept running for the rest of the session, still
+	// firing overdue notifications and sounds, and every re-enable added another
+	// set. Hold the handles so shutDown can cancel exactly ours.
+	private final List<ScheduledFuture<?>> scheduledTasks = new ArrayList<>();
+
+	// Bumped whenever the plugin stops or the player logs out. The login flow
+	// runs on the shared executor now, so a queued one can still be waiting
+	// when that happens - and it starts sync and opens a relay socket, which
+	// would come back up after teardown and leak for the rest of the session.
+	// Each run captures the value it was queued with and stops if it moved.
+	private final java.util.concurrent.atomic.AtomicLong sessionEpoch = new java.util.concurrent.atomic.AtomicLong();
 	@Inject private Notifier notifier;
 	@Inject private EventBus eventBus;
 	@Inject private DataService dataService;
@@ -154,15 +169,15 @@ public class LendingTrackerPlugin extends Plugin
 			&& client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
 		{
 			lastKnownWorld = client.getWorld();
-			triggerLoginFlow(client.getLocalPlayer().getName());
+			triggerLoginFlow(client.getLocalPlayer().getName(), sessionEpoch.get());
 		}
 
 		try
 		{
-			executor.scheduleAtFixedRate(this::checkOverdueLoans, 0, 1, TimeUnit.HOURS);
-			executor.scheduleAtFixedRate(this::cleanupOldRecords, 1, 24, TimeUnit.HOURS);
-			executor.scheduleAtFixedRate(this::syncGroupData, 0, 5, TimeUnit.MINUTES);
-			executor.scheduleAtFixedRate(this::updateMarketplacePrices, 1, 12, TimeUnit.HOURS);
+			scheduledTasks.add(executor.scheduleAtFixedRate(this::checkOverdueLoans, 0, 1, TimeUnit.HOURS));
+			scheduledTasks.add(executor.scheduleAtFixedRate(this::cleanupOldRecords, 1, 24, TimeUnit.HOURS));
+			scheduledTasks.add(executor.scheduleAtFixedRate(this::syncGroupData, 0, 5, TimeUnit.MINUTES));
+			scheduledTasks.add(executor.scheduleAtFixedRate(this::updateMarketplacePrices, 1, 12, TimeUnit.HOURS));
 		}
 		catch (Exception e) { log.warn("Failed to schedule periodic tasks: {}", e.getMessage()); }
 	}
@@ -170,6 +185,18 @@ public class LendingTrackerPlugin extends Plugin
 	@Override
 	protected void shutDown() throws Exception
 	{
+		sessionEpoch.incrementAndGet();
+		// Ours to cancel. The executor belongs to the client and is shared
+		// with every other plugin, so we must never shut it down - but that
+		// also means nothing else stops these. Left running they kept firing
+		// overdue notifications and sounds after the plugin was disabled, and
+		// every re-enable stacked another set on top.
+		for (ScheduledFuture<?> task : scheduledTasks)
+		{
+			if (task != null) { task.cancel(false); }
+		}
+		scheduledTasks.clear();
+
 		relaySyncService.stopKeepalive();
 		groupService.stopSync();
 		if (navButton != null) { clientToolbar.removeNavigation(navButton); }
@@ -178,14 +205,20 @@ public class LendingTrackerPlugin extends Plugin
 			try { localDataSyncService.shutdown(); }
 			catch (Exception e) { log.warn("Error shutting down local data sync: {}", e.getMessage()); }
 		}
+		// Dropping the reference does not release it: the event bus holds a
+		// strong reference to a registered subscriber, so the whole panel tree
+		// stays alive and keeps handling events, and its poller keeps ticking.
+		if (newPanel != null) { newPanel.deregister(); }
 		newPanel = null;
 		navButton = null;
 		tradeLoanTracker.reset();
 		tradeLoanTracker.clearPendingDecisions();
 	}
 
-	private void triggerLoginFlow(String playerName)
+	private void triggerLoginFlow(String playerName, long epoch)
 	{
+		// Stopped or logged out while this was queued - do nothing.
+		if (epoch != sessionEpoch.get()) { return; }
 		groupService.onAccountLogin(playerName);
 		// Read every group's stored data before the local backup restore runs. The
 		// restore only fills in what's missing, so it needs to see what we already
@@ -427,12 +460,19 @@ public class LendingTrackerPlugin extends Plugin
 				// (fires on login AND after every world hop).
 				lastKnownWorld = client.getWorld();
 				groupService.setOnSyncCallback(this::onGroupDataSynced);
-				triggerLoginFlow(playerName);
+				// Only the two reads above need the client thread. The login flow
+				// itself reads the whole backup file off disk and parses it, and that
+				// file grows with your history - doing it here stalls the game.
+				long epoch = sessionEpoch.get();
+				executor.execute(() -> triggerLoginFlow(playerName, epoch));
 				return true;
 			});
 		}
 		else if (event.getGameState() == GameState.LOGIN_SCREEN)
 		{
+			// A login flow queued moments ago must not start sync for an
+			// account that has already logged out.
+			sessionEpoch.incrementAndGet();
 			groupService.stopSync();
 			tradeLoanTracker.reset();
 			tradeLoanTracker.clearPendingDecisions();
@@ -450,7 +490,8 @@ public class LendingTrackerPlugin extends Plugin
 			// Keep the cached world fresh here too — this path also re-sends the
 			// presence join (via startSync's same-target fast path).
 			lastKnownWorld = client.getWorld();
-			triggerLoginFlow(playerName);
+			long epoch = sessionEpoch.get();
+			executor.execute(() -> triggerLoginFlow(playerName, epoch));
 			return true;
 		});
 	}

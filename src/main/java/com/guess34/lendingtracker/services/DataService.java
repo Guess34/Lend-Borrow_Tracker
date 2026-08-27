@@ -1399,12 +1399,16 @@ public class DataService
 				// Live update: publisher is authoritative only for their own rows.
 				applyPublisherRows(getCategory(snapshot, "available"), groupId, groupAvailable, publisher);
 				applyPublisherRows(getCategory(snapshot, "lent"), groupId, groupLent, publisher);
-				// "borrowed" is deliberately NOT applied here. Unlike available/lent,
-				// that map is keyed by BORROWER, not by the publisher — so the
-				// publisher-authoritative replace applyPublisherRows does would delete
-				// rows other lenders filed under the publisher's borrower key. Borrowed
-				// rows still arrive via the catch-up merge, which handles keying
-				// correctly; live borrowed sync needs its own merge rule.
+				// "borrowed" is deliberately NOT applied here, and an attempt to add it
+				// was reverted. Two reasons. It is keyed by BORROWER, so the publisher
+				// owns no bucket and any rule has to scope by the lender field - and
+				// scoping that way, absence of a row cannot mean "returned": a lend
+				// offer is recorded on the BORROWER's client, so the lender legitimately
+				// never holds it and would delete it off everyone else. Deletion here
+				// needs a positive tombstone, not an inference from absence.
+				// It also buys nothing today: nothing user-facing reads groupBorrowed.
+				// Active Loans, the trade guards and the return flow all read
+				// getActiveEntries(), which mergeActiveEntries already syncs live.
 				mergeRequests(groupId, snapshot.get("requests"), true);
 				mergeActiveEntries(groupId, snapshot.get("entries"));
 			}

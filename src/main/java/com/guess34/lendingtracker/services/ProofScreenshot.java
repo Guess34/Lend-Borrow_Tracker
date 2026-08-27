@@ -62,11 +62,16 @@ public class ProofScreenshot
 	 */
 	public String getScreenshotFolderPath(String username, String groupName)
 	{
-		// Deliberately does NOT create the folder. It only needed to exist so it
-		// could be opened; saving a screenshot makes it when there's something to
-		// put in it. Creating it here just leaves empty folders behind for anyone
-		// who presses the button.
-		return getScreenshotDirectory(username, groupName).toString();
+		// The BASE folder, not this group's subfolder. Screenshots are filed under
+		// the group that was active when the trade happened, so pointing at the
+		// group active right now sends anyone who has since switched groups to an
+		// empty directory - which is what people were reporting as "no screenshots".
+		// Everything is under here whichever group or name it was filed with.
+		//
+		// Deliberately does NOT create the folder either. It only needed to exist so
+		// it could be opened; saving a screenshot makes it when there is something
+		// to put in it.
+		return BASE_DIR.toString();
 	}
 
 	/** Screenshot phases captured across a loan trade's lifecycle. */

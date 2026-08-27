@@ -5,7 +5,6 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.config.ConfigManager;
 import com.guess34.lendingtracker.model.LendingEntry;
 import com.guess34.lendingtracker.model.LendingGroup;
-import com.guess34.lendingtracker.model.GroupMember;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -15,6 +14,7 @@ import java.time.Instant;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 @Slf4j
@@ -43,6 +43,7 @@ public class LocalDataSyncService {
 
     private Path backupDirectory;
     private Path syncDataFile;
+    private ScheduledFuture<?> backupTask;
     
     public void initialize() {
         try {
@@ -297,7 +298,13 @@ public class LocalDataSyncService {
      * Schedule periodic automatic backups
      */
     private void schedulePeriodicBackup() {
-        executor.scheduleAtFixedRate(() -> {
+        // Guarded because this is a @Singleton: initialize() runs again on every
+        // re-enable, and without this each cycle left another backup task running
+        // on the client's shared executor for the rest of the session.
+        if (backupTask != null) {
+            return;
+        }
+        backupTask = executor.scheduleAtFixedRate(() -> {
             try {
                 createBackup();
             } catch (Exception e) {
@@ -349,7 +356,19 @@ public class LocalDataSyncService {
     }
     
     public void shutdown() {
-        // Final backup before shutdown
-        createBackup();
+        // Ours to cancel - the executor belongs to the client and must not be
+        // shut down here. Left running, this kept writing backups every five
+        // minutes after the plugin was disabled.
+        if (backupTask != null) {
+            backupTask.cancel(false);
+            backupTask = null;
+        }
+        // Final backup, handed off rather than waited on: shutDown must not block,
+        // and this writes the whole dataset to disk.
+        try {
+            executor.execute(this::createBackup);
+        } catch (Exception e) {
+            log.warn("Could not queue the final backup: {}", e.getMessage());
+        }
     }
 }

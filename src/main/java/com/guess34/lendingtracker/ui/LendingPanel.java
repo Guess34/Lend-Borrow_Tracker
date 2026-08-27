@@ -97,9 +97,10 @@ public class LendingPanel extends PluginPanel
 
 		// Register for group change events
 		eventBus.register(this);
+		registered = true;
 
 		// Poll relay connection status until connected, then stop
-		Timer connectionPoller = new Timer(5000, null);
+		connectionPoller = new Timer(5000, null);
 		connectionPoller.addActionListener(e ->
 		{
 			boolean connected = plugin.isRelaySyncConnected();
@@ -111,6 +112,33 @@ public class LendingPanel extends PluginPanel
 		});
 		connectionPoller.setRepeats(true);
 		connectionPoller.start();
+	}
+
+	private Timer connectionPoller;
+	private boolean registered;
+
+	/**
+	 * Release everything this panel holds open. Called from the plugin's shutDown.
+	 *
+	 * Dropping the reference is not enough: the event bus keeps a strong reference
+	 * to a registered subscriber, so the whole panel tree stays alive and keeps
+	 * handling events after the plugin is disabled, and re-enabling stacks another
+	 * subscriber on top. The poller has the same problem - it only stopped itself
+	 * once the relay reported connected, and with Cloud Sync off by default that
+	 * never happens, so it ticked on the EDT for the rest of the session.
+	 */
+	public void deregister()
+	{
+		if (registered)
+		{
+			eventBus.unregister(this);
+			registered = false;
+		}
+		if (connectionPoller != null)
+		{
+			connectionPoller.stop();
+			connectionPoller = null;
+		}
 	}
 
 	/**

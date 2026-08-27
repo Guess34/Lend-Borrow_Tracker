@@ -439,9 +439,9 @@ public class TradeLoanTracker
 
 		// Prefer the middle column layer (holds Accept/Decline); fall back outward
 		Widget parent = firstNonNull(
-			client.getWidget(InterfaceID.TRADEMAIN, 5),
-			client.getWidget(InterfaceID.TRADEMAIN, 2),
-			client.getWidget(InterfaceID.TRADEMAIN, 0));
+			client.getWidget(InterfaceID.Trademain.MIDDLE),
+			client.getWidget(InterfaceID.Trademain.UNIVERSE),
+			client.getWidget(InterfaceID.Trademain.WHOLESCREEN));
 		if (parent == null)
 		{
 			return;
