@@ -119,6 +119,18 @@ public interface LendingTrackerConfig extends Config
 		return 7;
 	}
 
+	@ConfigItem(
+		keyName = "showInviteMenuOption",
+		name = "Right-click Invite Option",
+		description = "Show \"Invite to Lending Group\" when you right-click another player. Only ever appears if you can actually invite.",
+		position = 1,
+		section = defaultsSection
+	)
+	default boolean showInviteMenuOption()
+	{
+		return true;
+	}
+
 	// Screenshots
 
 	@ConfigItem(

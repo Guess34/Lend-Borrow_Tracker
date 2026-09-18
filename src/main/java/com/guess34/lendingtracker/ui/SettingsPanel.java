@@ -34,6 +34,10 @@ public class SettingsPanel extends JPanel
 	private JButton openCloseJoinsButton, copyGroupCodeButton, customGroupCodeButton;
 	private JPanel groupCodePanel;
 	private JButton deleteGroupButton, leaveGroupButton, transferOwnershipButton;
+	// The panel refreshes on every sync event and on a 5s timer, and that
+	// refresh re-enables this button - so without a flag a second click
+	// lands seconds later and starts a CONCURRENT disband.
+	private boolean disbandInProgress;
 	private JButton transferFounderButton;
 	private JComboBox<String> transferFounderDropdown;
 	private JPanel membersListPanel, permissionsPanel, dangerZonePanel;
@@ -761,43 +765,139 @@ public class SettingsPanel extends JPanel
 	{
 		LendingGroup g = groupService.getActiveGroup();
 		if (g == null) return;
-		String user = getCurrentUsername();
+		final String user = getCurrentUsername();
 		if (!groupService.isOwner(g.getId(), user) && !groupService.isFounder(g.getId(), user))
 		{
 			JOptionPane.showMessageDialog(this, "Only an owner can delete the group!",
 				"Permission Denied", JOptionPane.ERROR_MESSAGE);
 			return;
 		}
+
+		// Nothing may still be out on loan - ANYBODY's, not just yours. Disbanding
+		// destroys the record of who owes what for the whole group at once, so a
+		// single open loan somewhere else is still a reason to stop.
+		java.util.List<com.guess34.lendingtracker.model.LendingEntry> open =
+			plugin.getDataService().getAllUnsettled(g.getId());
+		if (!open.isEmpty())
+		{
+			StringBuilder sb = new StringBuilder("<html><b>'").append(escapeHtml(g.getName()))
+				.append("' still has ").append(open.size())
+				.append(open.size() == 1 ? " loan" : " loans").append(" outstanding.</b><br><br>");
+			int shown = 0;
+			for (com.guess34.lendingtracker.model.LendingEntry e : open)
+			{
+				if (shown++ == 8)
+				{
+					sb.append("…and ").append(open.size() - 8).append(" more<br>");
+					break;
+				}
+				sb.append(escapeHtml(e.getItemName())).append(" — ")
+					.append(escapeHtml(e.getLender())).append(" to ")
+					.append(escapeHtml(e.getBorrower())).append("<br>");
+			}
+			sb.append("<br>These have to be returned or settled first.</html>");
+			JOptionPane.showMessageDialog(this, sb.toString(),
+				"Loans Outstanding", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+
 		if (JOptionPane.showConfirmDialog(this,
-			String.format("PERMANENTLY DELETE '%s'?\nAll data will be lost. This cannot be undone!", g.getName()),
-			"Confirm Delete", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION)
+			"<html><b>Disband '" + escapeHtml(g.getName()) + "' for EVERYONE?</b><br><br>"
+				+ "Every member loses the group. Its listings, loans and invite codes are<br>"
+				+ "cleared from the sync server - only a closed marker stays behind, so<br>"
+				+ "members who are offline drop it too. This cannot be undone.</html>",
+			"Confirm Disband", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION)
 		{
 			return;
 		}
-		String groupId = g.getId();
-		String groupName = g.getName();
-		try
+
+		final String groupId = g.getId();
+		final String groupName = g.getName();
+		final String origText = deleteGroupButton.getText();
+		deleteGroupButton.setEnabled(false);
+		disbandInProgress = true;
+		deleteGroupButton.setText("Disbanding...");
+
+		// Blocking: it publishes over the network and reads the record back, so it
+		// must not run on the EDT.
+		new SwingWorker<GroupService.DisbandResult, Void>()
 		{
-			// deleteGroup owns the whole sequence now: it stops sync FIRST, then clears
-			// the data. Clearing here published an empty snapshot that wiped the group
-			// for every other member.
-			if (!groupService.deleteGroup(groupId))
+			@Override
+			protected GroupService.DisbandResult doInBackground()
 			{
-				JOptionPane.showMessageDialog(this,
-					"Still syncing with the group - try again in a moment.",
-					"Not Synced Yet", JOptionPane.WARNING_MESSAGE);
-				return;
+				return groupService.disbandGroup(groupId, user);
 			}
-			JOptionPane.showMessageDialog(this, "Group '" + groupName + "' deleted.",
-				"Deleted", JOptionPane.INFORMATION_MESSAGE);
-			plugin.refreshPanel();
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to delete group", e);
-			JOptionPane.showMessageDialog(this, "Delete failed: " + e.getMessage(),
-				"Error", JOptionPane.ERROR_MESSAGE);
-		}
+
+			@Override
+			protected void done()
+			{
+				disbandInProgress = false;
+				deleteGroupButton.setText(origText);
+				deleteGroupButton.setEnabled(true);
+				GroupService.DisbandResult result;
+				try
+				{
+					result = get();
+				}
+				catch (Exception ex)
+				{
+					log.error("Failed to disband group", ex);
+					JOptionPane.showMessageDialog(SettingsPanel.this,
+						"Disband failed: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+					return;
+				}
+				switch (result)
+				{
+					case DONE:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"'" + groupName + "' has been disbanded for everyone.",
+							"Disbanded", JOptionPane.INFORMATION_MESSAGE);
+						plugin.refreshPanel();
+						break;
+					case LOANS_OUTSTANDING:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"A loan was recorded while you were confirming. Nothing was changed.",
+							"Loans Outstanding", JOptionPane.WARNING_MESSAGE);
+						break;
+					case NOT_SYNCED:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"Still syncing with the group - try again in a moment.\n"
+								+ "Nothing was changed.",
+							"Not Synced Yet", JOptionPane.WARNING_MESSAGE);
+						break;
+					case SENT_UNCONFIRMED:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"The disband went out, and members online right now have lost '" + groupName + "'.\n\n"
+								+ "The sync server didn't confirm it saved it, so members who are offline\n"
+								+ "might not get it. The group is kept on your side so you can finish the\n"
+								+ "job: press Delete Group again in a moment.",
+							"Not Confirmed Yet", JOptionPane.WARNING_MESSAGE);
+						plugin.refreshPanel();
+						break;
+					case NOT_SENT:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"Couldn't reach the sync server, so nothing was sent and nothing was\n"
+								+ "changed - for you or for anyone else. Try again once you are connected.",
+							"Not Sent", JOptionPane.ERROR_MESSAGE);
+						break;
+					case LOCAL_ONLY:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"This group has other members, and with Cloud Sync off there is no way\n"
+								+ "to tell them it is gone.\n\n"
+								+ "Deleting it here would remove your copy and the key that goes with it,\n"
+								+ "leaving everyone else holding a group nobody can ever clear. Turn Cloud\n"
+								+ "Sync on and try again.",
+							"Cloud Sync Is Off", JOptionPane.ERROR_MESSAGE);
+						break;
+					case NOT_ALLOWED:
+					default:
+						JOptionPane.showMessageDialog(SettingsPanel.this,
+							"Only an owner can disband the group.",
+							"Permission Denied", JOptionPane.ERROR_MESSAGE);
+						break;
+				}
+			}
+		}.execute();
 	}
 
 	private void updatePermission(String permType, String role, boolean enabled)
@@ -1133,7 +1233,7 @@ public class SettingsPanel extends JPanel
 		if (dangerZonePanel != null)
 		{
 			dangerZonePanel.setVisible(true);
-			deleteGroupButton.setEnabled(isOwner);
+			deleteGroupButton.setEnabled(isOwner && !disbandInProgress);
 			deleteGroupButton.setVisible(isOwner);
 			// Owners may leave now, unless they are the founder or the last owner
 			// standing. leaveGroup() spells out which rule applies.

@@ -74,6 +74,32 @@ public class GroupService
 	private String currentSyncPlayerName;
 	private long lastSyncTimestamp = 0;
 	private Runnable onSyncCallback;
+	// Told when a group disappears out from under the player, so the plugin
+	// can say so. Without it the group just vanishes from the dropdown with
+	// no explanation - true of a disband AND of being kicked.
+	// How recent a removal has to be before it is worth announcing, and how
+	// many to announce at once. A member returning after a week away merges
+	// every kick that happened while they were gone in one go - without
+	// these they would get one notification per kick, all at once, each
+	// worded as though it had just happened.
+	private static final long REMOVAL_NOTICE_WINDOW_MS = 10L * 60000L;
+	private static final int MAX_REMOVAL_NOTICES = 3;
+	// The cap above is per merge, but a staff clear-out arrives as one publish
+	// per kick - twenty kicks, twenty merges, sixty notifications. This budget
+	// spans merges: at most MAX_REMOVAL_NOTICES a minute, the rest rolled up.
+	private static final long REMOVAL_NOTICE_BUDGET_MS = 60000L;
+	private final Deque<Long> recentRemovalNotices = new ArrayDeque<>();
+	private final Set<String> announcedRemovals = ConcurrentHashMap.newKeySet();
+	private int pendingRemovalNotices;
+	private long lastRemovalRollupAt;
+
+	// Tells the user when a group they were in has gone, or who has left one.
+	private java.util.function.Consumer<String> onGroupGone;
+
+	public void setOnGroupGone(java.util.function.Consumer<String> callback)
+	{
+		this.onGroupGone = callback;
+	}
 	private java.util.function.Consumer<SyncEvent> onWildernessAlert;
 
 	// The group whose stored snapshot we have reconciled with since connecting.
@@ -83,6 +109,15 @@ public class GroupService
 	// were away rolls them back for every member, not just for us. Written from
 	// the sync executor, read from the ws callback thread — hence volatile.
 	private volatile String caughtUpGroupId;
+
+	// Groups we have sent a disband tombstone for. The 5-minute heartbeat and any
+	// user action keep pushing state from other threads; one of those landing
+	// after the tombstone would overwrite the stored record with the live group,
+	// and members who were offline would come back to a group everyone else has
+	// lost. Kept for the rest of the session when the disband went out but could
+	// not be confirmed - the group stays on this client so the owner can retry,
+	// and it must stay silent until they do.
+	private final Set<String> disbandingGroupIds = ConcurrentHashMap.newKeySet();
 
 	// One catch-up retry chain at a time. pollForUpdates ticks every 5 seconds
 	// and would otherwise start a fresh 6-attempt chain on each tick whenever we
@@ -244,6 +279,177 @@ public class GroupService
 		return id;
 	}
 
+	/** Outcome of a disband, so the UI can tell the user what actually happened. */
+	public enum DisbandResult
+	{
+		/** Published, confirmed stored, and torn down here. */
+		DONE,
+		/**
+		 * Sent, but we could not confirm the server stored it. Members who were
+		 * online have already lost the group. We keep it here, silent, so the
+		 * owner can press Delete again - tearing it down now would throw away the
+		 * only key that can still finish the job for members who were offline.
+		 */
+		SENT_UNCONFIRMED,
+		NOT_ALLOWED,       // not an owner or founder
+		LOANS_OUTSTANDING, // something is still lent out somewhere in the group
+		NOT_SYNCED,        // sync is on, but we are offline or not reconciled yet
+		NOT_SENT,          // could not put the message on the wire; nothing changed
+		LOCAL_ONLY         // sync is off and the group has other members - refused
+	}
+
+	/**
+	 * Disband a group for EVERYONE, not just for us.
+	 *
+	 * The tombstone - an empty roster with every member recorded as removed, and no
+	 * listing or loan data - is an ORDINARY SIGNED MESSAGE. The relay is not asked
+	 * to do anything privileged and is not trusted to decide who may disband what;
+	 * it cannot, as it holds no group key. Only a holder of that key can produce a
+	 * tombstone other clients will accept, so knowing a group id is not enough to
+	 * destroy somebody else's group.
+	 *
+	 * THERE IS NO ABORT, and the code is shaped around that. The relay forwards a
+	 * state message to everyone in the room the instant it arrives, before and
+	 * regardless of whether it stores it - so the moment the message is on the wire
+	 * every online member has already dropped the group. Publishing IS the
+	 * irreversible act. What follows can only tell us how completely it took
+	 * effect, never undo it. We tear down here only once the server confirms it
+	 * holds the tombstone; until then this client keeps the group and its key,
+	 * silent, because it is the only thing left that can finish the disband for
+	 * members who were offline. Pressing Delete again simply re-sends it.
+	 *
+	 * Blocking - callers must run it off the EDT.
+	 */
+	public DisbandResult disbandGroup(String groupId, String requester)
+	{
+		LendingGroup group = groups.get(groupId);
+		if (group == null || requester == null) return DisbandResult.NOT_ALLOWED;
+		if (!isOwner(groupId, requester) && !hasFounderPower(groupId, requester))
+		{
+			return DisbandResult.NOT_ALLOWED;
+		}
+		// Nobody's loan disappears into a disband. This asks about the WHOLE group,
+		// not just the owner: disbanding destroys everyone's record of who owes what.
+		// It can only see what THIS client knows. A loan only a member's client
+		// holds survives anyway: dropping a group never deletes loan records, and
+		// the dashboard keeps showing that member their open loans from it.
+		if (dataService != null && !dataService.getAllUnsettled(groupId).isEmpty())
+		{
+			return DisbandResult.LOANS_OUTSTANDING;
+		}
+
+		boolean syncOn = relaySyncService != null && config != null && config.enableRelaySync();
+		boolean alone = group.getMembers() == null || group.getMembers().size() <= 1;
+		if (!syncOn)
+		{
+			// Deleting locally would destroy our copy of the group key, and with it
+			// the only means of ever disbanding it properly - leaving the group
+			// stranded on the server with every other member still holding it.
+			if (!alone) return DisbandResult.LOCAL_ONLY;
+			// A group only we are in has nothing to tell anyone. Safe to just drop.
+			deleteGroup(groupId);
+			return DisbandResult.DONE;
+		}
+
+		// Must be reconciled first, or the tombstone would be built from a view we
+		// already know is incomplete.
+		if (!canPublishRemoval(groupId)) return DisbandResult.NOT_SYNCED;
+
+		// DEEP copy. A shallow one shares the live member list and tombstone map, so
+		// clearing the roster below would empty the real group before the network
+		// call - and a send that never left would leave a live group with no members
+		// and everyone tombstoned.
+		LendingGroup tombstone = gson.fromJson(gson.toJson(group), LendingGroup.class);
+		long now = System.currentTimeMillis();
+		long latestJoin = 0L;
+		if (tombstone.getMembers() != null)
+		{
+			for (GroupMember m : tombstone.getMembers())
+			{
+				if (m != null) { latestJoin = Math.max(latestJoin, m.getJoinedAt()); }
+			}
+			// A tombstone only removes a member when it is NEWER than their joinedAt,
+			// and those two stamps come from different machines' clocks. Anyone whose
+			// clock ran ahead of ours would otherwise survive the disband entirely.
+			long stamp = Math.max(now, latestJoin + 1);
+			for (GroupMember m : tombstone.getMembers())
+			{
+				if (m != null && m.getName() != null) { tombstone.recordRemovalAt(m.getName(), stamp); }
+			}
+			tombstone.getMembers().clear();
+		}
+		tombstone.setMembersUpdatedAt(now);
+		tombstone.setInviteCode(null);
+		tombstone.setInviteCodeGeneratedAt(0);
+		tombstone.setClanCode(null);
+		tombstone.setClanCodeEnabled(false);
+		if (tombstone.getClanCodeUsedBy() != null) { tombstone.getClanCodeUsedBy().clear(); }
+		tombstone.touchCodeState();
+		tombstone.setDisbandedAt(now);
+		tombstone.setDisbandedBy(requester);
+
+		// Silence every other publish for this group BEFORE the tombstone goes, so
+		// no heartbeat can land behind it and overwrite the stored record.
+		disbandingGroupIds.add(groupId);
+		RelaySyncService.PublishOutcome sent =
+			relaySyncService.publishTombstoneBlocking(groupId, relayGroupJson(tombstone), requester);
+		if (sent == RelaySyncService.PublishOutcome.NOT_SENT)
+		{
+			// Never reached the wire, so nothing was broadcast and nothing changed.
+			disbandingGroupIds.remove(groupId);
+			return DisbandResult.NOT_SENT;
+		}
+
+		// On the wire: online members have dropped the group, so retire the codes
+		// either way - nobody should be joining it now. A joiner who slips in
+		// before this lands reads the tombstone on catch-up and drops it too
+		// (forgetGroupIfRemovedReturnsGone treats disbandedAt as removal for all).
+		revokeGroupCodes(group);
+
+		if (sent != RelaySyncService.PublishOutcome.CONFIRMED)
+		{
+			// Can't tell whether the server kept it. Keep the group, and its key,
+			// so a retry can finish the job; tearing down here would leave members
+			// who were offline holding a group nobody can ever disband.
+			return DisbandResult.SENT_UNCONFIRMED;
+		}
+
+		// Clearing our own roster first makes deleteGroup skip its leave-and-publish
+		// step: the tombstone said far more than a MEMBER_LEFT would, and that step
+		// is gated on still being reconciled - which can lapse during the network
+		// call and would otherwise abandon the teardown halfway.
+		if (group.getMembers() != null) { group.getMembers().clear(); }
+		deleteGroup(groupId);
+		disbandingGroupIds.remove(groupId);
+		return DisbandResult.DONE;
+	}
+
+	/**
+	 * The row a joiner adds for themselves. Invite records carry no roster, so the
+	 * joiner cannot tell whether they are already in the group - a staff member
+	 * setting up a second machine joins exactly like a stranger. joinedAt is now,
+	 * so a return outranks an old removal; the role is stamped as old as possible,
+	 * so this guess never outranks a role anyone actually set. Stamped "now", it
+	 * demoted every existing staff member who joined from a new machine.
+	 */
+	private static GroupMember joinerRow(String playerName)
+	{
+		GroupMember row = new GroupMember(playerName, "member");
+		row.setRoleUpdatedAt(1L);
+		return row;
+	}
+
+	/** Kill every code that could still be used to re-adopt this group. */
+	private void revokeGroupCodes(LendingGroup group)
+	{
+		for (String code : new String[] { group.getClanCode(), group.getInviteCode() })
+		{
+			if (code == null || code.isEmpty()) continue;
+			configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + code);
+			if (relaySyncService != null) { relaySyncService.consumeInviteCode(code); }
+		}
+	}
+
 	/**
 	 * Delete our copy of a group. Returns false when the departure could not be
 	 * published - deleting silently would leave us a live member (and possibly the
@@ -400,10 +606,77 @@ public class GroupService
 		// the member merge below can test against the combined set. This is how a
 		// kick propagates: rosters only ever ADD members, so without tombstones a
 		// peer with a stale roster would resurrect anyone we kicked.
+		// Snapshot first, so we can tell which kicks are NEW to us and announce
+		// only those. The tombstones persist, so diffing is what stops the same
+		// removal being announced again on every later merge.
+		java.util.Set<String> knownRemovals =
+			new java.util.HashSet<>(local.getRemovedMembersSafe().keySet());
 		Map<String, Long> tombstones = new HashMap<>(local.getRemovedMembersSafe());
 		for (Map.Entry<String, Long> t : remote.getRemovedMembersSafe().entrySet())
 		{
 			tombstones.merge(t.getKey(), t.getValue(), Math::max);
+		}
+
+		// Tell the group who just lost their place. Skipped entirely for a
+		// disband, which tombstones EVERY member at once - announcing that
+		// would fire once per person instead of the single message the
+		// departing client already shows.
+		if (onGroupGone != null && remote.getDisbandedAt() == 0)
+		{
+			String me = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
+			long now = System.currentTimeMillis();
+			long announceAfter = now - REMOVAL_NOTICE_WINDOW_MS;
+			List<String> notices = new ArrayList<>();
+			for (String key : tombstones.keySet())
+			{
+				if (knownRemovals.contains(key)) continue;
+				if (me != null && key.equals(nameKey(me))) continue;   // our own exit is announced separately
+				// Only for someone we actually had on the roster - otherwise a
+				// peer's old tombstones would announce strangers on first sync.
+				final String k = key;
+				GroupMember gone = merged.stream()
+					.filter(m -> m.getName() != null && k.equals(nameKey(m.getName())))
+					.findFirst().orElse(null);
+				if (gone == null) continue;
+				// Apply the SAME test the removal itself uses. A tombstone a re-join has
+				// already outranked leaves the member on the roster - announcing it would
+				// tell the group somebody was kicked who is standing right there, and
+				// would do it again every time a peer with the stale copy syncs.
+				Long removedAt = tombstones.get(key);
+				if (removedAt == null || removedAt <= gone.getJoinedAt()) continue;
+				if (removedAt < announceAfter) continue;   // history, not news
+				// Once per removal, however many peers relay it to us.
+				if (!announcedRemovals.add(local.getId() + ":" + key + ":" + removedAt)) continue;
+				// "No longer in" rather than "removed": leaving voluntarily
+				// leaves the same tombstone as a kick, and we can't tell them apart.
+				notices.add(gone.getName() + " is no longer in "
+					+ (local.getName() != null ? "'" + local.getName() + "'" : "the group") + ".");
+			}
+			synchronized (recentRemovalNotices)
+			{
+				while (!recentRemovalNotices.isEmpty()
+					&& recentRemovalNotices.peekFirst() < now - REMOVAL_NOTICE_BUDGET_MS)
+				{
+					recentRemovalNotices.pollFirst();
+				}
+				for (String notice : notices)
+				{
+					if (recentRemovalNotices.size() >= MAX_REMOVAL_NOTICES)
+					{
+						pendingRemovalNotices++;
+						continue;
+					}
+					recentRemovalNotices.addLast(now);
+					onGroupGone.accept(notice);
+				}
+				if (pendingRemovalNotices > 0 && now - lastRemovalRollupAt >= REMOVAL_NOTICE_BUDGET_MS)
+				{
+					onGroupGone.accept("...and " + pendingRemovalNotices + " other member"
+						+ (pendingRemovalNotices == 1 ? " is" : "s are") + " no longer in the group.");
+					pendingRemovalNotices = 0;
+					lastRemovalRollupAt = now;
+				}
+			}
 		}
 
 		if (remote.getMembers() != null)
@@ -496,6 +769,15 @@ public class GroupService
 		{
 			local.setFounderName(remote.getFounderName());
 			local.setFounderUpdatedAt(remoteFounderAt);
+		}
+		// Adopt the disband stamp. Without this it only ever existed on the
+		// disbanding client's own throwaway copy, so every OTHER member read
+		// 0 and was told they had been individually kicked - the exact
+		// confusion the message was added to prevent.
+		if (remote.getDisbandedAt() > local.getDisbandedAt())
+		{
+			local.setDisbandedAt(remote.getDisbandedAt());
+			local.setDisbandedBy(remote.getDisbandedBy());
 		}
 		local.setMembers(merged);
 		local.setMembersUpdatedAt(Math.max(local.getMembersUpdatedAt(), remote.getMembersUpdatedAt()));
@@ -706,7 +988,9 @@ public class GroupService
 	private boolean wasRemovedFrom(LendingGroup remote)
 	{
 		String me = currentSyncPlayerName != null ? currentSyncPlayerName : currentAccountName;
-		if (me == null || remote == null) return false;
+		if (remote == null) return false;
+		if (remote.getDisbandedAt() > 0) return true;   // gone for everyone
+		if (me == null) return false;
 		Long removedAt = remote.getRemovedMembersSafe().get(nameKey(me));
 		if (removedAt == null) return false;
 		long myJoinedAt = 0L;
@@ -737,16 +1021,34 @@ public class GroupService
 
 		LendingGroup g = groups.get(groupId);
 		if (g == null) return false;
-		Long removedAt = g.getRemovedMembersSafe().get(nameKey(me));
-		if (removedAt == null) return false;
-		if (g.hasMember(me)) return false;   // a re-join outdated the tombstone
+		// A disband is a removal for everyone, including anyone who joined after
+		// the owner's last look at the roster and so has no tombstone of their own.
+		if (g.getDisbandedAt() <= 0)
+		{
+			Long removedAt = g.getRemovedMembersSafe().get(nameKey(me));
+			if (removedAt == null) return false;
+			if (g.hasMember(me)) return false;   // a re-join outdated the tombstone
+		}
 
+		// Only the GROUP goes. Its loan records stay: an open loan is still owed
+		// whoever removed us, so it stays on the dashboard (under "other groups")
+		// and keeps its overdue reminders, which are scoped to the loans we are
+		// a party to. Deleting them here would also delete the records of any
+		// other account on this machine that is still in the group.
 		if (groupId.equals(currentSyncGroupId))
 		{
 			stopSync();
 		}
-		// Capture the player name BEFORE stopSync above nulls it - the replacement
-		// group needs it to start syncing again.
+		if (onGroupGone != null)
+		{
+			String who = g.getDisbandedBy();
+			String label = g.getName() != null ? g.getName() : "a lending group";
+			// Neutral on purpose: this also fires when we left from another
+			// machine, and "you were removed" reads as a kick.
+			onGroupGone.accept(g.getDisbandedAt() > 0
+				? "'" + label + "' was disbanded" + (who != null ? " by " + who : "") + "."
+				: "You are no longer in '" + label + "'.");
+		}
 		groups.remove(groupId);
 		String replacement = null;
 		if (Objects.equals(activeGroupId, groupId))
@@ -1259,7 +1561,7 @@ public class GroupService
 					// Add joining player as member
 					if (!sharedGroup.hasMember(playerName))
 					{
-						sharedGroup.addMember(new GroupMember(playerName, "member"));
+						sharedGroup.addMember(joinerRow(playerName));
 						touchRoster(sharedGroup);
 					}
 
@@ -1340,7 +1642,7 @@ public class GroupService
 
 						if (!relayGroup.hasMember(playerName))
 						{
-							relayGroup.addMember(new GroupMember(playerName, "member"));
+							relayGroup.addMember(joinerRow(playerName));
 							touchRoster(relayGroup);
 						}
 						if (multiUse)
@@ -1406,7 +1708,7 @@ public class GroupService
 	public InviteCodeResult generateAndPublishInviteCode(String groupId)
 	{
 		LendingGroup group = groups.get(groupId);
-		if (group == null)
+		if (group == null || disbandingGroupIds.contains(groupId))
 		{
 			return null;
 		}
@@ -1420,6 +1722,9 @@ public class GroupService
 			configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + previousCode);
 		}
 		saveGroups();
+		// FULL copy for the local shared key: with sync off this is the only
+		// way another account on this machine ever sees the roster, and it
+		// never leaves the machine. The relay gets the trimmed one below.
 		String groupJson = gson.toJson(group);
 		// Store in shared config so other accounts on the same machine can look up this code
 		configManager.setConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + code, groupJson);
@@ -1429,7 +1734,7 @@ public class GroupService
 		if (syncEnabled && relaySyncService != null)
 		{
 			// Confirm the code actually reached the relay before the owner hands it out
-			published = relaySyncService.publishInviteBlocking(code, groupId, groupJson);
+			published = relaySyncService.publishInviteBlocking(code, groupId, inviteGroupJson(group));
 		}
 
 		// Code state is shared group data — push it live so every staff member's
@@ -1478,6 +1783,10 @@ public class GroupService
 		{
 			return new GroupCodeResult(null, "You don't have permission to manage invite codes.", false, false);
 		}
+		if (disbandingGroupIds.contains(groupId))
+		{
+			return new GroupCodeResult(null, "This group is being disbanded.", false, false);
+		}
 
 		String code;
 		if (customCode != null)
@@ -1499,11 +1808,28 @@ public class GroupService
 			code = code.substring(0, 3) + "-" + code.substring(3, 6) + "-" + code.substring(6, 9);
 		}
 
+		// Kill the code we are replacing. Rotating the clan code after a kick is
+		// how staff shut that door, so leaving the old one alive on the relay
+		// until its 24h expiry defeats the point - closing joins already
+		// revoked properly, changing the code did not.
+		String previousClanCode = group.getClanCode();
+		if (previousClanCode != null && !previousClanCode.isEmpty()
+			&& !previousClanCode.equalsIgnoreCase(code))
+		{
+			configManager.unsetConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + previousClanCode);
+			if (relaySyncService != null)
+			{
+				relaySyncService.consumeInviteCode(previousClanCode);
+			}
+		}
 		group.setClanCode(code);
 		group.setClanCodeEnabled(true);
 		group.touchCodeState();
 		saveGroups();
 
+		// FULL copy for the local shared key: with sync off this is the only
+		// way another account on this machine ever sees the roster, and it
+		// never leaves the machine. The relay gets the trimmed one below.
 		String groupJson = gson.toJson(group);
 		// Same-machine joiners look the code up in shared config
 		configManager.setConfiguration(CFG_GROUP, INVITE_KEY_PREFIX + code, groupJson);
@@ -1512,7 +1838,7 @@ public class GroupService
 		boolean published = false;
 		if (syncEnabled && relaySyncService != null)
 		{
-			published = relaySyncService.publishInviteBlocking(code, groupId, groupJson);
+			published = relaySyncService.publishInviteBlocking(code, groupId, inviteGroupJson(group));
 		}
 
 		// Shared group data — every staff member's panel must show the code is OPEN.
@@ -1576,7 +1902,15 @@ public class GroupService
 		{
 			return;
 		}
-		relaySyncService.publishInviteCode(group.getClanCode(), group.getId(), gson.toJson(group));
+		// Only refresh from a client that has reconciled with the relay. An
+		// un-caught-up peer still holding a rotated-away code would republish
+		// it with a fresh 24h life, undoing the revoke that staff rely on
+		// after a kick - and undoing closing joins too.
+		if (!canPublishRemoval(group.getId())) return;
+		// A disband we are still finishing revoked this code; keeping it alive
+		// would let people join a group that is on its way out.
+		if (disbandingGroupIds.contains(group.getId())) return;
+		relaySyncService.publishInviteCode(group.getClanCode(), group.getId(), inviteGroupJson(group));
 	}
 
 	/** Uppercase and validate a custom code: 6-20 chars, A-Z 0-9 and dashes. */
@@ -1603,8 +1937,20 @@ public class GroupService
 
 	// --- Real-Time Sync ---
 
+	// False from the plugin's shutDown until its next startUp. A disband holds a
+	// network call open for seconds, and if the plugin is turned off meanwhile the
+	// teardown that follows would start syncing a replacement group - reopening a
+	// socket that nothing will ever close.
+	private volatile boolean active = true;
+
+	public void setActive(boolean active)
+	{
+		this.active = active;
+	}
+
 	public void startSync(String groupId, String playerName)
 	{
+		if (!active) return;
 		if (groupId == null || playerName == null)
 		{
 			return;
@@ -2004,6 +2350,57 @@ public class GroupService
 	}
 
 	/**
+	 * The group as it should appear in an INVITE payload.
+	 *
+	 * GET /api/invite/:code has no authentication - knowing the code is the only
+	 * credential - and an open clan code is republished every few minutes to keep
+	 * it alive. So whatever goes in here is readable by anyone who has ever seen
+	 * the code, indefinitely. It used to be the entire group: every member's name
+	 * and role, the kick tombstones, who had used the code.
+	 *
+	 * A joiner needs none of that. They get the real roster from their first sync.
+	 * The group's settings and permission flags do stay - they say nothing about
+	 * who is in it, and a joiner needs them before that first sync lands.
+	 * What they genuinely cannot start without is the signing key, so that stays -
+	 * which does mean the code is as powerful as the key. Fixing THAT needs a
+	 * different join handshake, not a smaller payload.
+	 */
+	private String inviteGroupJson(LendingGroup group)
+	{
+		com.google.gson.JsonObject o = gson.toJsonTree(group).getAsJsonObject();
+		o.remove("members");
+		o.remove("removedMembers");
+		o.remove("clanCodeUsedBy");
+		o.remove("usedGroupCodes");
+		o.remove("inviteCodeUsedByName");
+		return gson.toJson(o);
+	}
+
+	/**
+	 * The group as it should appear on the RELAY: everything except the signing key.
+	 *
+	 * That key is what proves a message came from a member, and the stored state is
+	 * readable by anyone who knows the group id - so publishing it there handed the
+	 * key to anyone who asked for it. It still travels in the INVITE payload, which
+	 * is how a joiner is supposed to receive it.
+	 *
+	 * Used only for what the relay STORES - the state push and the disband
+	 * tombstone - and it must stay that way. Do not reach for it on the invite paths: useInviteCode deserialises that payload
+	 * straight into the live group, and a group that arrives without a secret has a
+	 * brand new one minted for it by the backfill in loadGroups - a DIFFERENT key
+	 * from everyone else's. Every signature then fails, and the group quietly splits
+	 * in two with nothing shown to the user.
+	 *
+	 * Serialises a copy; the live group keeps its secret.
+	 */
+	private String relayGroupJson(LendingGroup group)
+	{
+		com.google.gson.JsonObject o = gson.toJsonTree(group).getAsJsonObject();
+		o.remove("syncSecret");
+		return gson.toJson(o);
+	}
+
+	/**
 	 * Push full group + data state to relay server for offline catch-up.
 	 * Called whenever data changes so the relay always has the latest snapshot.
 	 */
@@ -2016,11 +2413,12 @@ public class GroupService
 		// and the reconnect announce — so this one check is what stops a stale local
 		// copy from overwriting the shared record for everyone.
 		if (!groupId.equals(caughtUpGroupId)) return;
+		if (disbandingGroupIds.contains(groupId)) return;
 
 		LendingGroup group = groups.get(groupId);
 		if (group == null) return;
 
-		String groupJson = gson.toJson(group);
+		String groupJson = relayGroupJson(group);
 		String dataJson = dataService.getGroupDataSnapshot(groupId);
 		relaySyncService.publishState(groupId, groupJson, dataJson, currentSyncPlayerName);
 	}

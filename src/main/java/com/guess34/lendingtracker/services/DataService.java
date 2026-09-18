@@ -672,6 +672,27 @@ public class DataService
 			.forEach(e -> byId.putIfAbsent(e.getId(), e));
 		return new ArrayList<>(byId.values());
 	}
+	/**
+	 * Every unsettled loan anywhere in this group, whoever the parties are.
+	 *
+	 * getUnsettledFor answers "may THIS player walk away". This answers "is the
+	 * group finished with", which is a different question: disbanding destroys the
+	 * record of who owes what to whom, for everybody at once, so it has to wait
+	 * until nothing at all is outstanding - not merely nothing of the owner's.
+	 */
+	public List<LendingEntry> getAllUnsettled(String groupId)
+	{
+		if (groupId == null)
+		{
+			return new ArrayList<>();
+		}
+		Map<String, LendingEntry> byId = new LinkedHashMap<>();
+		Stream.concat(allEntries.values().stream(), historyEntries.stream())
+			.filter(e -> e != null && groupId.equals(e.getGroupId()))
+			.filter(e -> !e.isFullySettled())
+			.forEach(e -> byId.putIfAbsent(e.getId(), e));
+		return new ArrayList<>(byId.values());
+	}
 
 	/**
 	 * Drop every request this player is a party to when they leave or are removed.
@@ -809,11 +830,27 @@ public class DataService
 		return removed;
 	}
 
-	public List<LendingEntry> getOverdueEntries()
+	/**
+	 * Overdue loans this player is a party to - lender or borrower.
+	 *
+	 * allEntries holds every group this machine has ever loaded, and every loan in
+	 * each of them, not just ours. Unscoped, a 70-member group meant an hourly alert
+	 * for every late loan anyone had, and a group you had left or been removed from
+	 * kept alerting forever. Scoping to the player fixes both at the source, so
+	 * leaving a group never has to delete loan records to stop the noise - and the
+	 * loans you are still owed, or still owe, keep reminding you wherever they are.
+	 */
+	public List<LendingEntry> getOverdueEntries(String playerName)
 	{
+		if (playerName == null || playerName.isEmpty())
+		{
+			return new ArrayList<>();
+		}
 		long currentTime = Instant.now().toEpochMilli();
 		return allEntries.values().stream()
 			.filter(entry -> !entry.isReturned() && entry.getDueDate() > 0 && entry.getDueDate() < currentTime)
+			.filter(entry -> playerName.equalsIgnoreCase(entry.getLender())
+				|| playerName.equalsIgnoreCase(entry.getBorrower()))
 			.collect(Collectors.toList());
 	}
 

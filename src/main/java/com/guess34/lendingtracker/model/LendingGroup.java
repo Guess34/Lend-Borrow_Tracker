@@ -51,6 +51,13 @@ public class LendingGroup {
     // stale roster can't erase someone who just joined on another client.
     private long membersUpdatedAt;
 
+    // Set when the group is disbanded. Additive fields, so a client that
+    // predates them simply ignores both and still honours the disband -
+    // the roster arrives empty with everyone tombstoned, which the existing
+    // union merge already understands.
+    private long disbandedAt;
+    private String disbandedBy;
+
     // The player who created this group. A group may have up to 5 owners, and
     // owners can promote each other but never DEMOTE each other - without a
     // founder a single rogue owner could promote allies without limit and nobody
@@ -184,6 +191,20 @@ public class LendingGroup {
         if (memberName == null || memberName.isEmpty()) return;
         if (removedMembers == null) removedMembers = new HashMap<>();
         removedMembers.put(nameKey(memberName), System.currentTimeMillis());
+    }
+
+    /**
+     * Record a removal at a GIVEN time rather than now.
+     *
+     * A tombstone only removes a member when it is newer than their joinedAt, and
+     * those two stamps come from different machines. Disbanding needs to outrank
+     * every member at once, including anyone whose clock ran ahead of the
+     * disbander's - otherwise they quietly survive it and keep the group.
+     */
+    public void recordRemovalAt(String memberName, long at) {
+        if (memberName == null || memberName.isEmpty()) return;
+        if (removedMembers == null) removedMembers = new HashMap<>();
+        removedMembers.merge(nameKey(memberName), at, Math::max);
     }
 
     /** Drop the kick tombstone for a name (member re-joined). */

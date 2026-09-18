@@ -75,6 +75,10 @@ public class LendingTrackerPlugin extends Plugin
 	// would come back up after teardown and leak for the rest of the session.
 	// Each run captures the value it was queued with and stops if it moved.
 	private final java.util.concurrent.atomic.AtomicLong sessionEpoch = new java.util.concurrent.atomic.AtomicLong();
+	// Loan id -> the days-overdue count we last reminded about. The check runs
+	// hourly but a reminder day lasts 24 hours, so without this every due
+	// reminder went off 24 times.
+	private final java.util.Map<String, Long> overdueRemindedAt = new java.util.concurrent.ConcurrentHashMap<>();
 	@Inject private Notifier notifier;
 	@Inject private EventBus eventBus;
 	@Inject private DataService dataService;
@@ -121,7 +125,14 @@ public class LendingTrackerPlugin extends Plugin
 		if (clientToolbar != null) { clientToolbar.addNavigation(navButton); }
 		else { log.error("ClientToolbar is null - UI will not appear"); }
 
+		groupService.setActive(true);
 		groupService.setOnSyncCallback(this::onGroupDataSynced);
+		// A group vanishing without a word is the single most confusing thing
+		// the plugin can do, so say what happened.
+		groupService.setOnGroupGone(msg ->
+		{
+			if (config.enableNotifications()) { notifier.notify("[Lending Tracker] " + msg); }
+		});
 		groupService.setOnWildernessAlert(this::handleWildernessAlert);
 		tradeLoanTracker.setOnLoanRecorded(this::refreshPanel);
 
@@ -198,6 +209,7 @@ public class LendingTrackerPlugin extends Plugin
 		scheduledTasks.clear();
 
 		relaySyncService.stopKeepalive();
+		groupService.setActive(false);
 		groupService.stopSync();
 		if (navButton != null) { clientToolbar.removeNavigation(navButton); }
 		if (localDataSyncService != null)
@@ -232,7 +244,7 @@ public class LendingTrackerPlugin extends Plugin
 		configManager.setConfiguration("lendingtracker", "currentAccount", playerName);
 		LendingGroup activeGroup = groupService.getActiveGroup();
 		if (activeGroup != null) { groupService.startSync(activeGroup.getId(), playerName); }
-		if (newPanel != null) { newPanel.refresh(); }
+		refreshPanel();
 		checkForRequestNotifications();
 		applyApprovedRemovals();
 	}
@@ -240,7 +252,7 @@ public class LendingTrackerPlugin extends Plugin
 	/** Runs whenever group data changes via sync (local poll or relay). */
 	private void onGroupDataSynced()
 	{
-		if (newPanel != null) { newPanel.refresh(); }
+		refreshPanel();
 		checkForRequestNotifications();
 		applyApprovedRemovals();
 	}
@@ -476,7 +488,7 @@ public class LendingTrackerPlugin extends Plugin
 			groupService.stopSync();
 			tradeLoanTracker.reset();
 			tradeLoanTracker.clearPendingDecisions();
-			if (newPanel != null) { newPanel.refresh(); }
+			refreshPanel();
 		}
 	}
 
@@ -563,13 +575,15 @@ public class LendingTrackerPlugin extends Plugin
 
 	private void checkOverdueLoans()
 	{
-		List<LendingEntry> overdueEntries = dataService.getOverdueEntries();
+		List<LendingEntry> overdueEntries = dataService.getOverdueEntries(getCurrentPlayerName());
 		if (overdueEntries.isEmpty() || !config.enableNotifications()) { return; }
 		for (LendingEntry entry : overdueEntries)
 		{
 			long daysOverdue = ChronoUnit.DAYS.between(Instant.ofEpochMilli(entry.getDueDate()), Instant.now());
-			if (daysOverdue > 0 && daysOverdue % config.overdueReminderFrequency() == 0)
+			if (daysOverdue > 0 && daysOverdue % Math.max(1, config.overdueReminderFrequency()) == 0)
 			{
+				Long last = overdueRemindedAt.put(entry.getId(), daysOverdue);
+				if (last != null && last == daysOverdue) { continue; }
 				// With running-tally returns a loan can stay open past due while the
 				// BORROWER's side is fully home (only collateral still to hand back) —
 				// don't frame that as an overdue item on the borrower.
@@ -577,7 +591,13 @@ public class LendingTrackerPlugin extends Plugin
 					? "Overdue loan: " + entry.getItemName() + " (" + daysOverdue + " days overdue)"
 					: "Open loan: " + entry.getItemName() + " — items returned, collateral still to be handed back";
 				notifier.notify(message);
-				if (config.enableSoundAlerts()) { client.playSoundEffect(SoundEffectID.UI_BOOP); }
+				// playSoundEffect must run on the client thread. checkOverdueLoans runs on
+				// the shared executor, so this needs the same hop the request-notification
+				// path already makes.
+				if (config.enableSoundAlerts())
+				{
+					clientThread.invokeLater(() -> client.playSoundEffect(SoundEffectID.UI_BOOP));
+				}
 			}
 		}
 	}
@@ -704,7 +724,7 @@ public class LendingTrackerPlugin extends Plugin
 					? client.getLocalPlayer().getName() : "Unknown");
 				entry.setLendTime(Instant.now().toEpochMilli());
 				dataService.addToAvailableList(entry, groupService.getCurrentGroupId());
-				if (newPanel != null) { newPanel.refresh(); }
+				refreshPanel();
 			}
 			catch (NumberFormatException e)
 			{
@@ -1011,7 +1031,7 @@ public class LendingTrackerPlugin extends Plugin
 			{
 				groupService.addMember(fg.getId(), sender, "member");
 				showNotification("Added", sender + " joined " + fg.getName());
-				if (newPanel != null) { newPanel.refresh(); }
+				refreshPanel();
 			}
 		});
 	}
@@ -1161,6 +1181,9 @@ public class LendingTrackerPlugin extends Plugin
 
 	private boolean canCurrentUserInvite()
 	{
+		// Asked for in issue #1: some people just don't want a plugin adding a
+		// right-click entry, even one they're entitled to.
+		if (config != null && !config.showInviteMenuOption()) { return false; }
 		if (client == null || client.getLocalPlayer() == null) { return false; }
 		String name = client.getLocalPlayer().getName();
 		if (name == null || name.isEmpty() || groupService == null) { return false; }

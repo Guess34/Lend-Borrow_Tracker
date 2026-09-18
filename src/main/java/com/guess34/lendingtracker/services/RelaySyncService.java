@@ -583,6 +583,108 @@ public class RelaySyncService
 	}
 
 	/**
+	 * What became of a tombstone publish.
+	 *
+	 * NOT_SENT  - never reached the wire, so nothing was broadcast to anyone and
+	 *             nothing has changed for anybody. The only safe abort point.
+	 * SENT      - on the wire, but we could not verify the server stored it. Every
+	 *             member who was online has already dropped the group; members who
+	 *             were offline read the stored record, so they may not.
+	 * CONFIRMED - on the wire and our tombstone is what the server holds.
+	 */
+	public enum PublishOutcome { NOT_SENT, SENT, CONFIRMED }
+
+	/**
+	 * Publish a group tombstone and find out how completely it took effect.
+	 *
+	 * dataJson is deliberately null - a disbanded group publishes no listings, no
+	 * loans and no requests, so the stored record keeps nothing but the tombstone.
+	 *
+	 * The confirmation checks that OUR tombstone is the stored record, not merely
+	 * that something newer exists. Comparing timestamps alone passes on any peer's
+	 * heartbeat that crossed ours - and on our own, since this client keeps
+	 * publishing state on a timer throughout - which would report success for a
+	 * tombstone that was overwritten moments later.
+	 *
+	 * Blocking - callers must run it off the EDT.
+	 */
+	public PublishOutcome publishTombstoneBlocking(String groupId, String tombstoneJson, String publisher)
+	{
+		long sentAt = publishState(groupId, tombstoneJson, null, publisher);
+		if (sentAt == 0L)
+		{
+			log.warn("Could not publish the tombstone for group {}: not connected", groupId);
+			return PublishOutcome.NOT_SENT;
+		}
+
+		String baseUrl = getRestBaseUrl();
+		if (baseUrl == null) return PublishOutcome.SENT;
+
+		for (int attempt = 1; attempt <= 3; attempt++)
+		{
+			try
+			{
+				// Built inside the try: a malformed relay URL throws here, and an
+				// escape would leak past the caller's bookkeeping after the
+				// tombstone has already gone out.
+				Request request = new Request.Builder()
+					.url(baseUrl + "/api/state/" + groupId).get().build();
+				try (Response response = getRestClient().newCall(request).execute())
+				{
+					if (response.isSuccessful() && response.body() != null)
+					{
+						if (storedRecordIsTombstone(response.body().string(), publisher))
+						{
+							log.debug("Tombstone for group {} confirmed stored (attempt {})", groupId, attempt);
+							return PublishOutcome.CONFIRMED;
+						}
+						log.debug("Stored record for group {} is not our tombstone yet (attempt {})",
+							groupId, attempt);
+					}
+					else
+					{
+						log.warn("Tombstone check for group {} got HTTP {}", groupId, response.code());
+					}
+				}
+			}
+			catch (Exception e)
+			{
+				log.warn("Tombstone check {} for group {} failed: {}", attempt, groupId, e.getMessage());
+			}
+		}
+		return PublishOutcome.SENT;
+	}
+
+	/** Is the server holding a disband tombstone published by this player? */
+	private boolean storedRecordIsTombstone(String body, String publisher)
+	{
+		try
+		{
+			JsonObject stored = gson.fromJson(body, JsonObject.class);
+			if (stored == null || !stored.has("groupJson") || stored.get("groupJson").isJsonNull())
+			{
+				return false;
+			}
+			if (publisher != null && stored.has("publisher") && !stored.get("publisher").isJsonNull()
+				&& !publisher.equalsIgnoreCase(stored.get("publisher").getAsString()))
+			{
+				return false;
+			}
+			JsonObject group = gson.fromJson(stored.get("groupJson").getAsString(), JsonObject.class);
+			if (group == null || !group.has("disbandedAt") || group.get("disbandedAt").isJsonNull())
+			{
+				return false;
+			}
+			return group.get("disbandedAt").getAsLong() > 0;
+		}
+		catch (Exception e)
+		{
+			log.debug("Could not read the stored record back: {}", e.getMessage());
+			return false;
+		}
+	}
+
+	/**
 	 * Outcome of a relay invite-code lookup.
 	 * FOUND       - code exists, groupJson populated
 	 * NOT_FOUND   - relay responded 404 (code invalid/expired/consumed)
@@ -728,12 +830,12 @@ public class RelaySyncService
 	 * @param publisher this client's player name; receivers treat the publisher as
 	 *                  authoritative for their own rows when merging the snapshot
 	 */
-	public void publishState(String groupId, String groupJson, String dataJson, String publisher)
+	public long publishState(String groupId, String groupJson, String dataJson, String publisher)
 	{
-		if (config == null || !config.enableRelaySync()) return;
+		if (config == null || !config.enableRelaySync()) return 0L;
 		// Cache the volatile field — see leaveRoom for why.
 		WebSocket ws = webSocket;
-		if (!connected || ws == null || groupId == null) return;
+		if (!connected || ws == null || groupId == null) return 0L;
 
 		long timestamp = System.currentTimeMillis();
 
@@ -762,8 +864,16 @@ public class RelaySyncService
 			}
 		}
 
-		ws.send(gson.toJson(msg));
+		// send() returns false when the socket is already closing - during a relay
+		// redeploy, say. Discarding that reported a timestamp for a message that
+		// never left, which a caller then treats as "it went out".
+		if (!ws.send(gson.toJson(msg)))
+		{
+			log.warn("State for group {} was not queued: the socket is closing", groupId);
+			return 0L;
+		}
 		log.debug("Published group state to relay for group {}", groupId);
+		return timestamp;
 	}
 
 	/**
