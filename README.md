@@ -150,9 +150,13 @@ window.
 
 ## Linking an in-game clan
 
-In the same **Set up** window, press **Use my clan** or type the clan's name. It does not have
-to match the group's name. The plugin reads the game's own clan list, so clan mates on mobile
+Only for groups that belong to a clan. In the same **Set up** window, tick **This group
+belongs to an in-game clan**, then press **Use my clan** or type the name. It does not have to
+match the group's name. The plugin reads the game's own clan list, so clan mates on mobile
 count as members even though they cannot run the plugin.
+
+Leave it off for a group of friends. Nothing clan-related is then used, and the group can have
+its own Discord channel in its own server.
 
 **Track loans with** decides whose loans the group records and posts:
 
@@ -162,7 +166,7 @@ count as members even though they cannot run the plugin.
 | **Group members only** | Both players must be in this group |
 | **Anyone** | Every loan made in the group |
 
-A trade outside that setting is not recorded, and the player is told why in chat.
+"Clan members only" is offered once the group has a clan. A trade outside that setting is not recorded, and the player is told why in chat.
 
 ## Proof
 
