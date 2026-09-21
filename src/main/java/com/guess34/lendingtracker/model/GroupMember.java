@@ -25,6 +25,12 @@ public class GroupMember {
     // stale republish loses to the change it never saw. 0 on members saved before
     // this existed, so any explicit role change beats them.
     private long roleUpdatedAt;
+    // This member's Discord user ID, so loan posts can tag them. Only there if
+    // they turned "Ping me" on; sealed with the group key (WebhookSeal) because
+    // the roster is stored on the relay. Set by the member's own client. Its own
+    // stamp, newest wins; empty with a newer stamp means they turned it off.
+    private String discordSealed;
+    private long discordUpdatedAt;
 
     public GroupMember(String name, String role) {
         this.name = name;

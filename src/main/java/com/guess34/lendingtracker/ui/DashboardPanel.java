@@ -7,6 +7,10 @@ import com.guess34.lendingtracker.model.LendingEntry;
 import com.guess34.lendingtracker.model.LendingRequest;
 import com.guess34.lendingtracker.services.DataService;
 import com.guess34.lendingtracker.services.GroupService;
+import com.guess34.lendingtracker.services.ItemCategories;
+import net.runelite.client.game.ItemVariationMapping;
+import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.util.AsyncBufferedImage;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.util.QuantityFormatter;
@@ -35,9 +39,28 @@ public class DashboardPanel extends JPanel
 	private final JLabel activeLoansLabel;
 	private final JLabel overdueCountLabel;
 	private final JPanel loanListPanel;
+	private final ItemCategories itemCategories;
 
-	// In-memory cache for Looking For requests to ensure immediate display after saving
-	private final java.util.Map<String, List<LookingForRequest>> lookingForCache = new java.util.concurrent.ConcurrentHashMap<>();
+	// Search and filter live OUTSIDE the list, which is torn down and rebuilt on
+	// every refresh - inside it, each keystroke would rebuild the field being typed in.
+	private final IconTextField searchField;
+	private final JComboBox<String> filterBox;
+	private final Timer searchDebounce;
+
+	// With a big marketplace every owner starts folded so the list is a directory
+	// of people, not hundreds of rows. Smaller ones start open.
+	private static final int FOLD_OWNERS_ABOVE = 15;
+	private static final long END_GAME_VALUE = 10_000_000L;
+	private static final String FILTER_ALL = "All items";
+	private static final String FILTER_MINE = "My listings";
+	private static final String FILTER_SETS = "Sets";
+	private static final String FILTER_END_GAME = "End game (10m+)";
+	private final java.util.Set<String> ownerToggles = new java.util.HashSet<>();
+	private final java.util.Set<String> expandedSets = new java.util.HashSet<>();
+
+	// Legacy Looking For posts were kept only in local config; each group is moved
+	// onto the synced requests once per session.
+	private final java.util.Set<String> migratedLookingFor = new java.util.HashSet<>();
 
 	// Track collapsed sections - all start collapsed for a clean initial view
 	private final java.util.Set<String> collapsedSections = new java.util.HashSet<>(
@@ -50,6 +73,7 @@ public class DashboardPanel extends JPanel
 		this.dataService = plugin.getDataService();
 		this.groupService = plugin.getGroupService();
 		this.itemManager = plugin.getItemManager();
+		this.itemCategories = plugin.getItemCategories();
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -87,7 +111,42 @@ public class DashboardPanel extends JPanel
 		summaryHeader.add(Box.createVerticalStrut(5));
 		summaryHeader.add(overdueCountLabel);
 
-		add(summaryHeader, BorderLayout.NORTH);
+		searchField = new IconTextField();
+		searchField.setIcon(IconTextField.Icon.SEARCH);
+		searchField.setPreferredSize(new Dimension(200, 28));
+		searchField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		searchField.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+		searchField.setToolTipText("Search items, sets or players");
+		searchDebounce = new Timer(250, e -> refresh());
+		searchDebounce.setRepeats(false);
+		searchField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener()
+		{
+			public void insertUpdate(javax.swing.event.DocumentEvent e) { searchDebounce.restart(); }
+			public void removeUpdate(javax.swing.event.DocumentEvent e) { searchDebounce.restart(); }
+			public void changedUpdate(javax.swing.event.DocumentEvent e) { searchDebounce.restart(); }
+		});
+
+		java.util.List<String> filters = new java.util.ArrayList<>(java.util.Arrays.asList(
+			FILTER_ALL, FILTER_MINE, FILTER_SETS, FILTER_END_GAME));
+		for (ItemCategories.Category c : ItemCategories.Category.values())
+		{
+			filters.add(c.getLabel());
+		}
+		filterBox = new JComboBox<>(filters.toArray(new String[0]));
+		filterBox.setFont(FontManager.getRunescapeSmallFont());
+		filterBox.setToolTipText("Show only one kind of gear");
+		filterBox.addActionListener(e -> refresh());
+
+		JPanel filterBar = new JPanel(new BorderLayout(0, 4));
+		filterBar.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		filterBar.setBorder(new EmptyBorder(6, 6, 2, 6));
+		filterBar.add(searchField, BorderLayout.NORTH);
+		filterBar.add(filterBox, BorderLayout.SOUTH);
+
+		JPanel north = new JPanel(new BorderLayout());
+		north.add(summaryHeader, BorderLayout.NORTH);
+		north.add(filterBar, BorderLayout.SOUTH);
+		add(north, BorderLayout.NORTH);
 
 		// Create loan list panel (scrollable)
 		// Wrapper panel with BorderLayout ensures items stack top-down
@@ -265,28 +324,14 @@ public class DashboardPanel extends JPanel
 				})
 				.collect(java.util.stream.Collectors.toList());
 
-			// Show marketplace offerings first
-			if (!displayItems.isEmpty())
-			{
-				// Add section header for marketplace
-				// Collapsible section header with item count
-				boolean marketCollapsed = collapsedSections.contains("marketplace");
-				JPanel marketHeader = createCollapsibleHeader(
-					"Available for Lending (" + displayItems.size() + ")",
-					ColorScheme.BRAND_ORANGE, "marketplace", marketCollapsed);
-				loanListPanel.add(marketHeader);
+			// Categories come from the client thread; ask for anything not seen yet
+			// and draw again once it is known.
+			itemCategories.prime(displayItems.stream().map(LendingEntry::getItemId)
+				.collect(java.util.stream.Collectors.toList()), this::refresh);
 
-				if (!marketCollapsed)
-				{
-					for (LendingEntry item : displayItems)
-					{
-						MarketplaceCard card = new MarketplaceCard(item);
-						loanListPanel.add(card);
-					}
-				}
-			}
+			String query = searchQuery();
 
-			// Show direct requests (borrow requests / lend offers) involving me
+			// Direct requests (borrow requests / lend offers) involving me
 			String me = getCurrentPlayerName();
 			List<LendingRequest> incomingRequests = new java.util.ArrayList<>();
 			List<LendingRequest> outgoingRequests = new java.util.ArrayList<>();
@@ -296,9 +341,40 @@ public class DashboardPanel extends JPanel
 				// Staff-review removals visible to eligible uninvolved owners/co-owners
 				incomingRequests.addAll(dataService.getPendingStaffRemovalsFor(groupId, me,
 					groupService.getGroup(groupId)));
+				// Looking For posts are requests too, but they have their own section.
 				outgoingRequests.addAll(dataService.getRequestsFrom(groupId, me).stream()
-					.filter(LendingRequest::isPending)
+					.filter(r -> r.isPending() && !r.isLookingFor())
 					.collect(java.util.stream.Collectors.toList()));
+			}
+
+			// Looking For, matched against what is listed right now
+			List<LookingForRequest> lookingForRequests = getLookingForRequests(groupId);
+			java.util.Set<Integer> myBases = new java.util.HashSet<>();
+			for (LendingEntry item : displayItems)
+			{
+				if (me.equalsIgnoreCase(item.getLender())) myBases.add(ItemVariationMapping.map(item.getItemId()));
+			}
+			int wantsMine = 0;
+			for (LookingForRequest r : lookingForRequests)
+			{
+				r.listedBy = whoListed(r, displayItems);
+				r.wantsMine = !me.equalsIgnoreCase(r.requesterName) && r.wantsAny(myBases, displayItems, me);
+				if (r.wantsMine) wantsMine++;
+			}
+			if (!query.isEmpty())
+			{
+				lookingForRequests.removeIf(r -> !r.matches(query));
+			}
+
+			long myOverdue = java.util.stream.Stream.concat(activeLoans.stream(), otherGroupLoans.stream())
+				.filter(LendingEntry::isOverdue)
+				.filter(e -> me.equalsIgnoreCase(e.getLender()) || me.equalsIgnoreCase(e.getBorrower()))
+				.count();
+
+			// What needs this player's attention, before anything to browse.
+			if (!incomingRequests.isEmpty() || myOverdue > 0 || wantsMine > 0)
+			{
+				loanListPanel.add(createNeedsYouStrip(incomingRequests.size(), myOverdue, wantsMine));
 			}
 
 			if (!incomingRequests.isEmpty() || !outgoingRequests.isEmpty())
@@ -322,12 +398,15 @@ public class DashboardPanel extends JPanel
 				}
 			}
 
-			// Show "Looking For" requests section
-			List<LookingForRequest> lookingForRequests = getLookingForRequests(groupId);
+			if (!displayItems.isEmpty())
+			{
+				addMarketplaceSection(displayItems, me, query);
+			}
+
 			if (!lookingForRequests.isEmpty())
 			{
 				// Collapsible section header with item count
-				boolean lookingForCollapsed = collapsedSections.contains("lookingfor");
+				boolean lookingForCollapsed = collapsedSections.contains("lookingfor") && query.isEmpty();
 				JPanel lookingForHeader = createCollapsibleHeader(
 					"Looking For (" + lookingForRequests.size() + ")",
 					ColorScheme.GRAND_EXCHANGE_PRICE, "lookingfor", lookingForCollapsed);
@@ -404,36 +483,672 @@ public class DashboardPanel extends JPanel
 		});
 	}
 
+	// ---------------------------------------------------------------- marketplace
+
+	private String searchQuery()
+	{
+		String q = searchField.getText();
+		return q == null ? "" : q.trim().toLowerCase();
+	}
+
+	/**
+	 * One thing to show in the marketplace: a loose listing, or every listed piece
+	 * of one owner's set.
+	 */
+	private final class ListingUnit
+	{
+		final String owner;
+		final String setId;
+		final String setName;
+		final List<LendingEntry> pieces = new java.util.ArrayList<>();
+
+		ListingUnit(String owner, String setId, String setName)
+		{
+			this.owner = owner;
+			this.setId = setId;
+			this.setName = setName;
+		}
+
+		long value()
+		{
+			return pieces.stream().mapToLong(LendingEntry::getValue).sum();
+		}
+
+		String key()
+		{
+			return owner.toLowerCase() + "#" + setId;
+		}
+
+		boolean matches(String query, String filter, String me)
+		{
+			if (!query.isEmpty())
+			{
+				boolean hit = owner.toLowerCase().contains(query)
+					|| (setName != null && setName.toLowerCase().contains(query))
+					|| pieces.stream().anyMatch(p -> p.getItem() != null && p.getItem().toLowerCase().contains(query));
+				if (!hit) return false;
+			}
+			if (filter == null || FILTER_ALL.equals(filter)) return true;
+			if (FILTER_MINE.equals(filter)) return owner.equalsIgnoreCase(me);
+			if (FILTER_SETS.equals(filter)) return setId != null;
+			if (FILTER_END_GAME.equals(filter)) return pieces.stream().anyMatch(DashboardPanel::isEndGame);
+			ItemCategories.Category wanted = null;
+			for (ItemCategories.Category c : ItemCategories.Category.values())
+			{
+				if (c.getLabel().equals(filter)) wanted = c;
+			}
+			final ItemCategories.Category w = wanted;
+			return w != null && pieces.stream().anyMatch(p -> hasCategory(p, w));
+		}
+	}
+
+	private static boolean isEndGame(LendingEntry e)
+	{
+		long each = e.getQuantity() > 1 ? e.getValue() / e.getQuantity() : e.getValue();
+		return each >= END_GAME_VALUE;
+	}
+
+	private boolean hasCategory(LendingEntry e, ItemCategories.Category c)
+	{
+		java.util.Set<ItemCategories.Category> cats = itemCategories.get(e.getItemId());
+		return cats != null && cats.contains(c);
+	}
+
+	/** "Melee · Slash · DPS" - what the item is for, worked out from its stats. */
+	private String categoryText(LendingEntry e)
+	{
+		java.util.List<String> parts = new java.util.ArrayList<>();
+		java.util.Set<ItemCategories.Category> cats = itemCategories.get(e.getItemId());
+		if (cats != null)
+		{
+			for (ItemCategories.Category c : cats) parts.add(c.getLabel());
+		}
+		if (isEndGame(e)) parts.add("End game");
+		return String.join(" · ", parts);
+	}
+
+	/** Group listings into units: each owner's set becomes one unit, loose pieces their own. */
+	private List<ListingUnit> buildUnits(List<LendingEntry> items)
+	{
+		java.util.Map<String, ListingUnit> units = new java.util.LinkedHashMap<>();
+		int loose = 0;
+		for (LendingEntry e : items)
+		{
+			String owner = e.getLender();
+			if (e.isInSet())
+			{
+				String key = owner.toLowerCase() + "#" + e.getSetId();
+				units.computeIfAbsent(key, k -> new ListingUnit(owner, e.getSetId(), e.getSetName())).pieces.add(e);
+			}
+			else
+			{
+				ListingUnit u = new ListingUnit(owner, null, null);
+				u.pieces.add(e);
+				units.put("loose#" + (loose++), u);
+			}
+		}
+		return new java.util.ArrayList<>(units.values());
+	}
+
+	private void addMarketplaceSection(List<LendingEntry> displayItems, String me, String query)
+	{
+		String filter = (String) filterBox.getSelectedItem();
+		boolean filtering = !query.isEmpty() || (filter != null && !FILTER_ALL.equals(filter));
+
+		List<ListingUnit> units = buildUnits(displayItems);
+		if (filtering)
+		{
+			units.removeIf(u -> !u.matches(query, filter, me));
+		}
+		int shown = units.stream().mapToInt(u -> u.pieces.size()).sum();
+
+		// A search or filter opens the section - hiding the results of a search
+		// behind a folded header would look like there were none.
+		boolean marketCollapsed = collapsedSections.contains("marketplace") && !filtering;
+		loanListPanel.add(createCollapsibleHeader(
+			"Available for Lending (" + (filtering ? shown + " of " + displayItems.size() : displayItems.size()) + ")",
+			ColorScheme.BRAND_ORANGE, "marketplace", marketCollapsed));
+		if (marketCollapsed) return;
+
+		if (units.isEmpty())
+		{
+			JLabel none = new JLabel("Nothing matches.");
+			none.setFont(FontManager.getRunescapeSmallFont());
+			none.setForeground(Color.GRAY);
+			none.setBorder(new EmptyBorder(4, 12, 6, 0));
+			loanListPanel.add(none);
+			return;
+		}
+
+		java.util.Comparator<ListingUnit> byValue =
+			java.util.Comparator.comparingLong(ListingUnit::value).reversed();
+
+		if (filtering)
+		{
+			// Results: one flat list, best first, each row saying whose it is.
+			// Capped - a filter as broad as "Melee" across a whole clan would
+			// otherwise build hundreds of rows at once.
+			units.sort(byValue);
+			int cap = 60;
+			for (int i = 0; i < units.size() && i < cap; i++) addUnit(units.get(i), true);
+			if (units.size() > cap)
+			{
+				JLabel more = new JLabel("...and " + (units.size() - cap) + " more - search to narrow it down");
+				more.setFont(FontManager.getRunescapeSmallFont());
+				more.setForeground(Color.GRAY);
+				more.setBorder(new EmptyBorder(4, 12, 6, 0));
+				loanListPanel.add(more);
+			}
+			return;
+		}
+
+		// Browsing: a directory of owners, you first, then everyone A-Z.
+		java.util.Map<String, List<ListingUnit>> byOwner = new java.util.TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+		for (ListingUnit u : units)
+		{
+			byOwner.computeIfAbsent(u.owner, k -> new java.util.ArrayList<>()).add(u);
+		}
+		List<String> owners = new java.util.ArrayList<>(byOwner.keySet());
+		owners.sort((a, b) -> a.equalsIgnoreCase(me) ? -1 : b.equalsIgnoreCase(me) ? 1 : a.compareToIgnoreCase(b));
+		boolean big = displayItems.size() > FOLD_OWNERS_ABOVE;
+		for (String owner : owners)
+		{
+			List<ListingUnit> list = byOwner.get(owner);
+			list.sort(byValue);
+			int pieces = list.stream().mapToInt(u -> u.pieces.size()).sum();
+			long value = list.stream().mapToLong(ListingUnit::value).sum();
+			String key = owner.toLowerCase();
+			// The toggle set means "flipped from the default", whichever way the
+			// default currently points.
+			boolean open = big == ownerToggles.contains(key);
+			loanListPanel.add(createOwnerHeader(owner, owner.equalsIgnoreCase(me), pieces, value, open, key));
+			if (open)
+			{
+				for (ListingUnit u : list) addUnit(u, false);
+			}
+		}
+	}
+
+	private void addUnit(ListingUnit u, boolean showOwner)
+	{
+		if (u.setId == null)
+		{
+			loanListPanel.add(new MarketplaceCard(u.pieces.get(0), showOwner, false));
+			return;
+		}
+		loanListPanel.add(new SetCard(u, showOwner));
+		if (expandedSets.contains(u.key()))
+		{
+			for (LendingEntry piece : u.pieces)
+			{
+				loanListPanel.add(new MarketplaceCard(piece, false, true));
+			}
+		}
+	}
+
+	private JPanel createOwnerHeader(String owner, boolean isMe, int count, long value, boolean open, String key)
+	{
+		JPanel header = new JPanel(new BorderLayout());
+		header.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		header.setBorder(new EmptyBorder(5, 12, 3, 10));
+		header.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+		header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
+
+		JLabel name = new JLabel((open ? "▼ " : "▶ ") + owner + (isMe ? " (you)" : "") + "  " + count);
+		name.setFont(FontManager.getRunescapeSmallFont());
+		name.setForeground(isMe ? new Color(0x8C, 0xE0, 0x8C) : Color.WHITE);
+		header.add(name, BorderLayout.WEST);
+
+		JLabel worth = new JLabel(QuantityFormatter.quantityToStackSize(value));
+		worth.setFont(FontManager.getRunescapeSmallFont());
+		worth.setForeground(Color.YELLOW);
+		header.add(worth, BorderLayout.EAST);
+
+		header.addMouseListener(new java.awt.event.MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(java.awt.event.MouseEvent e)
+			{
+				if (!ownerToggles.remove(key)) ownerToggles.add(key);
+				refresh();
+			}
+		});
+		return header;
+	}
+
+	/** Who has something from this post listed right now (not the poster). */
+	private List<String> whoListed(LookingForRequest r, List<LendingEntry> listings)
+	{
+		java.util.Set<String> owners = new java.util.LinkedHashSet<>();
+		for (LendingEntry e : listings)
+		{
+			if (e.getLender() == null || e.getLender().equalsIgnoreCase(r.requesterName)) continue;
+			if (r.wants(e)) owners.add(e.getLender());
+		}
+		return new java.util.ArrayList<>(owners);
+	}
+
+	private JPanel createNeedsYouStrip(int requests, long overdue, int wanted)
+	{
+		JPanel strip = new JPanel();
+		strip.setLayout(new BoxLayout(strip, BoxLayout.Y_AXIS));
+		strip.setBackground(new Color(58, 46, 34));
+		strip.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createMatteBorder(0, 3, 0, 0, ColorScheme.BRAND_ORANGE),
+			new EmptyBorder(6, 8, 6, 8)));
+
+		JLabel title = new JLabel("Needs you");
+		title.setFont(FontManager.getRunescapeBoldFont());
+		title.setForeground(ColorScheme.BRAND_ORANGE);
+		strip.add(title);
+
+		if (requests > 0)
+		{
+			addNeedsYouLine(strip, requests + (requests == 1 ? " request is" : " requests are") + " waiting for you",
+				"requests");
+		}
+		if (overdue > 0)
+		{
+			addNeedsYouLine(strip, overdue + (overdue == 1 ? " loan is" : " loans are") + " overdue", "loans", "otherloans");
+		}
+		if (wanted > 0)
+		{
+			addNeedsYouLine(strip, wanted + (wanted == 1 ? " member wants" : " members want") + " gear you listed",
+				"lookingfor");
+		}
+		strip.setMaximumSize(new Dimension(Integer.MAX_VALUE, strip.getPreferredSize().height));
+		return strip;
+	}
+
+	private void addNeedsYouLine(JPanel strip, String text, String... sections)
+	{
+		JLabel line = new JLabel("› " + text);
+		line.setFont(FontManager.getRunescapeSmallFont());
+		line.setForeground(Color.WHITE);
+		line.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+		line.setToolTipText("Show them");
+		line.addMouseListener(new java.awt.event.MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(java.awt.event.MouseEvent e)
+			{
+				for (String s : sections) collapsedSections.remove(s);
+				refresh();
+			}
+		});
+		strip.add(line);
+	}
+
+	/**
+	 * Ask to borrow one listing or a whole set. A set goes out as one request per
+	 * piece: the lender answers each on its own, and a piece that is already out
+	 * does not hold up the rest.
+	 */
+	private void showBorrowRequestDialog(String lender, List<LendingEntry> pieces, String title)
+	{
+		String borrower = getCurrentPlayerName();
+		if (borrower == null || borrower.equals("Not logged in"))
+		{
+			JOptionPane.showMessageDialog(this, "You must be logged in to request items.", "Error", JOptionPane.ERROR_MESSAGE);
+			return;
+		}
+		if (pieces.isEmpty())
+		{
+			return;
+		}
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		String groupName = groupId != null ? groupService.getGroupNameById(groupId) : null;
+
+		JPanel panel = new JPanel(new GridBagLayout());
+		GridBagConstraints gbc = createDefaultGbc();
+		gbc.gridy = 0; gbc.gridwidth = 2;
+		StringBuilder head = new StringBuilder("<html><b>Borrow: ").append(escapeHtml(title)).append("</b> from ")
+			.append(escapeHtml(lender));
+		if (groupName != null) head.append(" <font color='#FFA500'>(").append(escapeHtml(groupName)).append(")</font>");
+		if (pieces.size() > 1)
+		{
+			head.append("<br><font color='gray'>").append(pieces.size()).append(" pieces:");
+			for (LendingEntry p : pieces) head.append("<br>• ").append(escapeHtml(p.getItem()));
+			head.append("</font>");
+		}
+		panel.add(new JLabel(head.append("</html>").toString()), gbc);
+
+		gbc.gridy = 1; gbc.gridwidth = 1;
+		panel.add(new JLabel("Duration:"), gbc);
+		gbc.gridx = 1;
+		JTextField durationField = new JTextField("7", 5);
+		panel.add(durationField, gbc);
+
+		gbc.gridx = 0; gbc.gridy = 2; gbc.gridwidth = 2;
+		JRadioButton daysRadio = new JRadioButton("Days", true);
+		JRadioButton hoursRadio = new JRadioButton("Hours");
+		ButtonGroup durationGroup = new ButtonGroup();
+		durationGroup.add(daysRadio);
+		durationGroup.add(hoursRadio);
+		JPanel radioPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+		radioPanel.add(daysRadio);
+		radioPanel.add(hoursRadio);
+		panel.add(radioPanel, gbc);
+
+		gbc.gridy = 3;
+		JCheckBox agreeTermsCheck = new JCheckBox("<html>I agree to the borrowing terms<br>" +
+			"<font size='2' color='#b0b0b0'>• No Wilderness • No trading • Return on time</font></html>");
+		panel.add(agreeTermsCheck, gbc);
+
+		gbc.gridy = 4;
+		panel.add(new JLabel("<html><font color='orange'>Breaking terms may result in group removal!</font></html>"), gbc);
+
+		int result = JOptionPane.showConfirmDialog(this, panel,
+			"Borrow Request", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+		if (result != JOptionPane.OK_OPTION)
+		{
+			return;
+		}
+		if (!agreeTermsCheck.isSelected())
+		{
+			JOptionPane.showMessageDialog(this,
+				"You must agree to the borrowing terms.", "Terms Not Accepted", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+		boolean isHours = hoursRadio.isSelected();
+		try
+		{
+			int duration = Integer.parseInt(durationField.getText().trim());
+			int maxValue = isHours ? 8760 : 365;
+			if (duration <= 0 || duration > maxValue) throw new NumberFormatException();
+			int durationDays = isHours ? Math.max(1, duration / 24) : duration;
+			String durationDisplay = isHours ? duration + " hours" : duration + " days";
+			int sent = 0;
+			for (LendingEntry p : pieces)
+			{
+				if (plugin.sendBorrowRequest(borrower, lender, p.getItem(), p.getItemId(), p.getQuantity(), durationDays))
+				{
+					sent++;
+				}
+			}
+			if (sent > 0)
+			{
+				String deliveryNote = plugin.isRelaySyncConnected()
+					? "They'll see it in their Lending Tracker panel."
+					: "Cloud Sync is offline — it will be delivered when they next sync.";
+				String what = pieces.size() > 1 ? sent + " requests (one per piece)" : "Borrow request";
+				JOptionPane.showMessageDialog(this,
+					what + " sent to " + lender + "!\nDuration: " + durationDisplay + "\n" + deliveryNote,
+					"Request Sent", JOptionPane.INFORMATION_MESSAGE);
+			}
+			else
+			{
+				JOptionPane.showMessageDialog(this,
+					"Could not send the request — no active group.",
+					"Request Not Sent", JOptionPane.ERROR_MESSAGE);
+			}
+		}
+		catch (NumberFormatException e)
+		{
+			JOptionPane.showMessageDialog(this,
+				"Please enter a valid duration.", "Invalid Duration", JOptionPane.ERROR_MESSAGE);
+		}
+	}
+
+	private static String escapeHtml(String s)
+	{
+		if (s == null) return "";
+		return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+	}
+
+	/**
+	 * Put listings into a set: pick a new or existing set of yours, name it, and
+	 * tick the pieces. Unticking a piece of an existing set takes it out.
+	 */
+	private void showSetDialog(LendingEntry seed)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		String owner = seed.getLender();
+		if (groupId == null || owner == null) return;
+
+		List<LendingEntry> mine = new java.util.ArrayList<>();
+		for (LendingEntry e : dataService.getOfferingsByOwner(groupId, owner))
+		{
+			if (e.getBorrower() == null || e.getBorrower().isEmpty()) mine.add(e);
+		}
+		java.util.Map<String, String> sets = new java.util.LinkedHashMap<>();
+		for (LendingEntry e : mine)
+		{
+			if (e.isInSet()) sets.putIfAbsent(e.getSetId(), e.getSetName() != null ? e.getSetName() : "Set");
+		}
+		List<String> setIds = new java.util.ArrayList<>(sets.keySet());
+
+		JComboBox<String> which = new JComboBox<>();
+		which.addItem("New set");
+		for (String id : setIds) which.addItem(sets.get(id));
+		if (seed.isInSet() && setIds.contains(seed.getSetId()))
+		{
+			which.setSelectedIndex(setIds.indexOf(seed.getSetId()) + 1);
+		}
+
+		JTextField nameField = new JTextField(16);
+
+		JPanel checks = new JPanel();
+		checks.setLayout(new BoxLayout(checks, BoxLayout.Y_AXIS));
+		java.util.Map<JCheckBox, LendingEntry> boxes = new java.util.LinkedHashMap<>();
+		for (LendingEntry e : mine)
+		{
+			JCheckBox box = new JCheckBox(e.getItem() + (e.getQuantity() > 1 ? " x" + e.getQuantity() : "")
+				+ (e.isInSet() && !e.getSetId().equals(seed.getSetId()) ? "  (in " + e.getSetName() + ")" : ""));
+			boxes.put(box, e);
+			checks.add(box);
+		}
+		Runnable showChoice = () ->
+		{
+			int i = which.getSelectedIndex();
+			String chosen = i > 0 ? setIds.get(i - 1) : null;
+			nameField.setText(chosen != null ? sets.get(chosen) : "");
+			for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
+			{
+				LendingEntry e = b.getValue();
+				b.getKey().setSelected(e.getItemId() == seed.getItemId()
+					|| (chosen != null && chosen.equals(e.getSetId())));
+			}
+		};
+		which.addActionListener(ev -> showChoice.run());
+		showChoice.run();
+
+		JPanel p = new JPanel(new BorderLayout(0, 6));
+		JPanel top = new JPanel(new GridLayout(2, 2, 4, 4));
+		top.add(new JLabel("Set:"));
+		top.add(which);
+		top.add(new JLabel("Name:"));
+		top.add(nameField);
+		p.add(top, BorderLayout.NORTH);
+		JScrollPane scroll = new JScrollPane(checks);
+		scroll.setPreferredSize(new Dimension(260, Math.min(260, 26 * boxes.size() + 10)));
+		p.add(scroll, BorderLayout.CENTER);
+		p.add(new JLabel("<html><font color='gray'>A piece that is lent out leaves the set on the<br>"
+			+ "marketplace and rejoins it when it comes home.</font></html>"), BorderLayout.SOUTH);
+
+		if (JOptionPane.showConfirmDialog(this, p, "Item Set", JOptionPane.OK_CANCEL_OPTION,
+			JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION)
+		{
+			return;
+		}
+		String name = nameField.getText().trim();
+		if (name.isEmpty())
+		{
+			JOptionPane.showMessageDialog(this, "Give the set a name.", "Item Set", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+		if (name.length() > 30) name = name.substring(0, 30);
+		int i = which.getSelectedIndex();
+		String setId = i > 0 ? setIds.get(i - 1) : java.util.UUID.randomUUID().toString();
+
+		List<Integer> chosen = new java.util.ArrayList<>();
+		List<Integer> dropped = new java.util.ArrayList<>();
+		for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
+		{
+			LendingEntry e = b.getValue();
+			if (b.getKey().isSelected()) chosen.add(e.getItemId());
+			else if (setId.equals(e.getSetId())) dropped.add(e.getItemId());
+		}
+		if (chosen.isEmpty())
+		{
+			JOptionPane.showMessageDialog(this, "Tick at least one item.", "Item Set", JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+		dataService.applySetToListings(groupId, owner, chosen, setId, name);
+		if (!dropped.isEmpty())
+		{
+			dataService.applySetToListings(groupId, owner, dropped, null, null);
+		}
+		expandedSets.add(owner.toLowerCase() + "#" + setId);
+		refresh();
+	}
+
+	/** One owner's set: name, value and the pieces' icons. Click to open it. */
+	private class SetCard extends JPanel
+	{
+		SetCard(ListingUnit unit, boolean showOwner)
+		{
+			setLayout(new BorderLayout(4, 2));
+			Color bg = new Color(48, 44, 38);
+			setBackground(bg);
+			setBorder(BorderFactory.createCompoundBorder(
+				BorderFactory.createMatteBorder(0, 2, 1, 0, ColorScheme.BRAND_ORANGE),
+				new EmptyBorder(5, 8, 5, 6)));
+			setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+
+			boolean open = expandedSets.contains(unit.key());
+			String name = unit.setName != null && !unit.setName.isEmpty() ? unit.setName : "Set";
+			JLabel title = new JLabel((open ? "▼ " : "▶ ") + name + "  (" + unit.pieces.size() + ")");
+			title.setFont(FontManager.getRunescapeSmallFont());
+			title.setForeground(new Color(0xFF, 0xC0, 0x60));
+
+			JLabel worth = new JLabel(QuantityFormatter.quantityToStackSize(unit.value()));
+			worth.setFont(FontManager.getRunescapeSmallFont());
+			worth.setForeground(Color.YELLOW);
+
+			JPanel top = new JPanel(new BorderLayout());
+			top.setOpaque(false);
+			top.add(title, BorderLayout.WEST);
+			top.add(worth, BorderLayout.EAST);
+			add(top, BorderLayout.NORTH);
+
+			JPanel icons = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
+			icons.setOpaque(false);
+			int max = 4;
+			for (int i = 0; i < unit.pieces.size() && i < max; i++)
+			{
+				LendingEntry p = unit.pieces.get(i);
+				JLabel icon = new JLabel();
+				icon.setPreferredSize(new Dimension(36, 32));
+				AsyncBufferedImage img = itemManager.getImage(p.getItemId(), p.getQuantity(), p.getQuantity() > 1);
+				if (img != null) img.addTo(icon);
+				icons.add(icon);
+			}
+			if (unit.pieces.size() > max)
+			{
+				JLabel more = new JLabel("+" + (unit.pieces.size() - max));
+				more.setFont(FontManager.getRunescapeSmallFont());
+				more.setForeground(Color.LIGHT_GRAY);
+				icons.add(more);
+			}
+			add(icons, BorderLayout.CENTER);
+
+			if (showOwner)
+			{
+				JLabel by = new JLabel("By: " + unit.owner);
+				by.setFont(FontManager.getRunescapeSmallFont());
+				by.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+				add(by, BorderLayout.SOUTH);
+			}
+
+			StringBuilder tip = new StringBuilder("<html><b>").append(escapeHtml(name)).append("</b> by ")
+				.append(escapeHtml(unit.owner));
+			for (LendingEntry p : unit.pieces)
+			{
+				tip.append("<br>• ").append(escapeHtml(p.getItem()))
+					.append(" - ").append(QuantityFormatter.quantityToStackSize(p.getValue()));
+			}
+			setToolTipText(tip.append("<br><i>Click to open, right-click for options</i></html>").toString());
+
+			int h = showOwner ? 76 : 62;
+			setMaximumSize(new Dimension(Integer.MAX_VALUE, h));
+			setPreferredSize(new Dimension(200, h));
+
+			String me = getCurrentPlayerName();
+			boolean mineSet = unit.owner.equalsIgnoreCase(me);
+			JPopupMenu menu = new JPopupMenu();
+			if (mineSet)
+			{
+				JMenuItem edit = new JMenuItem("Edit set...");
+				edit.addActionListener(e -> showSetDialog(unit.pieces.get(0)));
+				menu.add(edit);
+				JMenuItem breakUp = new JMenuItem("Break up set");
+				breakUp.addActionListener(e ->
+				{
+					if (JOptionPane.showConfirmDialog(DashboardPanel.this,
+						"Break up '" + name + "'? The pieces stay listed on their own.",
+						"Break Up Set", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION)
+					{
+						String groupId = groupService.getCurrentGroupIdUnchecked();
+						if (groupId != null) dataService.breakSet(groupId, unit.owner, unit.setId);
+						refresh();
+					}
+				});
+				menu.add(breakUp);
+			}
+			else
+			{
+				JMenuItem all = new JMenuItem("Request whole set");
+				all.addActionListener(e -> showBorrowRequestDialog(unit.owner, unit.pieces, name));
+				menu.add(all);
+			}
+			setComponentPopupMenu(menu);
+
+			addMouseListener(new java.awt.event.MouseAdapter()
+			{
+				@Override
+				public void mouseClicked(java.awt.event.MouseEvent e)
+				{
+					if (!SwingUtilities.isLeftMouseButton(e)) return;
+					if (!expandedSets.remove(unit.key())) expandedSets.add(unit.key());
+					refresh();
+				}
+			});
+		}
+	}
+
 	private class MarketplaceCard extends JPanel
 	{
 		private final LendingEntry item;
 		private final JPanel detailsPanel;
 		private final JPanel rightPanel;
 
-		public MarketplaceCard(LendingEntry item)
+		public MarketplaceCard(LendingEntry item, boolean showOwner, boolean inSet)
 		{
 			this.item = item;
 
 			setLayout(new BorderLayout(5, 0));
-			Color bgColor = ColorScheme.DARKER_GRAY_COLOR;
+			Color bgColor = inSet ? new Color(40, 38, 35) : ColorScheme.DARKER_GRAY_COLOR;
 			setBackground(bgColor);
 			setBorder(BorderFactory.createCompoundBorder(
 				BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.DARK_GRAY_COLOR),
-				new EmptyBorder(8, 8, 8, 8)
+				new EmptyBorder(3, inSet ? 18 : 6, 3, 6)
 			));
 
-			setMaximumSize(new Dimension(Integer.MAX_VALUE, 65));
-			setPreferredSize(new Dimension(200, 60));
+			// Compact on purpose: with a whole clan listing gear, row height is what
+			// decides whether the marketplace can be read at all.
+			setMaximumSize(new Dimension(Integer.MAX_VALUE, 44));
+			setPreferredSize(new Dimension(200, 42));
 
 			// Left side: Item icon (fixed width)
 			JLabel iconLabel = new JLabel();
-			iconLabel.setPreferredSize(new Dimension(36, 36));
+			iconLabel.setPreferredSize(new Dimension(36, 32));
 			try
 			{
-				BufferedImage itemImage = itemManager.getImage(item.getItemId(), item.getQuantity(), item.getQuantity() > 1);
+				AsyncBufferedImage itemImage = itemManager.getImage(item.getItemId(), item.getQuantity(), item.getQuantity() > 1);
 				if (itemImage != null)
 				{
-					iconLabel.setIcon(new ImageIcon(itemImage));
+					itemImage.addTo(iconLabel);
 				}
 			}
 			catch (Exception e)
@@ -448,41 +1163,40 @@ public class DashboardPanel extends JPanel
 			detailsPanel.setBackground(bgColor);
 
 			// Item name (truncate if too long)
-			String itemName = item.getItem();
+			String itemName = item.getItem() != null ? item.getItem() : "?";
 			if (itemName.length() > 18) itemName = itemName.substring(0, 15) + "...";
-			JLabel itemLabel = new JLabel(itemName + " x" + item.getQuantity());
+			JLabel itemLabel = new JLabel(itemName + (item.getQuantity() > 1 ? " x" + item.getQuantity() : ""));
 			itemLabel.setFont(FontManager.getRunescapeSmallFont());
 			itemLabel.setForeground(Color.WHITE);
 
-			// Owner name
-			String ownerText = "By: " + item.getLender();
-			JLabel ownerLabel = new JLabel(ownerText);
-			ownerLabel.setFont(FontManager.getRunescapeSmallFont());
-			ownerLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+			// Under an owner's heading the owner is already said, so the second line
+			// says what the item is for instead.
+			String cats = categoryText(item);
+			JLabel subLabel = new JLabel(showOwner ? "By: " + item.getLender() : cats);
+			subLabel.setFont(FontManager.getRunescapeSmallFont());
+			subLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 
 			detailsPanel.add(itemLabel);
-			detailsPanel.add(ownerLabel);
+			detailsPanel.add(subLabel);
 
 			add(detailsPanel, BorderLayout.CENTER);
 
-			// Right side: Value and status (compact)
-			rightPanel = new JPanel();
-			rightPanel.setLayout(new BoxLayout(rightPanel, BoxLayout.Y_AXIS));
+			// Right side: value
+			rightPanel = new JPanel(new BorderLayout());
 			rightPanel.setBackground(bgColor);
-			rightPanel.setPreferredSize(new Dimension(50, 45));
 
 			JLabel valueLabel = new JLabel(QuantityFormatter.quantityToStackSize(item.getValue()));
 			valueLabel.setFont(FontManager.getRunescapeSmallFont());
 			valueLabel.setForeground(Color.YELLOW);
-
-			JLabel statusLabel = new JLabel("Avail");
-			statusLabel.setFont(FontManager.getRunescapeSmallFont());
-			statusLabel.setForeground(Color.GREEN);
-
-			rightPanel.add(valueLabel);
-			rightPanel.add(statusLabel);
+			rightPanel.add(valueLabel, BorderLayout.CENTER);
 
 			add(rightPanel, BorderLayout.EAST);
+
+			setToolTipText("<html><b>" + escapeHtml(item.getItem()) + "</b> by " + escapeHtml(item.getLender())
+				+ (cats.isEmpty() ? "" : "<br>" + escapeHtml(cats))
+				+ (item.isInSet() ? "<br>Part of set: " + escapeHtml(item.getSetName()) : "")
+				+ (item.getNotes() != null && !item.getNotes().isEmpty() ? "<br>Note: " + escapeHtml(item.getNotes()) : "")
+				+ "</html>");
 
 			setComponentPopupMenu(createPopupMenu());
 			addHoverEffect(this, ColorScheme.DARKER_GRAY_HOVER_COLOR, bgColor, detailsPanel, rightPanel);
@@ -511,6 +1225,26 @@ public class DashboardPanel extends JPanel
 					editItem.addActionListener(e -> showFullEditDialog());
 					menu.add(editItem);
 
+					JMenuItem setItem = new JMenuItem(item.isInSet() ? "Edit set..." : "Add to a set...");
+					setItem.addActionListener(e -> showSetDialog(item));
+					menu.add(setItem);
+
+					if (item.isInSet())
+					{
+						JMenuItem outOfSet = new JMenuItem("Take out of set");
+						outOfSet.addActionListener(e ->
+						{
+							String groupId = groupService.getCurrentGroupIdUnchecked();
+							if (groupId != null)
+							{
+								dataService.applySetToListings(groupId, item.getLender(),
+									java.util.Collections.singletonList(item.getItemId()), null, null);
+								refresh();
+							}
+						});
+						menu.add(outOfSet);
+					}
+
 					JMenuItem removeItem = new JMenuItem("Remove from Marketplace");
 					removeItem.addActionListener(e -> removeFromMarketplace());
 					menu.add(removeItem);
@@ -519,8 +1253,24 @@ public class DashboardPanel extends JPanel
 			else
 			{
 				JMenuItem borrowItem = new JMenuItem("Request to Borrow");
-				borrowItem.addActionListener(e -> requestToBorrow());
+				borrowItem.addActionListener(e -> showBorrowRequestDialog(item.getLender(),
+					java.util.Collections.singletonList(item), item.getItem()));
 				menu.add(borrowItem);
+				if (item.isInSet())
+				{
+					JMenuItem whole = new JMenuItem("Request whole set");
+					whole.addActionListener(e ->
+					{
+						String groupId = groupService.getCurrentGroupIdUnchecked();
+						List<LendingEntry> pieces = new java.util.ArrayList<>();
+						for (LendingEntry o : dataService.getOfferingsByOwner(groupId, item.getLender()))
+						{
+							if (item.getSetId().equals(o.getSetId())) pieces.add(o);
+						}
+						showBorrowRequestDialog(item.getLender(), pieces, item.getSetName());
+					});
+					menu.add(whole);
+				}
 			}
 
 			return menu;
@@ -587,103 +1337,10 @@ public class DashboardPanel extends JPanel
 			{
 				dataService.removeAvailable(groupId, item.getLender(), item.getItem(), item.getItemId());
 				dataService.removeOffering(groupId, item.getLender(), item.getItem(), item.getItemId());
+				// Taken down on purpose, so it should not rejoin its set if relisted.
+				dataService.forgetSetMembership(groupId, item.getLender(), item.getItemId());
 				dataService.loadGroupData(groupId);
 				refresh();
-			}
-		}
-
-		private void requestToBorrow()
-		{
-			String currentPlayer = getCurrentPlayerName();
-			if (currentPlayer == null || currentPlayer.equals("Not logged in"))
-			{
-				JOptionPane.showMessageDialog(DashboardPanel.this, "You must be logged in to request items.", "Error", JOptionPane.ERROR_MESSAGE);
-				return;
-			}
-
-			String lender = item.getLender();
-			String itemName = item.getItem();
-
-			showBorrowRequestDialog(currentPlayer, lender, itemName, item.getItemId(), item.getQuantity());
-		}
-
-		private void showBorrowRequestDialog(String borrower, String lender, String itemName, int itemId, int quantity)
-		{
-			String groupId = groupService.getCurrentGroupIdUnchecked();
-			String groupName = groupId != null ? groupService.getGroupNameById(groupId) : null;
-
-			JPanel panel = new JPanel(new GridBagLayout());
-			GridBagConstraints gbc = createDefaultGbc();
-			gbc.gridy = 0; gbc.gridwidth = 2;
-			panel.add(new JLabel("<html><b>Borrow: " + itemName + "</b> from " + lender +
-				(groupName != null ? " <font color='#FFA500'>(" + groupName + ")</font>" : "") + "</html>"), gbc);
-
-			gbc.gridy = 1; gbc.gridwidth = 1;
-			panel.add(new JLabel("Duration:"), gbc);
-			gbc.gridx = 1;
-			JTextField durationField = new JTextField("7", 5);
-			panel.add(durationField, gbc);
-
-			gbc.gridx = 0; gbc.gridy = 2; gbc.gridwidth = 2;
-			JRadioButton daysRadio = new JRadioButton("Days", true);
-			JRadioButton hoursRadio = new JRadioButton("Hours");
-			ButtonGroup durationGroup = new ButtonGroup();
-			durationGroup.add(daysRadio);
-			durationGroup.add(hoursRadio);
-			JPanel radioPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
-			radioPanel.add(daysRadio);
-			radioPanel.add(hoursRadio);
-			panel.add(radioPanel, gbc);
-
-			gbc.gridy = 3;
-			JCheckBox agreeTermsCheck = new JCheckBox("<html>I agree to the borrowing terms<br>" +
-				"<font size='2' color='#b0b0b0'>\u2022 No Wilderness \u2022 No trading \u2022 Return on time</font></html>");
-			panel.add(agreeTermsCheck, gbc);
-
-			gbc.gridy = 4;
-			panel.add(new JLabel("<html><font color='orange'>Breaking terms may result in group removal!</font></html>"), gbc);
-
-			int result = JOptionPane.showConfirmDialog(DashboardPanel.this, panel,
-				"Borrow Request", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
-
-			if (result == JOptionPane.OK_OPTION)
-			{
-				if (!agreeTermsCheck.isSelected())
-				{
-					JOptionPane.showMessageDialog(DashboardPanel.this,
-						"You must agree to the borrowing terms.", "Terms Not Accepted", JOptionPane.WARNING_MESSAGE);
-					return;
-				}
-				boolean isHours = hoursRadio.isSelected();
-				try
-				{
-					int duration = Integer.parseInt(durationField.getText().trim());
-					int maxValue = isHours ? 8760 : 365;
-					if (duration <= 0 || duration > maxValue) throw new NumberFormatException();
-					int durationDays = isHours ? Math.max(1, duration / 24) : duration;
-					String durationDisplay = isHours ? duration + " hours" : duration + " days";
-					boolean sent = plugin.sendBorrowRequest(borrower, lender, itemName, itemId, quantity, durationDays);
-					if (sent)
-					{
-						String deliveryNote = plugin.isRelaySyncConnected()
-							? "They'll see it in their Lending Tracker panel."
-							: "Cloud Sync is offline — it will be delivered when they next sync.";
-						JOptionPane.showMessageDialog(DashboardPanel.this,
-							"Borrow request sent to " + lender + "!\nDuration: " + durationDisplay + "\n" + deliveryNote,
-							"Request Sent", JOptionPane.INFORMATION_MESSAGE);
-					}
-					else
-					{
-						JOptionPane.showMessageDialog(DashboardPanel.this,
-							"Could not send the request — no active group.",
-							"Request Not Sent", JOptionPane.ERROR_MESSAGE);
-					}
-				}
-				catch (NumberFormatException e)
-				{
-					JOptionPane.showMessageDialog(DashboardPanel.this,
-						"Please enter a valid duration.", "Invalid Duration", JOptionPane.ERROR_MESSAGE);
-				}
 			}
 		}
 	}
@@ -880,6 +1537,8 @@ public class DashboardPanel extends JPanel
 					{
 						if (dataService.forgiveLoan(loan.getId(), me))
 						{
+							plugin.getDiscordWebhook().post(
+								com.guess34.lendingtracker.services.DiscordWebhook.Event.FORGIVEN, loan, me);
 							refresh();
 						}
 						else
@@ -1610,8 +2269,10 @@ public class DashboardPanel extends JPanel
 				// millisecond shared an id and silently overwrote each other.
 				// Existing ids stay readable - nothing parses this back to a number.
 				String requestId = java.util.UUID.randomUUID().toString();
+				// "|" separates the fields, so it can't appear inside one.
 				saveLookingForRequest(groupId, requestId, String.format("%s|%s|%d|%d|%s|%s",
-					finalCurrentPlayer, displayName, items.size(), duration, notes, itemsStr.toString()));
+					finalCurrentPlayer, displayName.replace("|", "/"), items.size(), duration,
+					notes.replace("|", "/"), itemsStr.toString()));
 				long totalValue = items.stream().mapToLong(it -> it.value * it.quantity).sum();
 				final String chatMsg = String.format("[Lending Tracker] %s is looking for: %s (%d items, %s GP) for %d days",
 					finalCurrentPlayer, displayName, items.size(), QuantityFormatter.quantityToStackSize(totalValue), duration);
@@ -1641,138 +2302,139 @@ public class DashboardPanel extends JPanel
 		lookingForDialog.setVisible(true);
 	}
 
+	/**
+	 * Live Looking For posts for the group. They ride on the synced requests, so
+	 * every member sees every post - they used to live only in the poster's own
+	 * config and never left their machine.
+	 */
 	private List<LookingForRequest> getLookingForRequests(String groupId)
 	{
+		List<LookingForRequest> out = new java.util.ArrayList<>();
 		if (groupId == null || groupId.isEmpty())
 		{
-			return new java.util.ArrayList<>();
+			return out;
 		}
-
-		// Check cache first - source of truth once populated
-		if (lookingForCache.containsKey(groupId))
+		migrateLegacyLookingFor(groupId);
+		for (LendingRequest r : dataService.getLookingForPosts(groupId))
 		{
-			List<LookingForRequest> cached = lookingForCache.get(groupId);
-			return cached != null ? new java.util.ArrayList<>(cached) : new java.util.ArrayList<>();
+			LookingForRequest lf = r.getMessage() != null ? LookingForRequest.parse(r.getId(), r.getMessage()) : null;
+			if (lf == null)
+			{
+				lf = new LookingForRequest();
+				lf.id = r.getId();
+				lf.itemName = r.getItemName() != null ? r.getItemName() : "Item";
+				lf.quantity = Math.max(1, r.getQuantity());
+				lf.durationDays = r.getDurationDays();
+				lf.notes = "";
+			}
+			// The synced sender, not whatever the text claims.
+			lf.requesterName = r.getFrom();
+			lf.postedTime = r.getCreatedAt() > 0 ? r.getCreatedAt() : r.getUpdatedAt();
+			out.add(lf);
 		}
+		return out;
+	}
 
-		// First time loading this group - load from config and cache it
-		List<LookingForRequest> requests = new java.util.ArrayList<>();
+	/**
+	 * Move this player's old local-only posts onto the synced requests, once.
+	 * Posts by another account on this machine are left for that account to move
+	 * when it logs in - only the poster may publish their own post.
+	 */
+	private void migrateLegacyLookingFor(String groupId)
+	{
+		String me = plugin.getCurrentPlayerName();
+		if (me == null || !migratedLookingFor.add(groupId + ":" + me.toLowerCase()))
+		{
+			return;
+		}
 		try
 		{
-			String requestIdsKey = "lookingForIds." + groupId;
-			String requestIdsStr = plugin.getConfigManager().getConfiguration("lendingtracker", requestIdsKey);
-
-			if (requestIdsStr != null && !requestIdsStr.isEmpty())
+			String idsKey = "lookingForIds." + groupId;
+			String idsStr = plugin.getConfigManager().getConfiguration("lendingtracker", idsKey);
+			if (idsStr == null || idsStr.isEmpty())
 			{
-				// Dedupe on read as well as on save: configs written before the upsert
-				// fix already hold repeated ids, and without this they keep rendering as
-				// duplicate cards until that request happens to be saved again. Reading
-				// through a set makes existing damage self-heal.
-				java.util.Set<String> seenIds = new java.util.LinkedHashSet<>();
-				for (String rawId : requestIdsStr.split(","))
-				{
-					String t = rawId.trim();
-					if (!t.isEmpty()) seenIds.add(t);
-				}
-				for (String requestId : seenIds)
-				{
-					String requestKey = "lookingFor." + groupId + "." + requestId;
-					String requestData = plugin.getConfigManager().getConfiguration("lendingtracker", requestKey);
-
-					if (requestData != null && !requestData.isEmpty())
-					{
-						LookingForRequest request = LookingForRequest.parse(requestId, requestData);
-						if (request != null)
-						{
-							requests.add(request);
-						}
-					}
-				}
+				return;
 			}
-
-			lookingForCache.put(groupId, new java.util.ArrayList<>(requests));
+			java.util.Set<String> remaining = new java.util.LinkedHashSet<>();
+			for (String raw : idsStr.split(","))
+			{
+				String id = raw.trim();
+				if (id.isEmpty()) continue;
+				String key = "lookingFor." + groupId + "." + id;
+				String data = plugin.getConfigManager().getConfiguration("lendingtracker", key);
+				LookingForRequest parsed = data != null ? LookingForRequest.parse(id, data) : null;
+				if (parsed == null)
+				{
+					plugin.getConfigManager().unsetConfiguration("lendingtracker", key);
+					continue;
+				}
+				if (!me.equalsIgnoreCase(parsed.requesterName))
+				{
+					remaining.add(id);
+					continue;
+				}
+				publishLookingFor(groupId, id, data);
+				plugin.getConfigManager().unsetConfiguration("lendingtracker", key);
+			}
+			if (remaining.isEmpty())
+			{
+				plugin.getConfigManager().unsetConfiguration("lendingtracker", idsKey);
+			}
+			else
+			{
+				plugin.getConfigManager().setConfiguration("lendingtracker", idsKey, String.join(",", remaining));
+			}
 		}
 		catch (Exception e)
 		{
-			log.error("Failed to load looking for requests", e);
+			log.warn("Could not move old Looking For posts: {}", e.getMessage());
 		}
-
-		return requests;
 	}
 
 	private void saveLookingForRequest(String groupId, String requestId, String requestData)
 	{
-		// Save the request data to config (for persistence)
-		String requestKey = "lookingFor." + groupId + "." + requestId;
-		plugin.getConfigManager().setConfiguration("lendingtracker", requestKey, requestData);
-
-		// Update the list of request IDs in config
-		String requestIdsKey = "lookingForIds." + groupId;
-		String existingIds = plugin.getConfigManager().getConfiguration("lendingtracker", requestIdsKey);
-
-		// Editing an existing request calls this with the SAME id. Appending it
-		// unconditionally listed that id twice, so the panel drew the request once
-		// per copy - and deleting any one of them removed the single underlying
-		// record, making every copy vanish at once.
-		java.util.List<String> ids = new java.util.ArrayList<>();
-		if (existingIds != null && !existingIds.isEmpty())
+		// An edit goes out as a fresh post. The request merge only carries the
+		// STATUS forward for a row a peer already holds, so edited text would
+		// never reach anyone who had seen the original.
+		boolean exists = dataService.getLookingForPosts(groupId).stream()
+			.anyMatch(r -> requestId.equals(r.getId()));
+		String id = requestId;
+		if (exists)
 		{
-			for (String id : existingIds.split(","))
-			{
-				String trimmed = id.trim();
-				if (!trimmed.isEmpty() && !ids.contains(trimmed)) ids.add(trimmed);
-			}
+			dataService.updateRequestStatus(groupId, requestId, LendingRequest.STATUS_CANCELLED);
+			id = java.util.UUID.randomUUID().toString();
 		}
-		if (!ids.contains(requestId)) ids.add(requestId);
-		plugin.getConfigManager().setConfiguration("lendingtracker", requestIdsKey,
-			String.join(",", ids));
+		publishLookingFor(groupId, id, requestData);
+	}
 
-		// Also update in-memory cache for immediate display
-		LookingForRequest newRequest = LookingForRequest.parse(requestId, requestData);
-		if (newRequest != null)
+	private void publishLookingFor(String groupId, String id, String requestData)
+	{
+		LookingForRequest parsed = LookingForRequest.parse(id, requestData);
+		if (parsed == null)
 		{
-			// Replace in place when this id is already cached; appending would leave
-			// the stale copy next to the edited one, and the cache is what the panel
-			// displays ("source of truth once populated").
-			java.util.List<LookingForRequest> cached =
-				lookingForCache.computeIfAbsent(groupId, k -> new java.util.ArrayList<>());
-			int at = -1;
-			for (int i = 0; i < cached.size(); i++)
-			{
-				if (cached.get(i) != null && requestId.equals(cached.get(i).id)) { at = i; break; }
-			}
-			if (at >= 0) cached.set(at, newRequest); else cached.add(newRequest);
+			return;
 		}
+		long now = System.currentTimeMillis();
+		LendingRequest r = new LendingRequest();
+		r.setId(id);
+		r.setType(LendingRequest.TYPE_LOOKING_FOR);
+		r.setFrom(parsed.requesterName);
+		r.setTo("");
+		r.setItemName(parsed.itemName);
+		r.setItemId(parsed.items.isEmpty() ? 0 : parsed.items.get(0).itemId);
+		r.setQuantity(parsed.quantity);
+		r.setDurationDays(parsed.durationDays);
+		r.setMessage(requestData);
+		r.setStatus(LendingRequest.STATUS_PENDING);
+		r.setCreatedAt(now);
+		r.setUpdatedAt(now);
+		dataService.addRequest(groupId, r);
 	}
 
 	private void removeLookingForRequest(String groupId, String requestId)
 	{
-		// Remove the request data from config
-		String requestKey = "lookingFor." + groupId + "." + requestId;
-		plugin.getConfigManager().unsetConfiguration("lendingtracker", requestKey);
-
-		// Update the list of request IDs in config
-		String requestIdsKey = "lookingForIds." + groupId;
-		String existingIds = plugin.getConfigManager().getConfiguration("lendingtracker", requestIdsKey);
-
-		if (existingIds != null && !existingIds.isEmpty())
-		{
-			String[] ids = existingIds.split(",");
-			StringBuilder newIds = new StringBuilder();
-			for (String id : ids)
-			{
-				if (!id.equals(requestId))
-				{
-					if (newIds.length() > 0) newIds.append(",");
-					newIds.append(id);
-				}
-			}
-			plugin.getConfigManager().setConfiguration("lendingtracker", requestIdsKey, newIds.toString());
-		}
-
-		// Also remove from in-memory cache
-		List<LookingForRequest> cached = lookingForCache.get(groupId);
-		if (cached != null) cached.removeIf(r -> r.id != null && r.id.equals(requestId));
+		// Cancelled rather than deleted, so the removal reaches everyone.
+		dataService.updateRequestStatus(groupId, requestId, LendingRequest.STATUS_CANCELLED);
 	}
 
 	/**
@@ -1980,6 +2642,7 @@ public class DashboardPanel extends JPanel
 
 		long dueTime = System.currentTimeMillis() + request.getDurationDays() * 86400000L;
 		dataService.addLoan(groupId, lender, borrower, entry, dueTime);
+		plugin.getDiscordWebhook().post(com.guess34.lendingtracker.services.DiscordWebhook.Event.LOAN, entry, me);
 		dataService.updateRequestStatus(groupId, request.getId(), LendingRequest.STATUS_ACCEPTED);
 
 		// If I lent from my marketplace listing, reduce or remove it. Use the
@@ -2032,6 +2695,48 @@ public class DashboardPanel extends JPanel
 		String notes;
 		long postedTime;
 		java.util.List<LookingForItem> items = new java.util.ArrayList<>();
+		// Filled in per redraw: who has something from this post listed, and
+		// whether the viewer is one of them.
+		java.util.List<String> listedBy = new java.util.ArrayList<>();
+		boolean wantsMine;
+
+		/** Does this listing satisfy anything in the post? By item where known, else by name. */
+		boolean wants(LendingEntry e)
+		{
+			int base = ItemVariationMapping.map(e.getItemId());
+			for (LookingForItem it : items)
+			{
+				if (it.itemId > 0 && ItemVariationMapping.map(it.itemId) == base) return true;
+				if (it.itemName != null && it.itemName.equalsIgnoreCase(e.getItem())) return true;
+			}
+			return items.isEmpty() && itemName != null && itemName.equalsIgnoreCase(e.getItem());
+		}
+
+		boolean wantsAny(java.util.Set<Integer> bases, List<LendingEntry> listings, String owner)
+		{
+			for (LendingEntry e : listings)
+			{
+				if (owner.equalsIgnoreCase(e.getLender()) && bases.contains(ItemVariationMapping.map(e.getItemId())) && wants(e))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		boolean matches(String query)
+		{
+			if ((requesterName != null && requesterName.toLowerCase().contains(query))
+				|| (itemName != null && itemName.toLowerCase().contains(query)))
+			{
+				return true;
+			}
+			for (LookingForItem it : items)
+			{
+				if (it.itemName != null && it.itemName.toLowerCase().contains(query)) return true;
+			}
+			return false;
+		}
 
 		static LookingForRequest parse(String id, String data)
 		{
@@ -2161,6 +2866,21 @@ public class DashboardPanel extends JPanel
 
 			detailsPanel.add(itemLabel);
 			detailsPanel.add(requesterLabel);
+
+			// Matched against the marketplace, so nobody has to go looking.
+			if (request.wantsMine || !request.listedBy.isEmpty())
+			{
+				String who = request.wantsMine ? "You have this listed"
+					: "Listed by " + request.listedBy.get(0)
+						+ (request.listedBy.size() > 1 ? " +" + (request.listedBy.size() - 1) : "");
+				JLabel match = new JLabel(who);
+				match.setFont(FontManager.getRunescapeSmallFont());
+				match.setForeground(request.wantsMine ? ColorScheme.BRAND_ORANGE : new Color(0x8C, 0xE0, 0x8C));
+				match.setToolTipText("<html>Listed right now by:<br>" + String.join("<br>", request.listedBy) + "</html>");
+				detailsPanel.add(match);
+				setMaximumSize(new Dimension(Integer.MAX_VALUE, 78));
+				setPreferredSize(new Dimension(200, 72));
+			}
 
 			add(detailsPanel, BorderLayout.CENTER);
 
@@ -2309,8 +3029,18 @@ public class DashboardPanel extends JPanel
 					String groupId = groupService.getCurrentGroupIdUnchecked();
 					if (groupId != null)
 					{
-						String requestData = String.format("%s|%s|%d|%d|%s|",
-							request.requesterName, newItemName, newQty, newDuration, newNotes);
+						// Keep the item list, or the post can no longer be matched
+						// against the marketplace by item.
+						StringBuilder itemsStr = new StringBuilder();
+						for (LookingForItem it : request.items)
+						{
+							if (itemsStr.length() > 0) itemsStr.append(",");
+							itemsStr.append(it.itemId).append(":").append(it.itemName.replace(":", "").replace(",", ""))
+								.append(":").append(it.quantity).append(":").append(it.value);
+						}
+						String requestData = String.format("%s|%s|%d|%d|%s|%s",
+							request.requesterName, newItemName, newQty, newDuration,
+							newNotes.replace("|", "/"), itemsStr);
 						saveLookingForRequest(groupId, request.id, requestData);
 						refresh();
 					}

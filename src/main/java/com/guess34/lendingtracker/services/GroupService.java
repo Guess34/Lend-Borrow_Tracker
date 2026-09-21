@@ -387,6 +387,9 @@ public class GroupService
 		tombstone.touchCodeState();
 		tombstone.setDisbandedAt(now);
 		tombstone.setDisbandedBy(requester);
+		// The stored record outlives the group; don't leave the webhook in it.
+		tombstone.setWebhookSealed("");
+		tombstone.setWebhookUpdatedAt(now);
 
 		// Silence every other publish for this group BEFORE the tombstone goes, so
 		// no heartbeat can land behind it and overwrite the stored record.
@@ -715,6 +718,11 @@ public class GroupService
 					existing.setRole(rm.getRole());
 					existing.setRoleUpdatedAt(Math.max(rm.getRoleUpdatedAt(), existing.getRoleUpdatedAt()));
 				}
+				if (existing != null && rm.getDiscordUpdatedAt() > existing.getDiscordUpdatedAt())
+				{
+					existing.setDiscordSealed(rm.getDiscordSealed());
+					existing.setDiscordUpdatedAt(rm.getDiscordUpdatedAt());
+				}
 			}
 		}
 
@@ -778,6 +786,39 @@ public class GroupService
 		{
 			local.setDisbandedAt(remote.getDisbandedAt());
 			local.setDisbandedBy(remote.getDisbandedBy());
+		}
+		// The group's Discord webhook rides its own stamp, newest wins. A client
+		// that predates it relays stamp 0, which never clears it. Exact-tie breaks
+		// on the value so both sides settle on the same one.
+		long remoteHookAt = remote.getWebhookUpdatedAt();
+		long localHookAt = local.getWebhookUpdatedAt();
+		if (remoteHookAt > localHookAt
+			|| (remoteHookAt == localHookAt && remoteHookAt > 0
+				&& String.valueOf(remote.getWebhookSealed()).compareTo(String.valueOf(local.getWebhookSealed())) > 0))
+		{
+			local.setWebhookSealed(remote.getWebhookSealed());
+			local.setWebhookUpdatedAt(remoteHookAt);
+			local.setWebhookSetBy(remote.getWebhookSetBy());
+		}
+		long remoteScopeAt = remote.getLoanScopeUpdatedAt();
+		long localScopeAt = local.getLoanScopeUpdatedAt();
+		if (remoteScopeAt > localScopeAt
+			|| (remoteScopeAt == localScopeAt && remoteScopeAt > 0
+				&& String.valueOf(remote.getLoanScope()).compareTo(String.valueOf(local.getLoanScope())) > 0))
+		{
+			local.setLoanScope(remote.getLoanScope());
+			local.setLoanScopeUpdatedAt(remoteScopeAt);
+		}
+		local.setWebhookTestedFor(Math.max(local.getWebhookTestedFor(), remote.getWebhookTestedFor()));
+		long remoteClanAt = remote.getLinkedClanUpdatedAt();
+		long localClanAt = local.getLinkedClanUpdatedAt();
+		if (remoteClanAt > localClanAt
+			|| (remoteClanAt == localClanAt && remoteClanAt > 0
+				&& String.valueOf(remote.getLinkedClan()).compareTo(String.valueOf(local.getLinkedClan())) > 0))
+		{
+			local.setLinkedClan(remote.getLinkedClan());
+			local.setLinkedClanUpdatedAt(remoteClanAt);
+			local.setLinkedClanSetBy(remote.getLinkedClanSetBy());
 		}
 		local.setMembers(merged);
 		local.setMembersUpdatedAt(Math.max(local.getMembersUpdatedAt(), remote.getMembersUpdatedAt()));
@@ -1349,6 +1390,222 @@ public class GroupService
 			case "mod": return group.isModCanKick();
 			default: return false;
 		}
+	}
+
+	public enum WebhookResult { SAVED, REMOVED, NOT_ALLOWED, NOT_A_WEBHOOK, NO_GROUP }
+
+	/**
+	 * Set or remove (blank url) the group's Discord webhook. Co-owners and up, or
+	 * the founder. Stored sealed with the group key and synced to every member,
+	 * so each loan posts to the channel of the group it was made in and nowhere else.
+	 */
+	public WebhookResult setGroupWebhook(String groupId, String requester, String url)
+	{
+		LendingGroup group = groupId != null ? groups.get(groupId) : null;
+		if (group == null || requester == null) return WebhookResult.NO_GROUP;
+		boolean founder = hasFounderPower(groupId, requester);
+		String role = getMemberRole(groupId, requester);
+		if (!founder && (role == null || getRoleRank(role) < 4)) return WebhookResult.NOT_ALLOWED;
+		// Never mint a key here: a group without one is not in sync with anybody,
+		// and a new key would seal the link so no other member could open it.
+		if (group.getSyncSecret() == null || group.getSyncSecret().isEmpty()) return WebhookResult.NO_GROUP;
+
+		String clean = url == null ? "" : url.trim();
+		String sealed = "";
+		if (!clean.isEmpty())
+		{
+			if (!DiscordWebhook.isDiscordWebhook(clean)) return WebhookResult.NOT_A_WEBHOOK;
+			sealed = WebhookSeal.seal(clean, group.getSyncSecret());
+			if (sealed == null) return WebhookResult.NOT_A_WEBHOOK;
+		}
+		synchronized (group)
+		{
+			group.setWebhookSealed(sealed);
+			group.setWebhookUpdatedAt(System.currentTimeMillis());
+			group.setWebhookSetBy(requester);
+		}
+		saveGroups();
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
+		return clean.isEmpty() ? WebhookResult.REMOVED : WebhookResult.SAVED;
+	}
+
+	/**
+	 * Link the group to an in-game clan by its exact name, or unlink it (blank).
+	 * Same people as the webhook: co-owners and up, or the founder.
+	 */
+	public boolean setLinkedClan(String groupId, String requester, String clan)
+	{
+		LendingGroup group = groupId != null ? groups.get(groupId) : null;
+		if (group == null || requester == null) return false;
+		boolean founder = hasFounderPower(groupId, requester);
+		String role = getMemberRole(groupId, requester);
+		if (!founder && (role == null || getRoleRank(role) < 4)) return false;
+		String clean = clan == null ? "" : clan.trim();
+		if (clean.length() > 40) clean = clean.substring(0, 40);
+		synchronized (group)
+		{
+			group.setLinkedClan(clean);
+			group.setLinkedClanUpdatedAt(System.currentTimeMillis());
+			group.setLinkedClanSetBy(requester);
+		}
+		saveGroups();
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
+		return true;
+	}
+
+	/** Whose loans a group tracks and posts to its Discord. */
+	public enum LoanScope
+	{
+		CLAN("Clan members only"),
+		GROUP("Group members only"),
+		ANYONE("Anyone");
+
+		private final String label;
+
+		LoanScope(String label)
+		{
+			this.label = label;
+		}
+
+		public String getLabel()
+		{
+			return label;
+		}
+	}
+
+	/**
+	 * The scope in force. CLAN with no clan linked can't be checked, so it falls
+	 * back to GROUP - the narrower of the two that can.
+	 */
+	public LoanScope getLoanScope(String groupId)
+	{
+		LendingGroup group = groupId != null ? groups.get(groupId) : null;
+		if (group == null) return LoanScope.ANYONE;
+		boolean clanLinked = getLinkedClan(groupId) != null;
+		LoanScope scope;
+		try
+		{
+			scope = group.getLoanScope() != null ? LoanScope.valueOf(group.getLoanScope())
+				: clanLinked ? LoanScope.CLAN : LoanScope.ANYONE;
+		}
+		catch (IllegalArgumentException e)
+		{
+			scope = LoanScope.GROUP;   // unknown value from a newer client: stay narrow
+		}
+		return scope == LoanScope.CLAN && !clanLinked ? LoanScope.GROUP : scope;
+	}
+
+	/** Co-owners and up, or the founder. */
+	public boolean setLoanScope(String groupId, String requester, LoanScope scope)
+	{
+		LendingGroup group = groupId != null ? groups.get(groupId) : null;
+		if (group == null || requester == null || scope == null) return false;
+		boolean founder = hasFounderPower(groupId, requester);
+		String role = getMemberRole(groupId, requester);
+		if (!founder && (role == null || getRoleRank(role) < 4)) return false;
+		synchronized (group)
+		{
+			group.setLoanScope(scope.name());
+			group.setLoanScopeUpdatedAt(System.currentTimeMillis());
+		}
+		saveGroups();
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
+		return true;
+	}
+
+	/** The in-game clan this group is linked to, or null. */
+	public String getLinkedClan(String groupId)
+	{
+		LendingGroup group = groupId != null ? groups.get(groupId) : null;
+		String clan = group != null ? group.getLinkedClan() : null;
+		return clan == null || clan.trim().isEmpty() ? null : clan.trim();
+	}
+
+	/**
+	 * Put this player's Discord user ID on their own row in every group they are
+	 * in, or take it off (null). Sealed with each group's key. Cheap to call
+	 * often: a group whose row already says the same thing is left alone.
+	 */
+	public void setMyDiscordId(String playerName, String discordId)
+	{
+		if (playerName == null) return;
+		boolean changed = false;
+		boolean changedActive = false;
+		for (LendingGroup g : groups.values())
+		{
+			String secret = g.getSyncSecret();
+			if (secret == null || secret.isEmpty() || g.getMembers() == null) continue;
+			GroupMember mine = null;
+			for (GroupMember m : g.getMembers())
+			{
+				if (m != null && m.getName() != null && m.getName().equalsIgnoreCase(playerName))
+				{
+					mine = m;
+					break;
+				}
+			}
+			if (mine == null) continue;
+			String sealed = mine.getDiscordSealed();
+			String current = sealed == null || sealed.isEmpty() ? null : WebhookSeal.open(sealed, secret);
+			if (Objects.equals(current, discordId)) continue;
+			String next = discordId == null ? "" : WebhookSeal.seal(discordId, secret);
+			if (next == null) continue;
+			synchronized (g)
+			{
+				mine.setDiscordSealed(next);
+				mine.setDiscordUpdatedAt(System.currentTimeMillis());
+			}
+			changed = true;
+			changedActive |= g.getId().equals(currentSyncGroupId);
+		}
+		if (changed) saveGroups();
+		if (changedActive) publishEvent(SyncEventType.SETTINGS_CHANGED, currentSyncGroupId, null);
+	}
+
+	/** A member's Discord user ID in this group, if they chose to be tagged; else null. */
+	public String getMemberDiscordId(String groupId, String playerName)
+	{
+		LendingGroup g = groupId != null ? groups.get(groupId) : null;
+		if (g == null || playerName == null || g.getMembers() == null) return null;
+		for (GroupMember m : g.getMembers())
+		{
+			if (m != null && m.getName() != null && m.getName().equalsIgnoreCase(playerName))
+			{
+				String sealed = m.getDiscordSealed();
+				String id = sealed == null || sealed.isEmpty() ? null : WebhookSeal.open(sealed, g.getSyncSecret());
+				return id != null && id.matches("\\d{17,20}") ? id : null;
+			}
+		}
+		return null;
+	}
+
+	/** Has the group's current webhook already had its "connected" test? */
+	public boolean isWebhookTested(String groupId)
+	{
+		LendingGroup g = groupId != null ? groups.get(groupId) : null;
+		return g != null && g.getWebhookUpdatedAt() > 0 && g.getWebhookTestedFor() == g.getWebhookUpdatedAt();
+	}
+
+	/** Lock the Test button for everyone until the webhook changes. */
+	public void markWebhookTested(String groupId)
+	{
+		LendingGroup g = groupId != null ? groups.get(groupId) : null;
+		if (g == null) return;
+		synchronized (g)
+		{
+			g.setWebhookTestedFor(g.getWebhookUpdatedAt());
+		}
+		saveGroups();
+		publishEvent(SyncEventType.SETTINGS_CHANGED, groupId, null);
+	}
+
+	/** The group's Discord webhook, or null when none is set or it can't be opened here. */
+	public String getGroupWebhook(String groupId)
+	{
+		LendingGroup group = groupId != null ? groups.get(groupId) : null;
+		if (group == null || group.getWebhookSealed() == null || group.getWebhookSealed().isEmpty()) return null;
+		String url = WebhookSeal.open(group.getWebhookSealed(), group.getSyncSecret());
+		return DiscordWebhook.isDiscordWebhook(url) ? url : null;
 	}
 
 	public boolean setKickPermission(String groupId, String requesterName, String role, boolean value)

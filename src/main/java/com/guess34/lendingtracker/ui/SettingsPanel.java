@@ -41,6 +41,8 @@ public class SettingsPanel extends JPanel
 	private JButton transferFounderButton;
 	private JComboBox<String> transferFounderDropdown;
 	private JPanel membersListPanel, permissionsPanel, dangerZonePanel;
+	private JLabel discordStatusLabel;
+	private JButton setDiscordButton, removeDiscordButton, testDiscordButton;
 	private JPanel contentPanel, notLoggedInPanel, inviteCodePanel, membersSection;
 	private JCheckBox coOwnerKickCb, adminKickCb, modKickCb;
 	private JCheckBox coOwnerInviteCb, adminInviteCb, modInviteCb;
@@ -83,6 +85,8 @@ public class SettingsPanel extends JPanel
 		groupCodePanel = buildGroupCodeSection();
 		contentPanel.add(groupCodePanel);
 		contentPanel.add(Box.createVerticalStrut(10));
+		contentPanel.add(buildDiscordSection());
+		contentPanel.add(Box.createVerticalStrut(10));
 		contentPanel.add(buildScreenshotSection());
 		contentPanel.add(Box.createVerticalStrut(10));
 		contentPanel.add(buildFeedbackSection());
@@ -104,6 +108,248 @@ public class SettingsPanel extends JPanel
 	}
 
 	// ---- Section Builders ----
+
+	/**
+	 * The group's Discord channel. Staff set it here, once, for the whole group -
+	 * it is not a personal setting, so a member of several groups never posts one
+	 * group's loans into another's channel.
+	 */
+	private JPanel buildDiscordSection()
+	{
+		JPanel section = sectionPanel("Discord");
+		JPanel content = boxPanel();
+		discordStatusLabel = smallLabel("Not set up");
+		content.add(discordStatusLabel);
+		content.add(Box.createVerticalStrut(5));
+
+		JPanel buttons = new JPanel(new GridLayout(1, 3, 4, 0));
+		buttons.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		buttons.setAlignmentX(LEFT_ALIGNMENT);
+		buttons.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
+		setDiscordButton = smallButton("Set up", ColorScheme.BRAND_ORANGE);
+		setDiscordButton.setToolTipText("Paste the channel's webhook link (Discord: Edit Channel > Integrations > Webhooks)");
+		setDiscordButton.addActionListener(e -> setDiscordWebhook());
+		removeDiscordButton = smallButton("Remove", ColorScheme.MEDIUM_GRAY_COLOR);
+		removeDiscordButton.addActionListener(e -> removeDiscordWebhook());
+		testDiscordButton = smallButton("Test", ColorScheme.MEDIUM_GRAY_COLOR);
+		testDiscordButton.setToolTipText("Send a short test message to the channel");
+		testDiscordButton.addActionListener(e -> testDiscordWebhook());
+		buttons.add(setDiscordButton);
+		buttons.add(removeDiscordButton);
+		buttons.add(testDiscordButton);
+		content.add(buttons);
+		content.add(Box.createVerticalStrut(4));
+		content.add(smallLabel("<i>Members don't paste anything - each just turns on posting once in the plugin's settings (Discord).</i>"));
+		section.add(content, BorderLayout.CENTER);
+		return section;
+	}
+
+	private void setDiscordWebhook()
+	{
+		LendingGroup g = groupService.getActiveGroup();
+		if (g == null) return;
+		boolean hookSet = groupService.getGroupWebhook(g.getId()) != null;
+		String currentClan = groupService.getLinkedClan(g.getId());
+		String myClan = plugin.getClanRoster().currentClanName();
+
+		JPasswordField field = new JPasswordField(30);
+		// Off unless this group already has a clan: a group of friends shouldn't be
+		// dragged into whatever clan the person setting it up happens to be in.
+		JCheckBox clanOn = new JCheckBox("This group belongs to an in-game clan", currentClan != null);
+		JTextField clanField = new JTextField(currentClan != null ? currentClan : "", 20);
+		JButton useMine = new JButton(myClan != null ? "Use my clan (" + myClan + ")" : "Use my clan");
+		useMine.addActionListener(ev -> clanField.setText(myClan));
+
+		GroupService.LoanScope currentScope = groupService.getLoanScope(g.getId());
+		JComboBox<String> scopeBox = new JComboBox<>();
+		// "Clan members only" is only on offer while there IS a clan.
+		Runnable fillScopes = () ->
+		{
+			Object was = scopeBox.getSelectedItem();
+			scopeBox.removeAllItems();
+			for (GroupService.LoanScope sc : GroupService.LoanScope.values())
+			{
+				if (sc != GroupService.LoanScope.CLAN || clanOn.isSelected())
+				{
+					scopeBox.addItem(sc.getLabel());
+				}
+			}
+			scopeBox.setSelectedItem(was != null ? was : currentScope.getLabel());
+			if (scopeBox.getSelectedItem() == null)
+			{
+				scopeBox.setSelectedItem(GroupService.LoanScope.ANYONE.getLabel());
+			}
+		};
+		Runnable syncClanFields = () ->
+		{
+			clanField.setEnabled(clanOn.isSelected());
+			useMine.setEnabled(clanOn.isSelected() && myClan != null);
+			if (!clanOn.isSelected())
+			{
+				clanField.setText("");
+			}
+			fillScopes.run();
+		};
+		clanOn.addActionListener(ev -> syncClanFields.run());
+		fillScopes.run();
+		scopeBox.setSelectedItem(currentScope.getLabel());
+		syncClanFields.run();
+		JLabel scopeText = new JLabel("<html><br><b>Track and post loans with</b><br>"
+			+ "<font color='gray'>Clan members only - both players must be in the clan above.<br>"
+			+ "Group members only - both players must be in this group.<br>"
+			+ "Anyone - every loan made in this group, whoever it's with.</font></html>");
+
+		JPanel p = new JPanel();
+		p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+		JLabel hookText = new JLabel("<html><b>Discord webhook</b> for <b>" + escapeHtml(g.getName()) + "</b>'s loan channel<br>"
+			+ "<font color='gray'>Discord: Edit Channel &gt; Integrations &gt; Webhooks &gt; Copy Webhook URL.<br>"
+			+ "Anyone with this link can post in that channel - it is stored locked,<br>"
+			+ "so only members of this group can read it."
+			+ (hookSet ? "<br>Leave blank to keep the current one." : "") + "</font></html>");
+		JLabel clanText = new JLabel("<html><br><b>In-game clan</b><br>"
+			+ "<font color='gray'>For clan groups only. Clan members then count as group members<br>"
+			+ "in trades, even on mobile, and each post says whether the lender and<br>"
+			+ "borrower are in the clan. Leave it off for a group of friends.</font></html>");
+		for (JComponent c : new JComponent[] { hookText, field, clanText, clanOn, clanField, useMine, scopeText, scopeBox })
+		{
+			c.setAlignmentX(LEFT_ALIGNMENT);
+			p.add(c);
+			p.add(Box.createVerticalStrut(4));
+		}
+		if (JOptionPane.showConfirmDialog(this, p, "Group Discord & Clan", JOptionPane.OK_CANCEL_OPTION,
+			JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION)
+		{
+			return;
+		}
+
+		java.util.List<String> said = new java.util.ArrayList<>();
+		String url = new String(field.getPassword()).trim();
+		if (!url.isEmpty())
+		{
+			said.add(webhookResultMessage(groupService.setGroupWebhook(g.getId(), getCurrentUsername(), url)));
+		}
+		String clan = clanOn.isSelected() ? clanField.getText().trim() : "";
+		if (!clan.equals(currentClan != null ? currentClan : ""))
+		{
+			if (groupService.setLinkedClan(g.getId(), getCurrentUsername(), clan))
+			{
+				said.add(clan.isEmpty() ? "Clan link removed." : "Linked to the clan '" + clan + "'.");
+				if (!clan.isEmpty() && (myClan == null || !myClan.equalsIgnoreCase(clan)))
+				{
+					said.add("Note: you aren't in '" + clan + "' in-game right now, so check the spelling -\n"
+						+ "only members of that clan can check who's in it.");
+				}
+			}
+			else
+			{
+				said.add("Only co-owners and owners can change the group's clan.");
+			}
+		}
+		GroupService.LoanScope chosenScope = currentScope;
+		for (GroupService.LoanScope sc : GroupService.LoanScope.values())
+		{
+			if (sc.getLabel().equals(scopeBox.getSelectedItem()))
+			{
+				chosenScope = sc;
+			}
+		}
+		if (chosenScope != currentScope)
+		{
+			if (chosenScope == GroupService.LoanScope.CLAN && clan.isEmpty())
+			{
+				said.add("'Clan members only' needs a clan - tick the clan box above. Kept as '"
+					+ currentScope.getLabel() + "'.");
+			}
+			else if (groupService.setLoanScope(g.getId(), getCurrentUsername(), chosenScope))
+			{
+				said.add("Now tracking loans with: " + chosenScope.getLabel() + ".");
+			}
+			else
+			{
+				said.add("Only co-owners and owners can change which loans the group tracks.");
+			}
+		}
+		if (!said.isEmpty())
+		{
+			JOptionPane.showMessageDialog(this, String.join("\n\n", said), "Discord & Clan",
+				JOptionPane.INFORMATION_MESSAGE);
+		}
+		refresh();
+	}
+
+	private void removeDiscordWebhook()
+	{
+		LendingGroup g = groupService.getActiveGroup();
+		if (g == null) return;
+		if (JOptionPane.showConfirmDialog(this, "Stop posting " + g.getName() + "'s loans to Discord?",
+			"Remove Discord Channel", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION)
+		{
+			return;
+		}
+		showWebhookResult(groupService.setGroupWebhook(g.getId(), getCurrentUsername(), ""));
+	}
+
+	private void testDiscordWebhook()
+	{
+		LendingGroup g = groupService.getActiveGroup();
+		if (g == null) return;
+		String problem = plugin.getDiscordWebhook().postTest(g.getId(), getCurrentUsername());
+		if (problem == null)
+		{
+			// One test per webhook: it locks until someone changes the webhook.
+			groupService.markWebhookTested(g.getId());
+		}
+		JOptionPane.showMessageDialog(this, problem != null ? problem : "Test sent - check the channel.",
+			"Discord", problem != null ? JOptionPane.WARNING_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
+		refresh();
+	}
+
+	private String webhookResultMessage(GroupService.WebhookResult result)
+	{
+		switch (result)
+		{
+			case SAVED:
+				return "Webhook saved. It syncs to every member of the group - nobody else has to paste it.\n"
+					+ "Use Test to check it reaches the channel.";
+			case REMOVED:
+				return "Webhook removed.";
+			case NOT_A_WEBHOOK:
+				return "That isn't a Discord webhook link - nothing was changed.\n"
+					+ "It should start with https://discord.com/api/webhooks/";
+			case NOT_ALLOWED:
+				return "Only co-owners and owners can change the group's Discord channel.";
+			default:
+				return "The group isn't ready yet - try again once it has synced.";
+		}
+	}
+
+	private void showWebhookResult(GroupService.WebhookResult result)
+	{
+		switch (result)
+		{
+			case SAVED:
+				JOptionPane.showMessageDialog(this, "Saved. It syncs to every member of the group.\n"
+					+ "Use Test to check it reaches the channel.", "Discord", JOptionPane.INFORMATION_MESSAGE);
+				break;
+			case REMOVED:
+				JOptionPane.showMessageDialog(this, "Removed. Loans from this group are no longer posted.",
+					"Discord", JOptionPane.INFORMATION_MESSAGE);
+				break;
+			case NOT_A_WEBHOOK:
+				JOptionPane.showMessageDialog(this, "That isn't a Discord webhook link.\n"
+					+ "It should start with https://discord.com/api/webhooks/", "Discord", JOptionPane.WARNING_MESSAGE);
+				break;
+			case NOT_ALLOWED:
+				JOptionPane.showMessageDialog(this, "Only co-owners and owners can change the group's Discord channel.",
+					"Discord", JOptionPane.WARNING_MESSAGE);
+				break;
+			default:
+				JOptionPane.showMessageDialog(this, "The group isn't ready yet - try again once it has synced.",
+					"Discord", JOptionPane.WARNING_MESSAGE);
+				break;
+		}
+		refresh();
+	}
 
 	private JPanel buildNotLoggedInPanel()
 	{
@@ -1186,6 +1432,35 @@ public class SettingsPanel extends JPanel
 				inviteCodeStatusLabel.setText(" ");
 			}
 			generateCodeButton.setEnabled(canInvite);
+		}
+
+		// Discord: everyone sees whether it is set; co-owners and up can change it
+		boolean hookSet = groupService.getGroupWebhook(g.getId()) != null;
+		boolean canEditHook = isOwner || isCoOwner || groupService.hasFounderPower(g.getId(), currentUser);
+		if (discordStatusLabel != null)
+		{
+			String linkedClan = groupService.getLinkedClan(g.getId());
+			boolean posting = plugin.getConfig().webhookEnabled();
+			discordStatusLabel.setText("<html>" + (hookSet
+				? "Loans post to the group's Discord" + (g.getWebhookSetBy() != null
+					? " <font color='gray'>(set by " + escapeHtml(g.getWebhookSetBy()) + ")</font>" : "")
+				: "No Discord channel set")
+				+ "<br>Clan: " + (linkedClan != null ? escapeHtml(linkedClan) : "<font color='gray'>none</font>")
+				+ "<br>Tracks loans with: " + groupService.getLoanScope(g.getId()).getLabel()
+				+ (hookSet && !posting
+					? "<br><font color='#FFA500'>Your loans aren't posted yet - turn on 'Post loans to Discord' in the plugin's settings.</font>"
+					: "")
+				+ "</html>");
+			setDiscordButton.setVisible(canEditHook);
+			setDiscordButton.setText(hookSet || linkedClan != null ? "Change" : "Set up");
+			removeDiscordButton.setVisible(canEditHook && hookSet);
+			boolean tested = groupService.isWebhookTested(g.getId());
+			testDiscordButton.setVisible(canEditHook && hookSet);
+			testDiscordButton.setEnabled(!tested);
+			testDiscordButton.setText(tested ? "Tested ✓" : "Test");
+			testDiscordButton.setToolTipText(tested
+				? "Already tested - unlocks again when the webhook is changed"
+				: "Send a short test message to the channel");
 		}
 
 		// Permissions

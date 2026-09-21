@@ -24,6 +24,12 @@ public class LendingRequest
 	// borrowers) or as escalation after a mutual request failed.
 	public static final String TYPE_REMOVAL_MUTUAL = "REMOVAL_MUTUAL";
 	public static final String TYPE_REMOVAL_STAFF = "REMOVAL_STAFF";
+	// A "Looking For" post: addressed to nobody (to = ""), visible to the whole
+	// group. These used to live only in the poster's own config, so nobody else
+	// ever saw them. Riding on requests gets them synced, expired after two weeks
+	// and pruned like everything else. Older clients only ever list requests
+	// addressed to them or sent by them, so they carry these without showing them.
+	public static final String TYPE_LOOKING_FOR = "LOOKING_FOR";
 
 	public static final String STATUS_PENDING = "PENDING";
 	public static final String STATUS_ACCEPTED = "ACCEPTED";
@@ -64,6 +70,11 @@ public class LendingRequest
 	public boolean isRemoval()
 	{
 		return TYPE_REMOVAL_MUTUAL.equals(type) || TYPE_REMOVAL_STAFF.equals(type);
+	}
+
+	public boolean isLookingFor()
+	{
+		return TYPE_LOOKING_FOR.equals(type);
 	}
 
 	public boolean isStaffRemoval()

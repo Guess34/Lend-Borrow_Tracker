@@ -66,6 +66,23 @@ public class LendingEntry {
     // Misc
     private String notes;
 
+    // Item set this listing belongs to, if any. Both live on the listing itself,
+    // not in a separate set record: a set is simply whichever listings carry the
+    // same setId, so lending one piece out delists only that piece and the rest
+    // stay a set. The name rides along so peers need nothing else to draw it.
+    // New fields, not a new status - clients that predate sets ignore them and
+    // show the pieces as ordinary listings.
+    private String setId;
+    private String setName;
+
+    // The BORROWER's client keeps this loan: the lender can't run the plugin (a
+    // clan-mate on mobile, say) so theirs can't record it, track its returns or
+    // post it. Exactly one client is ever the keeper - the lender's normally,
+    // the borrower's for these - so nothing is counted twice. A field, not a
+    // status; the merge treats it as a one-way latch because clients that predate
+    // it drop it when they relay the row.
+    private Boolean keptByBorrower;
+
     // Convenience
 
     public long getDueDate() { return this.dueTime; }
@@ -117,6 +134,10 @@ public class LendingEntry {
 
     public boolean isOneTimeLoan() { return Boolean.TRUE.equals(oneTime); }
 
+    public boolean isInSet() { return setId != null && !setId.isEmpty(); }
+
+    public boolean isKeptByBorrower() { return Boolean.TRUE.equals(keptByBorrower); }
+
     public boolean isOverdue() {
         return returnedAt == 0 && dueTime > 0 && System.currentTimeMillis() > dueTime;
     }
@@ -145,6 +166,9 @@ public class LendingEntry {
         this.collateralGpOutstanding = other.collateralGpOutstanding;
         this.oneTime = other.oneTime;
         this.notes = other.notes;
+        this.setId = other.setId;
+        this.setName = other.setName;
+        this.keptByBorrower = other.keptByBorrower;
     }
 
     public String getPlayerName() { return borrower != null ? borrower : lender; }

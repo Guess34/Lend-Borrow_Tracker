@@ -161,6 +161,18 @@ public class DataService
 		}
 		else
 		{
+			// A piece coming back from a loan is relisted as a brand new row, so it
+			// would come back loose. The lender's own machine remembers which set
+			// it was in; putting it back is what makes the set regroup itself.
+			if (!entry.isInSet())
+			{
+				String[] remembered = rememberedSet(groupId, owner, entry.getItemId());
+				if (remembered != null)
+				{
+					entry.setSetId(remembered[0]);
+					entry.setSetName(remembered[1]);
+				}
+			}
 			ownerList.add(new LendingEntry(entry));
 		}
 
@@ -267,6 +279,149 @@ public class DataService
 	public List<LendingEntry> getAvailable(String groupId)
 	{
 		return flattenGroupData(groupAvailable, groupId);
+	}
+
+	// --- Item sets ---
+	//
+	// A set is whichever of one owner's listings share a setId. Only the owner
+	// ever changes it, and only from their own machine - which is also where the
+	// memory of each piece's set lives, so a piece lent out and relisted on return
+	// rejoins its set without anything new crossing the wire.
+
+	private static final String SET_MEMORY_PREFIX = "setMembers.";
+
+	/**
+	 * Put these of the owner's listings into a set, or take them out of any set
+	 * when setId is null. One save and one sync for the lot rather than one per
+	 * piece - a set of eight was eight full state pushes.
+	 *
+	 * @return how many listings changed
+	 */
+	public int applySetToListings(String groupId, String owner, Collection<Integer> itemIds,
+		String setId, String setName)
+	{
+		if (groupId == null || owner == null || itemIds == null || itemIds.isEmpty()) return 0;
+		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
+		if (groupData == null) return 0;
+		String ownerKey = groupData.keySet().stream()
+			.filter(k -> k.equalsIgnoreCase(owner)).findFirst().orElse(null);
+		if (ownerKey == null) return 0;
+		List<LendingEntry> ownerItems = groupData.get(ownerKey);
+		long now = System.currentTimeMillis();
+		Map<Integer, String> memory = loadSetMemory(groupId, owner);
+		int changed = 0;
+		for (int i = 0; i < ownerItems.size(); i++)
+		{
+			LendingEntry e = ownerItems.get(i);
+			if (e == null || !itemIds.contains(e.getItemId())) continue;
+			LendingEntry updated = new LendingEntry(e);
+			updated.setSetId(setId);
+			updated.setSetName(setId != null ? setName : null);
+			updated.setUpdatedAt(now);
+			ownerItems.set(i, updated);
+			int base = net.runelite.client.game.ItemVariationMapping.map(e.getItemId());
+			if (setId != null) memory.put(base, setId + "|" + (setName != null ? setName : ""));
+			else memory.remove(base);
+			changed++;
+		}
+		if (changed == 0) return 0;
+		saveSetMemory(groupId, owner, memory);
+		persist(groupId, "available");
+		if (groupService != null)
+		{
+			groupService.publishEvent(GroupService.SyncEventType.ITEM_UPDATED, groupId + ":sets", null);
+		}
+		return changed;
+	}
+
+	/** The item ids of the owner's listings currently in this set. */
+	public List<Integer> getSetPieces(String groupId, String owner, String setId)
+	{
+		List<Integer> ids = new ArrayList<>();
+		if (setId == null) return ids;
+		for (LendingEntry e : getOfferingsByOwner(groupId, owner))
+		{
+			if (setId.equals(e.getSetId())) ids.add(e.getItemId());
+		}
+		return ids;
+	}
+
+	/** Rename a set everywhere it appears. */
+	public void renameSet(String groupId, String owner, String setId, String newName)
+	{
+		applySetToListings(groupId, owner, getSetPieces(groupId, owner, setId), setId, newName);
+	}
+
+	/** Break a set back into loose listings. */
+	public void breakSet(String groupId, String owner, String setId)
+	{
+		applySetToListings(groupId, owner, getSetPieces(groupId, owner, setId), null, null);
+		// Pieces out on loan right now aren't listed, so the loop above never saw
+		// them - clear their memory too, or they rejoin a dead set on return.
+		Map<Integer, String> memory = loadSetMemory(groupId, owner);
+		if (memory.values().removeIf(v -> v.startsWith(setId + "|")))
+		{
+			saveSetMemory(groupId, owner, memory);
+		}
+	}
+
+	/**
+	 * The owner took this piece off the marketplace themselves, so it should not
+	 * rejoin its set if they list it again later. (Lending it out is different -
+	 * that delists it too, and the whole point is that it comes back.)
+	 */
+	public void forgetSetMembership(String groupId, String owner, int itemId)
+	{
+		Map<Integer, String> memory = loadSetMemory(groupId, owner);
+		if (memory.remove(net.runelite.client.game.ItemVariationMapping.map(itemId)) != null)
+		{
+			saveSetMemory(groupId, owner, memory);
+		}
+	}
+
+	/** {setId, setName} this owner last had the item in, or null. */
+	private String[] rememberedSet(String groupId, String owner, int itemId)
+	{
+		if (groupId == null || owner == null) return null;
+		String v = loadSetMemory(groupId, owner).get(net.runelite.client.game.ItemVariationMapping.map(itemId));
+		if (v == null) return null;
+		int bar = v.indexOf('|');
+		if (bar <= 0) return null;
+		return new String[] { v.substring(0, bar), v.substring(bar + 1) };
+	}
+
+	private Map<Integer, String> loadSetMemory(String groupId, String owner)
+	{
+		String json = configManager.getConfiguration(CONFIG_GROUP,
+			SET_MEMORY_PREFIX + groupId + "." + owner.toLowerCase());
+		if (json == null || json.isEmpty()) return new HashMap<>();
+		try
+		{
+			Map<Integer, String> m = gson.fromJson(json, new TypeToken<Map<Integer, String>>(){}.getType());
+			return m != null ? new HashMap<>(m) : new HashMap<>();
+		}
+		catch (Exception e)
+		{
+			return new HashMap<>();
+		}
+	}
+
+	private void saveSetMemory(String groupId, String owner, Map<Integer, String> memory)
+	{
+		String key = SET_MEMORY_PREFIX + groupId + "." + owner.toLowerCase();
+		if (memory.isEmpty()) configManager.unsetConfiguration(CONFIG_GROUP, key);
+		else configManager.setConfiguration(CONFIG_GROUP, key, gson.toJson(memory));
+	}
+
+	// --- Looking For posts ---
+
+	/** Live Looking For posts in this group, newest first. */
+	public List<LendingRequest> getLookingForPosts(String groupId)
+	{
+		return getRequests(groupId).stream()
+			.filter(r -> r.isLookingFor() && r.isPending())
+			.sorted(Comparator.comparingLong(LendingRequest::getCreatedAt).reversed())
+			.collect(Collectors.toList());
 	}
 
 	public void addToAvailableList(LendingEntry entry, String groupId)
@@ -1658,6 +1813,16 @@ public class DataService
 	 * when it is newer than the local copy, and never resurrected if this client
 	 * has already archived it.
 	 */
+	// Told about a loan this client had never seen before, arriving from sync.
+	// The Discord webhook uses it: the lender must post loans they did not record
+	// themselves (an accepted lend offer is recorded by the borrower).
+	private java.util.function.Consumer<LendingEntry> onNewLoanFromSync;
+
+	public void setOnNewLoanFromSync(java.util.function.Consumer<LendingEntry> callback)
+	{
+		this.onNewLoanFromSync = callback;
+	}
+
 	private boolean applyRemoteEntry(LendingEntry remote)
 	{
 		boolean alreadyInHistory;
@@ -1692,9 +1857,27 @@ public class DataService
 		}
 
 		LendingEntry local = allEntries.get(remote.getId());
+		// One-way latch: a client that predates the flag drops it when relaying
+		// the row, and losing it would leave a borrower-kept loan with no client
+		// tracking its returns.
+		if (local != null && local.isKeptByBorrower() && !remote.isKeptByBorrower())
+		{
+			remote.setKeptByBorrower(true);
+		}
 		if (local == null || remote.getUpdatedAt() > local.getUpdatedAt())
 		{
 			allEntries.put(remote.getId(), remote);
+			if (local == null && onNewLoanFromSync != null)
+			{
+				try
+				{
+					onNewLoanFromSync.accept(remote);
+				}
+				catch (Exception e)
+				{
+					log.debug("New-loan listener failed: {}", e.getMessage());
+				}
+			}
 			return true;
 		}
 		return false;

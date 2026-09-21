@@ -14,6 +14,8 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.imageio.ImageIO;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.ui.DrawManager;
 import com.guess34.lendingtracker.LendingTrackerConfig;
 import com.guess34.lendingtracker.model.LendingEntry;
@@ -31,6 +33,9 @@ public class ProofScreenshot
 
 	@Inject
 	private DrawManager drawManager;
+
+	@Inject
+	private Client client;
 
 	@Inject
 	private ScheduledExecutorService executor;
@@ -89,6 +94,10 @@ public class ProofScreenshot
 	// generation check and the store/take are atomic.
 	private final Object cacheLock = new Object();
 	private final java.util.Map<String, BufferedImage> cachedFrames = new java.util.HashMap<>();
+	// The same frames cut down to just the trade window. These, never the full
+	// frame, are what may leave the machine (the Discord post): a full frame
+	// carries the chatbox - private messages included - and the inventory.
+	private final java.util.Map<String, BufferedImage> cachedCrops = new java.util.HashMap<>();
 	private int cacheGeneration;
 
 	/**
@@ -99,23 +108,94 @@ public class ProofScreenshot
 	 */
 	public void cacheTradeFrame(String phase)
 	{
+		cacheTradeFrame(phase, -1);
+	}
+
+	/**
+	 * As above, also keeping a copy cropped to the given widget (the trade
+	 * window). Its bounds are read inside the frame listener, which runs on the
+	 * client thread while that very frame is drawn - so the crop matches it.
+	 */
+	public void cacheTradeFrame(String phase, int cropWidgetId)
+	{
 		final int generation;
 		synchronized (cacheLock)
 		{
 			generation = cacheGeneration;
 		}
 		drawManager.requestNextFrameListener(image ->
+		{
+			Rectangle bounds = null;
+			Dimension real = null;
+			if (cropWidgetId != -1)
+			{
+				Widget w = client.getWidget(cropWidgetId);
+				if (w != null && !w.isHidden())
+				{
+					bounds = w.getBounds();
+					// Widget bounds are in game pixels; the frame may be stretched.
+					real = client.isStretchedEnabled()
+						? client.getRealDimensions()
+						: new Dimension(client.getCanvasWidth(), client.getCanvasHeight());
+				}
+			}
+			final Rectangle cropBounds = bounds;
+			final Dimension gameSize = real;
 			executor.submit(() ->
 			{
 				BufferedImage frame = toBufferedImage(image);
+				BufferedImage crop = crop(frame, cropBounds, gameSize);
 				synchronized (cacheLock)
 				{
 					if (cacheGeneration == generation)
 					{
 						cachedFrames.put(phase, frame);
+						if (crop != null)
+						{
+							cachedCrops.put(phase, crop);
+						}
 					}
 				}
-			}));
+			});
+		});
+	}
+
+	/**
+	 * The trade-window picture for this trade - confirm screen if we have it,
+	 * else the first screen - or null. Does not clear anything; call before
+	 * commitCachedTrade/discardCachedFrame, which do.
+	 */
+	public BufferedImage takeProofCrop()
+	{
+		synchronized (cacheLock)
+		{
+			BufferedImage confirm = cachedCrops.get(PHASE_CONFIRM_SCREEN);
+			return confirm != null ? confirm : cachedCrops.get(PHASE_FIRST_SCREEN);
+		}
+	}
+
+	private static BufferedImage crop(BufferedImage frame, Rectangle bounds, Dimension real)
+	{
+		if (frame == null || bounds == null || real == null || real.width <= 0 || real.height <= 0
+			|| bounds.width <= 0 || bounds.height <= 0)
+		{
+			return null;
+		}
+		double sx = frame.getWidth() / (double) real.width;
+		double sy = frame.getHeight() / (double) real.height;
+		int x = Math.max(0, (int) Math.floor(bounds.x * sx));
+		int y = Math.max(0, (int) Math.floor(bounds.y * sy));
+		int w = Math.min((int) Math.ceil(bounds.width * sx), frame.getWidth() - x);
+		int h = Math.min((int) Math.ceil(bounds.height * sy), frame.getHeight() - y);
+		if (w <= 0 || h <= 0)
+		{
+			return null;
+		}
+		BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+		Graphics2D g = out.createGraphics();
+		g.drawImage(frame.getSubimage(x, y, w, h), 0, 0, null);
+		g.dispose();
+		return out;
 	}
 
 	/**
@@ -133,6 +213,7 @@ public class ProofScreenshot
 			cacheGeneration++;
 			frames = new java.util.HashMap<>(cachedFrames);
 			cachedFrames.clear();
+			cachedCrops.clear();
 		}
 		for (java.util.Map.Entry<String, BufferedImage> cached : frames.entrySet())
 		{
@@ -153,6 +234,7 @@ public class ProofScreenshot
 		{
 			cacheGeneration++;
 			cachedFrames.clear();
+			cachedCrops.clear();
 		}
 	}
 

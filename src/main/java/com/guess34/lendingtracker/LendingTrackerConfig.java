@@ -59,6 +59,14 @@ public interface LendingTrackerConfig extends Config
 	String syncSection = "sync";
 
 	@ConfigSection(
+		name = "Discord",
+		description = "Post loans to a Discord channel through a webhook",
+		position = 65,
+		closedByDefault = true
+	)
+	String discordSection = "discord";
+
+	@ConfigSection(
 		name = "Data & Storage",
 		description = "Data retention and storage settings",
 		position = 70,
@@ -247,6 +255,95 @@ public interface LendingTrackerConfig extends Config
 	default String relayServerUrl()
 	{
 		return "wss://lending-tracker-relay.onrender.com";
+	}
+
+	// Discord
+
+	@ConfigItem(
+		keyName = "webhookEnabled",
+		name = "Post loans to Discord",
+		description = "Post your loans to your group's Discord channel. The channel is set by the group's staff in the group settings, so each group's loans only go to that group. Only the lender posts, so each loan shows once - everyone who lends should turn this on.",
+		// Canonical third-party wording first, verbatim; extra disclosure after it.
+		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It posts your loans - player names, items, values, due dates and a picture of the trade window - to the Discord channel your group's staff have set up.",
+		position = 0,
+		section = discordSection
+	)
+	default boolean webhookEnabled()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "webhookLoans",
+		name = "New loans",
+		description = "Post when you lend something out",
+		position = 2,
+		section = discordSection
+	)
+	default boolean webhookLoans()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "webhookReturns",
+		name = "Returns",
+		description = "Post when a loan is returned, forgiven or removed",
+		position = 3,
+		section = discordSection
+	)
+	default boolean webhookReturns()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "webhookOverdue",
+		name = "Overdue loans",
+		description = "Post when a loan goes overdue (same days as your overdue reminders)",
+		position = 4,
+		section = discordSection
+	)
+	default boolean webhookOverdue()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "webhookScreenshot",
+		name = "Attach trade picture",
+		description = "Add a picture of the trade window to loan and return posts - the trade window only, never your chat or inventory. Needs Loan Trade Screenshots on.",
+		position = 5,
+		section = discordSection
+	)
+	default boolean webhookScreenshot()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "webhookPingMe",
+		name = "Ping me in Discord",
+		description = "Tag you in your groups' Discord posts about loans you're part of. Your Discord ID is picked up from the Discord app when it's open on this computer, or from the box below.",
+		warning = "This shares your Discord user ID with the members of your groups so loan posts can tag you. It goes through the sync server locked with each group's key, so the server can't read it.",
+		position = 6,
+		section = discordSection
+	)
+	default boolean webhookPingMe()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "webhookDiscordId",
+		name = "My Discord user ID",
+		description = "Only needed if you use Discord in a browser or on your phone. In Discord: Settings > Advanced > turn on Developer Mode, then right-click your name > Copy User ID.",
+		position = 7,
+		section = discordSection
+	)
+	default String webhookDiscordId()
+	{
+		return "";
 	}
 
 	// Data & Storage

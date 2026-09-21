@@ -17,7 +17,12 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import com.guess34.lendingtracker.model.*;
 import com.guess34.lendingtracker.ui.LendingPanel;
+import com.guess34.lendingtracker.services.ClanRoster;
+import net.runelite.client.discord.DiscordService;
+import net.runelite.client.discord.events.DiscordReady;
 import com.guess34.lendingtracker.services.DataService;
+import com.guess34.lendingtracker.services.DiscordWebhook;
+import com.guess34.lendingtracker.services.ItemCategories;
 import com.guess34.lendingtracker.services.LocalDataSyncService;
 import com.guess34.lendingtracker.services.ProofScreenshot;
 import com.guess34.lendingtracker.services.GroupService;
@@ -82,6 +87,11 @@ public class LendingTrackerPlugin extends Plugin
 	@Inject private Notifier notifier;
 	@Inject private EventBus eventBus;
 	@Inject private DataService dataService;
+	@Inject private ItemCategories itemCategories;
+	@Inject private DiscordWebhook discordWebhook;
+	@Inject private ClanRoster clanRoster;
+	@Inject private DiscordService discordService;
+	private int clanRefreshTicks = 99; // first tick after start reads it straight away
 	@Inject private GroupService groupService;
 	@Inject private LocalDataSyncService localDataSyncService;
 	@Inject private ProofScreenshot proofScreenshot;
@@ -126,6 +136,10 @@ public class LendingTrackerPlugin extends Plugin
 		else { log.error("ClientToolbar is null - UI will not appear"); }
 
 		groupService.setActive(true);
+		// The lender posts a loan to Discord the first time their client sees it,
+		// however it got here. The webhook remembers what it posted, so the loans
+		// reloaded at every login are not posted again.
+		dataService.setOnNewLoanFromSync(loan -> discordWebhook.postLoanSeen(loan, getCurrentPlayerName()));
 		groupService.setOnSyncCallback(this::onGroupDataSynced);
 		// A group vanishing without a word is the single most confusing thing
 		// the plugin can do, so say what happened.
@@ -508,6 +522,59 @@ public class LendingTrackerPlugin extends Plugin
 		});
 	}
 
+	// The clan list changes as people join and leave; re-read it when the clan
+	// channel changes and about once a minute, not every tick.
+	@Subscribe
+	public void onClanChannelChanged(ClanChannelChanged event)
+	{
+		clanRoster.refresh();
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		if (++clanRefreshTicks >= 100)
+		{
+			clanRefreshTicks = 0;
+			clanRoster.refresh();
+			// Also catches groups joined since, and a Discord app opened late
+			updateMyDiscordId();
+		}
+	}
+
+	@Subscribe
+	public void onDiscordReady(DiscordReady event)
+	{
+		updateMyDiscordId();
+	}
+
+	/**
+	 * Keep this player's Discord ID on their group rows in step with "Ping me":
+	 * the typed ID if there is one, else the one the Discord app reports, and
+	 * none at all when pinging is off.
+	 */
+	private void updateMyDiscordId()
+	{
+		String me = getCurrentPlayerName();
+		if (me == null) { return; }
+		String id = null;
+		if (config.webhookPingMe())
+		{
+			String typed = config.webhookDiscordId() != null ? config.webhookDiscordId().trim() : "";
+			if (typed.matches("\\d{17,20}"))
+			{
+				id = typed;
+			}
+			else if (discordService.getCurrentUser() != null
+				&& discordService.getCurrentUser().userId != null
+				&& discordService.getCurrentUser().userId.matches("\\d{17,20}"))
+			{
+				id = discordService.getCurrentUser().userId;
+			}
+		}
+		groupService.setMyDiscordId(me, id);
+	}
+
 	@Subscribe
 	public void onVarbitChanged(VarbitChanged event)
 	{
@@ -534,6 +601,12 @@ public class LendingTrackerPlugin extends Plugin
 	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
+		if ("lendingtracker".equals(event.getGroup())
+			&& ("webhookPingMe".equals(event.getKey()) || "webhookDiscordId".equals(event.getKey())))
+		{
+			updateMyDiscordId();
+			return;
+		}
 		if (!"lendingtracker".equals(event.getGroup()) || !"enableRelaySync".equals(event.getKey()))
 		{
 			return;
@@ -575,8 +648,12 @@ public class LendingTrackerPlugin extends Plugin
 
 	private void checkOverdueLoans()
 	{
-		List<LendingEntry> overdueEntries = dataService.getOverdueEntries(getCurrentPlayerName());
-		if (overdueEntries.isEmpty() || !config.enableNotifications()) { return; }
+		String me = getCurrentPlayerName();
+		List<LendingEntry> overdueEntries = dataService.getOverdueEntries(me);
+		if (overdueEntries.isEmpty()) { return; }
+		// Grouped per borrower and day, so one trade's worth of overdue gear is one
+		// Discord post rather than one per item.
+		java.util.Map<String, List<LendingEntry>> overduePosts = new java.util.LinkedHashMap<>();
 		for (LendingEntry entry : overdueEntries)
 		{
 			long daysOverdue = ChronoUnit.DAYS.between(Instant.ofEpochMilli(entry.getDueDate()), Instant.now());
@@ -590,6 +667,16 @@ public class LendingTrackerPlugin extends Plugin
 				String message = entry.outstandingLentQty() > 0
 					? "Overdue loan: " + entry.getItemName() + " (" + daysOverdue + " days overdue)"
 					: "Open loan: " + entry.getItemName() + " — items returned, collateral still to be handed back";
+				// The Discord post is its own setting - someone who silences the
+				// popups may still want the channel to hear about it.
+				if (entry.outstandingLentQty() > 0)
+				{
+					// Per group too: each group's loans go to that group's channel.
+					overduePosts.computeIfAbsent(entry.getGroupId() + "|"
+						+ String.valueOf(entry.getBorrower()).toLowerCase() + "|" + daysOverdue,
+						k -> new ArrayList<>()).add(entry);
+				}
+				if (!config.enableNotifications()) { continue; }
 				notifier.notify(message);
 				// playSoundEffect must run on the client thread. checkOverdueLoans runs on
 				// the shared executor, so this needs the same hop the request-notification
@@ -599,6 +686,11 @@ public class LendingTrackerPlugin extends Plugin
 					clientThread.invokeLater(() -> client.playSoundEffect(SoundEffectID.UI_BOOP));
 				}
 			}
+		}
+		for (java.util.Map.Entry<String, List<LendingEntry>> post : overduePosts.entrySet())
+		{
+			String day = post.getKey().substring(post.getKey().lastIndexOf('|') + 1);
+			discordWebhook.postBatch(DiscordWebhook.Event.OVERDUE, post.getValue(), me, day, null);
 		}
 	}
 
@@ -1370,6 +1462,7 @@ public class LendingTrackerPlugin extends Plugin
 				: "[Removed by mutual consent of " + r.getFrom() + " and " + r.getTo() + "]";
 			if (dataService.removeLoanApproved(entry.getId(), stamp))
 			{
+				discordWebhook.post(DiscordWebhook.Event.REMOVED, entry, me);
 				clientThread.invokeLater(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
 					"[Lending Tracker] Loan removed after approval: " + entry.getItemName()
 						+ " (" + entry.getLender() + " -> " + entry.getBorrower() + ").", ""));
@@ -1495,8 +1588,9 @@ public class LendingTrackerPlugin extends Plugin
 					seen.add(key);
 					if (notified.add(key))
 					{
-						notifier.notify("[Lending Tracker] Your request for " + r.getItemName()
-							+ " expired — nobody answered it.");
+						notifier.notify("[Lending Tracker] " + (r.isLookingFor()
+							? "Your Looking For post for " + r.getItemName() + " expired - post it again if you still need it."
+							: "Your request for " + r.getItemName() + " expired — nobody answered it."));
 						changed = true;
 					}
 					continue;
@@ -1579,6 +1673,9 @@ public class LendingTrackerPlugin extends Plugin
 	public ConfigManager getConfigManager() { return configManager; }
 	public ItemManager getItemManager() { return itemManager; }
 	public DataService getDataService() { return dataService; }
+	public ItemCategories getItemCategories() { return itemCategories; }
+	public DiscordWebhook getDiscordWebhook() { return discordWebhook; }
+	public ClanRoster getClanRoster() { return clanRoster; }
 	public GroupService getGroupService() { return groupService; }
 	public ProofScreenshot getProofScreenshot() { return proofScreenshot; }
 	public boolean isRelaySyncConnected() { return relaySyncService != null && relaySyncService.isConnected(); }

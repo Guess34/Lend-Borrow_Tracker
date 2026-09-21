@@ -76,6 +76,38 @@ public class LendingGroup {
     // ADDED: Shared secret for HMAC-SHA256 message signing on relay sync
     private String syncSecret;
 
+    // The group's Discord webhook, set by staff in the group settings. Sealed with
+    // a key derived from syncSecret (see WebhookSeal): the relay stores group JSON
+    // where anyone who knows the group id can read it, and a webhook link lets
+    // whoever holds it post in that channel. Members hold the key; nobody else
+    // does, the relay included. Its own stamp, newest wins; an empty value with a
+    // newer stamp means it was removed. Clients that predate it drop these fields
+    // when they relay the group, which the stamp makes harmless - absence never
+    // clears it.
+    private String webhookSealed;
+    private long webhookUpdatedAt;
+    private String webhookSetBy;
+    // The webhookUpdatedAt the "connected" test was sent for. Equal means the
+    // current webhook has been tested, so the Test button locks for all staff
+    // until the webhook changes. Merged by max: a value from an older webhook is
+    // always smaller than the current stamp, so it can't lock a new one.
+    private long webhookTestedFor;
+
+    // The in-game clan this group belongs to, chosen by staff - independent of the
+    // group's own name. Lets members recognise clan-mates who can't run the plugin
+    // (mobile players) from the game's own clan list. Public information, so not
+    // sealed. Same newest-stamp-wins rule as the webhook.
+    private String linkedClan;
+    private long linkedClanUpdatedAt;
+    private String linkedClanSetBy;
+
+    // Whose loans this group tracks and posts: "CLAN" (both players in the linked
+    // clan), "GROUP" (both in this group) or "ANYONE". Chosen by staff. Null on
+    // groups that predate it, which read as CLAN when a clan is linked and ANYONE
+    // otherwise - exactly how they behaved before. Newest stamp wins.
+    private String loanScope;
+    private long loanScopeUpdatedAt;
+
     // Permission settings - which roles can kick members
     // Default: co-owner, admin, mod can all kick (true)
     private boolean coOwnerCanKick = true;
