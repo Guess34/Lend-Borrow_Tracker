@@ -1,51 +1,194 @@
 # Lending Tracker
 
-A [RuneLite](https://runelite.net/) plugin that enables Old School RuneScape players to form groups and track item lending and borrowing between members.
+A [RuneLite](https://runelite.net/) plugin for clans and friend groups who lend gear to each
+other. It records who lent what to whom, what collateral was put up, when it is due back, and
+whether it came home — straight from the trade window.
 
-## Features
+Only one side of a trade needs the plugin, so you can lend to clan mates on mobile or in
+vanilla and still have a record of it.
 
-### Group System
-- Create or join lending groups with role-based permissions (Owner, Co-Owner, Admin, Mod, Member)
-- Single-use invite codes with shareable format (ABC-123-XYZ)
-- Right-click players in-game to generate an invite message (copies to clipboard — paste in-game with Ctrl+V)
-- Ownership transfer, member kicking, and role management
-- Configurable permissions per role (who can kick, invite, manage)
+## Quick start
 
-### Cross-Machine Sync
-- Group data syncs in real-time between all members on different computers
-- Secure relay server with HMAC-SHA256 signed messages
-- Automatic reconnection with exponential backoff
-- Connection status indicator in the panel header
+**Members**
 
-### Marketplace
-- Right-click items in your inventory to list them for lending
-- Browse what group members are offering on the Dashboard tab
-- Set collateral type, value, percentage, duration, and notes per listing
-- GE price integration with automatic price updates
-- Looking For board — post requests for items you need so group members know what to lend
+1. Install the plugin and open its panel from the RuneLite sidebar.
+2. Plugin settings → **Sync** → turn on **Enable Cloud Sync**. Without it, nothing reaches the
+   rest of your group.
+3. Get a **group code** from your staff and join with it on the **Groups** tab.
+4. Offer gear with **Offer Item**, or right-click an item in your inventory → **Add to Lending
+   List**.
+5. In a trade: the **lender** taps **Loan**, the **borrower** taps **Collat**.
 
-### Tracking & History
-- Lending history with status badges (Returned, Overdue, Active, Defaulted)
-- Overdue loan alerts with configurable reminder frequency
-- Desktop and in-game sound notifications when loans pass their due date
-- Wilderness warning when entering the Wilderness with borrowed items
-- Screenshot proof capture for trade record-keeping
+**Staff**
 
-### Group Roster
-- See all group members with their roles
-- Online status detection (via friends list and Friends Chat)
-- World number display for online members
+1. Turn on Cloud Sync, then create your group on the **Groups** tab.
+2. Share a code from group settings, and set which ranks may kick and invite.
+3. Optional: connect a **Discord** channel and link the group to your **in-game clan**.
 
-### Data & Storage
-- Per-account data storage — each OSRS account has its own groups and data
-- Local JSON backup and restore
-- Automatic save on shutdown, auto-load on login
+---
 
-### Coming Soon
-- **Borrow Requests** — Request to borrow specific items directly from group members
-- **Item Set Bundles** — Bundle multiple items into a single lendable package
-- **Risk Analysis** — Player risk scoring based on lending history and behavior
-- **Discord Integration** — Get notifications in your Discord server for lending activity
+# Member guide
+
+## Joining a group
+
+Paste the code your staff gave you on the **Groups** tab. You then see the group's
+marketplace, its members, and your own loans. Cloud Sync must be on.
+
+## Offering gear
+
+- **Offer Item** on the dashboard, or right-click an item in your inventory → **Add to Lending
+  List**.
+- Set quantity, value and any collateral you want for it. Values come from the GE and keep
+  themselves up to date.
+- **Item sets:** right-click one of your listings → **Add to a set...** to group pieces
+  together, like a full Inquisitor's. Others can request the whole set, lending one piece
+  leaves the rest listed, and the piece rejoins the set when it comes home.
+
+## Lending and borrowing in a trade
+
+The plugin adds its own buttons to the trade window:
+
+| Button | What it means |
+|---|---|
+| **Loan** | You are the lender. Everything you hand over is recorded as a loan |
+| **Collat** | You are the borrower. Everything you hand over is your collateral |
+| **Days** | How long the loan runs: 1 to 7 days, or No limit |
+
+Only the lender's plugin records the loan, so it is never counted twice. If the lender has no
+plugin — a clan mate on mobile, say — tap **Collat** and your own client keeps the record
+instead.
+
+A proof screenshot of the trade window is saved automatically, on your own computer.
+
+## Getting gear back
+
+- Trade the items back and the loan settles itself.
+- A loan is only finished once the items **and** the collateral are back. Either can come in a
+  later trade, including one where the other person offers nothing.
+- If part is still out, the plugin tells you exactly what is missing and who has it.
+
+## Asking to borrow
+
+- Right-click a listing → **Request to Borrow**, choose a duration and agree to the terms. The
+  lender sees it in their panel.
+- **Looking For** posts what you need to the whole group, and shows who already has that item
+  listed.
+
+## While you hold borrowed gear
+
+The plugin warns you before you trade it away or take it into the Wilderness. Those settings
+live under **Borrowed Item Guards**.
+
+## Reminders
+
+Overdue reminders cover your own loans only, once a day, with optional sound. Turn them off
+under **Notifications**.
+
+## Discord
+
+If your staff have set up a channel:
+
+1. Plugin settings → **Discord** → tick **Post loans to Discord**. RuneLite shows a warning,
+   because loans go to an outside site.
+2. You never paste a link — it comes with the group.
+3. Optional: tick **Ping me in Discord** to be tagged in posts about your loans. Your Discord
+   ID is read from the Discord app if it is open on the same computer, or you can paste it.
+
+---
+
+# Staff guide
+
+## Letting people in
+
+| Code | Use |
+|---|---|
+| **Invite code** | One person, one use |
+| **Group code** | Stays open for a clan, can be a custom phrase, and joins can be closed any time |
+
+Changing a code kills the old one immediately, which is how you shut the door after a kick.
+Codes expire on the server after 24 hours unless a staff member is online to keep them alive.
+
+## Ranks and permissions
+
+Ranks run **owner → co-owner → admin → mod → member**. In group settings you choose which
+ranks may **kick** and which may **generate invite codes**. Owners and co-owners handle
+everything else.
+
+## Kicking
+
+A kick sticks: the member loses the group on every computer they use, and old codes cannot
+bring them back. Loan records stay with both sides, so anything still open remains on the
+dashboard. Rotate the group code afterwards if they left on bad terms.
+
+## Deleting a group
+
+Only an owner or the founder can, and it removes the group **for every member**. It is blocked
+while anything at all is still on loan. If the server does not confirm the delete, the group
+stays on your side so you can press Delete again — nobody is left holding a group that cannot
+be cleared.
+
+## Discord channel
+
+1. In Discord: Edit Channel → Integrations → Webhooks → Copy Webhook URL.
+2. Group settings → **Discord** → **Set up** → paste it. It is stored locked with the group's
+   key and synced to every member, so **members never paste anything**.
+3. **Test** sends one message to check the channel, then locks until the webhook changes.
+4. Each member ticks **Post loans to Discord** once in their own settings.
+
+Only co-owners and owners can set or change it. The posts' name and picture come from the
+webhook, so set those in Discord.
+
+Posted events: new loans, returns, incomplete returns, overdue loans, and loans forgiven or
+removed. Each post shows the players, items, values, collateral and a picture of the trade
+window.
+
+## Linking an in-game clan
+
+In the same **Set up** window, press **Use my clan** or type the clan's name. It does not have
+to match the group's name. The plugin reads the game's own clan list, so clan mates on mobile
+count as members even though they cannot run the plugin.
+
+**Track loans with** decides whose loans the group records and posts:
+
+| Setting | Meaning |
+|---|---|
+| **Clan members only** | Both players must be in the linked clan |
+| **Group members only** | Both players must be in this group |
+| **Anyone** | Every loan made in the group |
+
+A trade outside that setting is not recorded, and the player is told why in chat.
+
+## Proof
+
+Every loan and return trade saves a screenshot on the lender's computer. Group settings →
+**Show Screenshot Folder** gives the path.
+
+---
+
+## Everything it does
+
+- **Groups** — roles and per-role permissions, ownership transfer, founder handover, kicks that
+  stick across computers, and group deletion that clears for everyone
+- **Loans from the trade window** — items, collateral in gear or GP, value, due date, partial
+  returns tracked piece by piece, and proof screenshots
+- **Marketplace** — listings priced from the GE, item sets, gear categories worked out from
+  each item's own stats (melee, range, mage, tank, DPS, stab, slash, crush, end game), search
+  and filters, listings grouped by owner, Looking For board, borrow requests and lend offers
+- **Clan and Discord** — link a group to an in-game clan, choose whose loans it tracks, and
+  post loan activity to a Discord channel with optional pings
+- **Reminders and history** — daily overdue reminders for your own loans, completed loan
+  history with status badges, per-account storage and local backups
+- **Sync** — group data shared between members' computers through a relay server, signed with a
+  per-group key, catching up automatically after you reconnect
+
+## Privacy
+
+- Cloud Sync sends your player name, world and online status to the relay server so your group
+  can see who is online. RuneLite shows this warning when you turn it on.
+- Discord posting is off by default. When on, loans — names, items, values, due dates and a
+  picture cropped to the trade window — are posted to the channel your staff set up. Your chat
+  and inventory are never included.
+- Proof screenshots stay on your own computer, under `~/.runelite/lending-tracker/proof/`.
 
 ## Installation
 
@@ -54,16 +197,7 @@ A [RuneLite](https://runelite.net/) plugin that enables Old School RuneScape pla
 3. Search for **Lending Tracker**
 4. Click **Install**
 
-## Usage
-
-1. Open the Lending Tracker panel from the sidebar
-2. Create a new group or join an existing one using an invite code
-3. Right-click items in your inventory to list them on the marketplace
-4. Group members can browse available items on the Dashboard tab
-5. Use the Roster tab to see group members and their online status
-6. Check the History tab for completed lending transactions
-
-## Building from Source
+## Building from source
 
 ```bash
 ./gradlew build
