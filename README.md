@@ -29,6 +29,12 @@ vanilla and still have a record of it.
 
 # Member guide
 
+## Inviting someone in game
+
+Right-click a player → **Invite to Lending Group** and the plugin puts an invite message on
+your clipboard, ready to paste in chat with Ctrl+V. You can turn that menu entry off in the
+plugin's settings.
+
 ## Joining a group
 
 Paste the code your staff gave you on the **Groups** tab. You then see the group's
@@ -176,6 +182,7 @@ Every loan and return trade saves a screenshot on the lender's computer. Group s
   and filters, listings grouped by owner, Looking For board, borrow requests and lend offers
 - **Clan and Discord** — link a group to an in-game clan, choose whose loans it tracks, and
   post loan activity to a Discord channel with optional pings
+- **Roster** — every member with their rank, who is online, and the world they are on
 - **Reminders and history** — daily overdue reminders for your own loans, completed loan
   history with status badges, per-account storage and local backups
 - **Sync** — group data shared between members' computers through a relay server, signed with a
