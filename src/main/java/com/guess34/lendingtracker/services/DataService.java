@@ -149,7 +149,7 @@ public class DataService
 			{
 				if (existing.getItemId() == entry.getItemId())
 				{
-					existing.setQuantity(existing.getQuantity() + entry.getQuantity());
+					existing.setQuantity(existing.getQuantity() + Math.max(0, entry.getQuantity()));
 					// Restocking is a change, so the stored row has to say so. Without
 					// this the row keeps its original time, which both loses the merge
 					// against a peer's older copy and leaves it looking old enough for
@@ -310,19 +310,91 @@ public class DataService
 		long now = System.currentTimeMillis();
 		Map<Integer, String> memory = loadSetMemory(groupId, owner);
 		int changed = 0;
-		for (int i = 0; i < ownerItems.size(); i++)
+		for (LendingEntry e : ownerItems)
 		{
-			LendingEntry e = ownerItems.get(i);
 			if (e == null || !itemIds.contains(e.getItemId())) continue;
-			LendingEntry updated = new LendingEntry(e);
-			updated.setSetId(setId);
-			updated.setSetName(setId != null ? setName : null);
-			updated.setUpdatedAt(now);
-			ownerItems.set(i, updated);
+			// In place, for the same reason as applyAutoSets: a websocket push can
+			// replace this whole list while we walk it, and writing back by index
+			// would then land on a row that moved. Name before id, so nothing ever
+			// sees a set without one.
+			e.setSetName(setId != null ? setName : null);
+			e.setSetId(setId);
+			e.setUpdatedAt(now);
 			int base = net.runelite.client.game.ItemVariationMapping.map(e.getItemId());
 			if (setId != null) memory.put(base, setId + "|" + (setName != null ? setName : ""));
 			else memory.remove(base);
 			changed++;
+		}
+		if (changed == 0) return 0;
+		saveSetMemory(groupId, owner, memory);
+		persist(groupId, "available");
+		if (groupService != null)
+		{
+			groupService.publishEvent(GroupService.SyncEventType.ITEM_UPDATED, groupId + ":sets", null);
+		}
+		return changed;
+	}
+
+	/** One set the plugin worked out for itself, ready to apply. */
+	public static final class AutoSet
+	{
+		private final String setId;
+		private final String setName;
+		private final Collection<Integer> itemIds;
+
+		public AutoSet(String setId, String setName, Collection<Integer> itemIds)
+		{
+			this.setId = setId;
+			this.setName = setName;
+			this.itemIds = itemIds;
+		}
+	}
+
+	/**
+	 * Group listings into sets the plugin worked out by itself, all in one go.
+	 *
+	 * Two things make this different from applySetToListings, and both matter:
+	 *
+	 * It does NOT stamp updatedAt. On a marketplace row that timestamp does one
+	 * job - applyRemovedListings drops a row when a delisting tombstone is newer
+	 * than it. Listings are otherwise replaced wholesale by whoever owns them, so
+	 * nothing else reads it. Stamping it here would mean this machine tidying gear
+	 * into a set could outrank, and silently undo, a delisting the same player made
+	 * on their other computer.
+	 *
+	 * And it persists and publishes ONCE for the whole batch, rather than sending
+	 * the entire group snapshot to the relay per set.
+	 */
+	public int applyAutoSets(String groupId, String owner, List<AutoSet> sets)
+	{
+		if (groupId == null || owner == null || sets == null || sets.isEmpty()) return 0;
+		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
+		if (groupData == null) return 0;
+		String ownerKey = groupData.keySet().stream()
+			.filter(k -> k.equalsIgnoreCase(owner)).findFirst().orElse(null);
+		if (ownerKey == null) return 0;
+		List<LendingEntry> ownerItems = groupData.get(ownerKey);
+		if (ownerItems == null) return 0;
+
+		Map<Integer, String> memory = loadSetMemory(groupId, owner);
+		int changed = 0;
+		for (AutoSet set : sets)
+		{
+			if (set.setId == null || set.itemIds == null || set.itemIds.isEmpty()) continue;
+			for (LendingEntry e : ownerItems)
+			{
+				if (e == null || !set.itemIds.contains(e.getItemId())) continue;
+				// Set the fields in place rather than swapping the row out by index.
+				// A websocket push can replace this whole list while we walk it, and
+				// an index read-modify-write would then write over a row that moved.
+				// Name first, then id: nothing groups a row until it has an id, so a
+				// reader never catches a set with no name.
+				e.setSetName(set.setName);
+				e.setSetId(set.setId);
+				memory.put(net.runelite.client.game.ItemVariationMapping.map(e.getItemId()),
+					set.setId + "|" + (set.setName != null ? set.setName : ""));
+				changed++;
+			}
 		}
 		if (changed == 0) return 0;
 		saveSetMemory(groupId, owner, memory);
@@ -447,6 +519,93 @@ public class DataService
 			throw new IllegalArgumentException("Invalid removal parameters");
 		}
 		removeAvailable(groupId, ownerName, itemName, itemId);
+	}
+
+	/**
+	 * Note how much of each of OUR OWN listings is on our back right now, so the
+	 * rest of the group stops being offered gear that cannot be handed over. Our
+	 * own rows only: no client can see anybody else's equipment, so no client but
+	 * ours ever writes this.
+	 *
+	 * Both maps are keyed by item FAMILY, so an ornament kit or a charged variant
+	 * still counts as the listed item. That is only safe because the spare count
+	 * uses the same key: wearing a Berserker ring (i) cannot hide the plain one,
+	 * because the plain one in the bank covers its own listing.
+	 *
+	 * @param wornByItemId  how many of each family are equipped
+	 * @param spareByItemId how many of each family we can see NOT equipped
+	 *                      (inventory plus the last seen bank), or null when we
+	 *                      have not seen the bank and therefore cannot rule out a
+	 *                      spare sitting in it - in which case nothing is hidden.
+	 * @return true only if something actually changed, so the caller can decide
+	 *         whether a redraw or a publish is worth doing at all.
+	 */
+	public boolean setWornQuantities(String groupId, String owner,
+		Map<Integer, Integer> wornByItemId, Map<Integer, Integer> spareByItemId)
+	{
+		if (groupId == null || owner == null) return false;
+		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
+		if (groupData == null) return false;
+		String ownerKey = groupData.keySet().stream()
+			.filter(k -> k.equalsIgnoreCase(owner)).findFirst().orElse(null);
+		if (ownerKey == null) return false;
+		List<LendingEntry> ownerItems = groupData.get(ownerKey);
+		if (ownerItems == null) return false;
+
+		boolean changed = false;
+		// One worn copy covers one listing. Without this, two rows of the same
+		// family would each claim the same equipped item.
+		Map<Integer, Integer> wornLeft = new HashMap<>();
+		if (wornByItemId != null) wornLeft.putAll(wornByItemId);
+		Map<Integer, Integer> spareLeft = new HashMap<>();
+		if (spareByItemId != null) spareLeft.putAll(spareByItemId);
+		for (int i = 0; i < ownerItems.size(); i++)
+		{
+			LendingEntry e = ownerItems.get(i);
+			if (e == null) continue;
+			Integer value = null;
+			// A listed quantity is whatever the lender typed, so it is not evidence
+			// of anything. Only hide the part of a listing that no copy we can see
+			// off our back could cover - and only ever because it is being worn.
+			if (spareByItemId != null)
+			{
+				int family = net.runelite.client.game.ItemVariationMapping.map(e.getItemId());
+				int listed = Math.max(0, e.getQuantity());
+				int worn = Math.max(0, wornLeft.getOrDefault(family, 0));
+				int spare = Math.max(0, spareLeft.getOrDefault(family, 0));
+				int uncovered = Math.max(0, listed - spare);
+				int hide = Math.min(Math.min(worn, listed), uncovered);
+				// Whatever this row uses up is not available to the next one.
+				wornLeft.put(family, worn - hide);
+				spareLeft.put(family, Math.max(0, spare - Math.min(spare, listed)));
+				if (hide > 0) value = hide;
+				if (!java.util.Objects.equals(e.getWornQty(), hide > 0 ? (Integer) hide : null))
+				{
+					log.debug("Lending Tracker worn: {} (id {}, family {}) listed={} worn={} spare={} -> hide={}",
+						e.getItem(), e.getItemId(), family, listed, worn, spare, hide);
+				}
+			}
+			if (java.util.Objects.equals(e.getWornQty(), value)) continue;
+			// Set the one field in place rather than swapping the row out. This runs
+			// on the client thread while the panel groups sets on the EDT, and an
+			// index read-modify-write from two threads can land on a row that moved
+			// under it - which would replace one listing with a copy of another.
+			// Writing a single reference field cannot tear: a reader sees the old
+			// value or the new one.
+			//
+			// updatedAt is deliberately NOT touched. On a marketplace row it only
+			// decides whether a delisting tombstone still outranks it, and putting a
+			// helmet on must never undo a removal made on another computer.
+			//
+			// This is not written here on purpose, but it is NOT kept off disk: any
+			// later persist serialises the row, so it does reach the config snapshot,
+			// the local backup and the relay. That is safe only because
+			// triggerLoginFlow clears it before the first publish of a session and
+			// re-reads the live containers - do not remove that clear.
+			e.setWornQty(value);
+			changed = true;
+		}
+		return changed;
 	}
 
 	public List<LendingEntry> getOfferingsByOwner(String groupId, String ownerName)
@@ -1451,6 +1610,27 @@ public class DataService
 	// is why this stayed hidden.
 	private final Set<String> hydratedGroups = ConcurrentHashMap.newKeySet();
 
+	/**
+	 * Load a group from config if this session has not read it yet, and otherwise
+	 * do nothing. For callers that only need to know the data is there before they
+	 * draw it.
+	 *
+	 * Config is only ever written FROM memory (persist serialises groupAvailable),
+	 * so once a group is hydrated the stored copy can never be newer than what is
+	 * already in memory - re-reading it can only ever bring back something older.
+	 * The panel used to do exactly that on every redraw, on the EDT, while the
+	 * client thread was writing worn state into the same rows; the reload swapped
+	 * in fresh objects mid-write and silently dropped the flag on whichever rows
+	 * the writer had not reached yet.
+	 */
+	public void ensureHydrated(String groupId)
+	{
+		if (groupId != null && !groupId.isEmpty() && !hydratedGroups.contains(groupId))
+		{
+			loadGroupData(groupId);
+		}
+	}
+
 	private void persist(String groupId, String kind)
 	{
 		if (groupId == null || groupId.isEmpty()) return;
@@ -2070,6 +2250,12 @@ public class DataService
 		// otherwise come back through persist's hydrate check and recurse.
 		hydratedGroups.add(groupId);
 
+		// What we are wearing is worked out live and means "right now", so it is
+		// never taken from disk: kept here across the reload below, which replaces
+		// every row with a fresh object built from the stored snapshot.
+		String selfNow = configManager.getConfiguration(CONFIG_GROUP, "currentAccount");
+		Map<Integer, Integer> wornBefore = ownWornState(groupId, selfNow);
+
 		String json = configManager.getConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId);
 		if (json != null && !json.isEmpty())
 		{
@@ -2079,6 +2265,11 @@ public class DataService
 				Map<String, Object> snapshot = gson.fromJson(json, Map.class);
 
 				loadGroupEntries(getCategory(snapshot, "available"), groupId, groupAvailable);
+				// Our own rows take their worn state from memory, both ways round: a
+				// piece just put on has to stay hidden, and one just taken off has to
+				// come back even if an earlier save wrote the flag to disk. Everyone
+				// else's stays exactly as they published it.
+				restoreOwnWornState(groupId, selfNow, wornBefore);
 				loadGroupEntries(getCategory(snapshot, "lent"), groupId, groupLent);
 				loadGroupEntries(getCategory(snapshot, "borrowed"), groupId, groupBorrowed);
 				mergeRequests(groupId, snapshot.get("requests"), false);
@@ -2113,6 +2304,45 @@ public class DataService
 		Map<String, Map<String, List<LendingEntry>>> target)
 	{
 		loadGroupEntries(rawData, groupId, target, null);
+	}
+
+	/** Our own listings' worn state, by item id. Absent means "not worn". */
+	private Map<Integer, Integer> ownWornState(String groupId, String self)
+	{
+		Map<Integer, Integer> out = new HashMap<>();
+		if (self == null || self.isEmpty()) return out;
+		Map<String, List<LendingEntry>> owners = groupAvailable.get(groupId);
+		if (owners == null) return out;
+		for (Map.Entry<String, List<LendingEntry>> owner : owners.entrySet())
+		{
+			if (!owner.getKey().equalsIgnoreCase(self)) continue;
+			for (LendingEntry e : owner.getValue())
+			{
+				if (e != null && e.getWornQty() != null) out.put(e.getItemId(), e.getWornQty());
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Put our own worn state back after a reload has replaced the row objects.
+	 * Authoritative in BOTH directions - a row missing from the map is set back to
+	 * null - because the only truth about what is on our back is the live
+	 * equipment we read a moment ago, never what happened to be saved.
+	 */
+	private void restoreOwnWornState(String groupId, String self, Map<Integer, Integer> worn)
+	{
+		if (self == null || self.isEmpty()) return;
+		Map<String, List<LendingEntry>> owners = groupAvailable.get(groupId);
+		if (owners == null) return;
+		for (Map.Entry<String, List<LendingEntry>> owner : owners.entrySet())
+		{
+			if (!owner.getKey().equalsIgnoreCase(self)) continue;
+			for (LendingEntry e : owner.getValue())
+			{
+				if (e != null) e.setWornQty(worn.get(e.getItemId()));
+			}
+		}
 	}
 
 	/**

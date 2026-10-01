@@ -83,11 +83,29 @@ public class LendingEntry {
     // it drop it when they relay the row.
     private Boolean keptByBorrower;
 
+    // How many of this listing the owner's client positively SAW on their own
+    // back. Gear somebody is wearing can't be handed over, so the rest of the
+    // group stops being shown it until they take it off.
+    //
+    // Only the owner's client ever writes this - nobody can see anyone else's
+    // equipment. Absent means visible, and absent is NEVER repaired: unlike
+    // keptByBorrower above, losing this flag only means a peer briefly sees gear
+    // that is on someone's back, while re-asserting it would hide gear that is
+    // actually free with no way for the owner to clear it. So there is no latch
+    // here on purpose.
+    private Integer wornQty;
+
     // Convenience
 
     public long getDueDate() { return this.dueTime; }
     public long getLendDate() { return this.lendTime; }
     public boolean isReturned() { return this.returnedAt > 0; }
+
+    /** How many of this listing are on the owner's back right now. */
+    public int wornQuantity() { return wornQty == null ? 0 : Math.max(0, Math.min(wornQty, quantity)); }
+
+    /** How many could actually be handed over right now. */
+    public int availableQuantity() { return Math.max(0, quantity - wornQuantity()); }
 
     // --- Null-safe outstanding accessors (legacy records fall back to the old
     // all-or-nothing model: everything outstanding while active, nothing after) ---
@@ -169,6 +187,7 @@ public class LendingEntry {
         this.setId = other.setId;
         this.setName = other.setName;
         this.keptByBorrower = other.keptByBorrower;
+        this.wornQty = other.wornQty;
     }
 
     public String getPlayerName() { return borrower != null ? borrower : lender; }

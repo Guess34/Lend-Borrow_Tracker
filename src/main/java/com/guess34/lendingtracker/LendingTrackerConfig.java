@@ -236,7 +236,7 @@ public interface LendingTrackerConfig extends Config
 		// The first sentence is the canonical wording RuneLite requires verbatim for
 		// any third-party server feature; additional disclosure goes AFTER it, never
 		// spliced into the middle.
-		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It also sends your player name, current world, and online status; group members can see when you are online and what world you are on.",
+		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It also sends your player name, current world, and online status; group members can see when you are online and what world you are on. It also tells your group which of the items you have listed you are currently wearing, so they are not offered gear you are using.",
 		position = 0,
 		section = syncSection
 	)

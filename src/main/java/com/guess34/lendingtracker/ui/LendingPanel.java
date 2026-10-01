@@ -148,11 +148,14 @@ public class LendingPanel extends PluginPanel
 	{
 		SwingUtilities.invokeLater(() ->
 		{
-			// Ensure data is loaded for the active group BEFORE refreshing panels
+			// Make sure the active group has been read at least once before drawing it
+			// - and ONLY once. Re-reading it from config on every redraw raced the
+			// client thread writing worn state, and could only ever pull in older data
+			// than memory already held. See DataService.ensureHydrated.
 			String activeGroupId = plugin.getGroupService().getCurrentGroupIdUnchecked();
 			if (activeGroupId != null)
 			{
-				plugin.getDataService().loadGroupData(activeGroupId);
+				plugin.getDataService().ensureHydrated(activeGroupId);
 			}
 
 			groupControlPanel.refresh();

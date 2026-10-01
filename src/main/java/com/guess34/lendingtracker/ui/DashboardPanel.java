@@ -5,6 +5,7 @@ import net.runelite.client.game.ItemManager;
 import com.guess34.lendingtracker.LendingTrackerPlugin;
 import com.guess34.lendingtracker.model.LendingEntry;
 import com.guess34.lendingtracker.model.LendingRequest;
+import com.guess34.lendingtracker.services.ArmourSets;
 import com.guess34.lendingtracker.services.DataService;
 import com.guess34.lendingtracker.services.GroupService;
 import com.guess34.lendingtracker.services.ItemCategories;
@@ -40,11 +41,16 @@ public class DashboardPanel extends JPanel
 	private final JLabel overdueCountLabel;
 	private final JPanel loanListPanel;
 	private final ItemCategories itemCategories;
+	private final ArmourSets armourSets;
 
 	// Search and filter live OUTSIDE the list, which is torn down and rebuilt on
 	// every refresh - inside it, each keystroke would rebuild the field being typed in.
 	private final IconTextField searchField;
 	private final JComboBox<String> filterBox;
+	// The filter's plain name, without the "(12)" the dropdown shows. Kept apart
+	// so the counts can be rewritten on every redraw without losing the choice.
+	private String filterKey = FILTER_ALL;
+	private boolean rewritingFilters;
 	private final Timer searchDebounce;
 
 	// With a big marketplace every owner starts folded so the list is a directory
@@ -57,6 +63,9 @@ public class DashboardPanel extends JPanel
 	private static final String FILTER_END_GAME = "End game (10m+)";
 	private final java.util.Set<String> ownerToggles = new java.util.HashSet<>();
 	private final java.util.Set<String> expandedSets = new java.util.HashSet<>();
+	// Looking For posts asking for several items fold away the same way, and start
+	// closed so a few long wishlists can't swamp the board.
+	private final java.util.Set<String> expandedWants = new java.util.HashSet<>();
 
 	// Legacy Looking For posts were kept only in local config; each group is moved
 	// onto the synced requests once per session.
@@ -74,6 +83,7 @@ public class DashboardPanel extends JPanel
 		this.groupService = plugin.getGroupService();
 		this.itemManager = plugin.getItemManager();
 		this.itemCategories = plugin.getItemCategories();
+		this.armourSets = plugin.getArmourSets();
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -134,8 +144,40 @@ public class DashboardPanel extends JPanel
 		}
 		filterBox = new JComboBox<>(filters.toArray(new String[0]));
 		filterBox.setFont(FontManager.getRunescapeSmallFont());
-		filterBox.setToolTipText("Show only one kind of gear");
-		filterBox.addActionListener(e -> refresh());
+		filterBox.setToolTipText("Show only one kind of gear - the number is how many are listed now");
+		// It sat under the search box in the same flat grey and was being missed
+		// entirely. An accent edge and the orange the section headers already use
+		// make it read as something you can press.
+		filterBox.setForeground(new Color(0xFF, 0xC0, 0x60));
+		filterBox.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		filterBox.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createMatteBorder(0, 3, 0, 0, ColorScheme.BRAND_ORANGE),
+			new EmptyBorder(3, 6, 3, 3)));
+		filterBox.setPreferredSize(new Dimension(200, 26));
+		// Some look-and-feels ignore the colours above on the closed box, so the
+		// renderer sets them itself.
+		filterBox.setRenderer(new DefaultListCellRenderer()
+		{
+			@Override
+			public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+				boolean selected, boolean focused)
+			{
+				Component c = super.getListCellRendererComponent(list, value, index, selected, focused);
+				c.setFont(FontManager.getRunescapeSmallFont());
+				c.setForeground(selected ? Color.WHITE : new Color(0xFF, 0xC0, 0x60));
+				c.setBackground(selected ? ColorScheme.BRAND_ORANGE.darker() : ColorScheme.DARKER_GRAY_COLOR);
+				return c;
+			}
+		});
+		filterBox.addActionListener(e ->
+		{
+			if (rewritingFilters)
+			{
+				return;
+			}
+			filterKey = withoutCount((String) filterBox.getSelectedItem());
+			refresh();
+		});
 
 		JPanel filterBar = new JPanel(new BorderLayout(0, 4));
 		filterBar.setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -266,6 +308,15 @@ public class DashboardPanel extends JPanel
 
 			String groupId = groupService.getCurrentGroupIdUnchecked();
 
+			// Armour listed piece by piece becomes a real item set, so the whole
+			// group sees it grouped - not just whoever happens to be looking at it.
+			// Costs nothing unless our own loose armour has actually changed.
+			// The live name, not the config fallback: this writes and publishes, and
+			// the fallback exists for read-only display when logged out.
+			String meNow = plugin.getClient() != null && plugin.getClient().getLocalPlayer() != null
+				? plugin.getClient().getLocalPlayer().getName() : null;
+			announceNewSets(armourSets.groupNewKits(groupId, meNow, this::refresh));
+
 			// Get marketplace offerings from DataService
 			List<LendingEntry> marketplaceItems = new java.util.ArrayList<>();
 			if (groupId != null && !groupId.isEmpty())
@@ -295,18 +346,10 @@ public class DashboardPanel extends JPanel
 					&& (selfName.equalsIgnoreCase(e.getLender()) || selfName.equalsIgnoreCase(e.getBorrower())))
 				.collect(java.util.stream.Collectors.toList());
 
-			// Calculate summary stats from both marketplace and loans
-			long totalMarketplaceValue = marketplaceItems.stream()
-				.mapToLong(LendingEntry::getValue)
-				.sum();
-
 			long overdueCount = activeLoans.stream()
 				.filter(LendingEntry::isOverdue)
 				.count();
 
-			// Update summary labels
-			totalValueLabel.setText("Available: " + QuantityFormatter.quantityToStackSize(totalMarketplaceValue) + " GP");
-			activeLoansLabel.setText("Marketplace: " + marketplaceItems.size() + " | Loans: " + activeLoans.size());
 			overdueCountLabel.setText("Overdue: " + overdueCount);
 			overdueCountLabel.setForeground(overdueCount > 0 ? Color.RED : Color.GREEN);
 
@@ -322,13 +365,25 @@ public class DashboardPanel extends JPanel
 					if (lender == null) return false;
 					return currentGroupForFilter == null || currentGroupForFilter.hasMember(lender);
 				})
+				.map(this::asAvailableNow)
+				.filter(java.util.Objects::nonNull)
 				.collect(java.util.stream.Collectors.toList());
+
+			// Counted from what is actually on the board, so the headline can't
+			// claim gear that is on somebody's back or outside the group.
+			totalValueLabel.setText("Available: "
+				+ QuantityFormatter.quantityToStackSize(displayItems.stream()
+					.mapToLong(LendingEntry::getValue).sum()) + " GP");
+			activeLoansLabel.setText("Marketplace: " + displayItems.size()
+				+ " | Loans: " + activeLoans.size());
 
 			// Categories come from the client thread; ask for anything not seen yet
 			// and draw again once it is known.
 			itemCategories.prime(displayItems.stream().map(LendingEntry::getItemId)
 				.collect(java.util.stream.Collectors.toList()), this::refresh);
 
+			List<ListingUnit> marketUnits = buildUnits(displayItems);
+			showFilterCounts(displayItems, marketUnits, getCurrentPlayerName());
 			String query = searchQuery();
 
 			// Direct requests (borrow requests / lend offers) involving me
@@ -400,7 +455,7 @@ public class DashboardPanel extends JPanel
 
 			if (!displayItems.isEmpty())
 			{
-				addMarketplaceSection(displayItems, me, query);
+				addMarketplaceSection(displayItems, marketUnits, me, query);
 			}
 
 			if (!lookingForRequests.isEmpty())
@@ -418,6 +473,13 @@ public class DashboardPanel extends JPanel
 					{
 						LookingForCard card = new LookingForCard(request);
 						loanListPanel.add(card);
+						if (request.isMultiItem() && expandedWants.contains(request.id))
+						{
+							for (LookingForItem item : request.items)
+							{
+								loanListPanel.add(new WantedItemRow(item));
+							}
+						}
 					}
 				}
 			}
@@ -485,6 +547,221 @@ public class DashboardPanel extends JPanel
 
 	// ---------------------------------------------------------------- marketplace
 
+	/** "Melee (12)" -> "Melee". */
+	private static String withoutCount(String label)
+	{
+		return label == null ? FILTER_ALL : label.replaceAll(" [(]\\d+[)]$", "");
+	}
+
+	/**
+	 * Put a live count on every filter, so you can see there is no tank gear
+	 * listed without picking it first. Rebuilt on each redraw; the choice itself
+	 * lives in filterKey, not in the visible label.
+	 */
+	private void showFilterCounts(List<LendingEntry> items, List<ListingUnit> units, String me)
+	{
+		int inSets = 0;
+		for (ListingUnit u : units)
+		{
+			if (u.bundled()) inSets += u.pieces.size();
+		}
+		java.util.List<String> labels = new java.util.ArrayList<>();
+		labels.add(FILTER_ALL + " (" + items.size() + ")");
+		labels.add(FILTER_MINE + " (" + items.stream().filter(e -> e.getLender() != null
+			&& e.getLender().equalsIgnoreCase(me)).count() + ")");
+		labels.add(FILTER_SETS + " (" + inSets + ")");
+		labels.add(FILTER_END_GAME + " (" + items.stream().filter(DashboardPanel::isEndGame).count() + ")");
+		for (ItemCategories.Category c : ItemCategories.Category.values())
+		{
+			labels.add(c.getLabel() + " (" + items.stream().filter(e -> hasCategory(e, c)).count() + ")");
+		}
+
+		String wanted = null;
+		for (String label : labels)
+		{
+			if (withoutCount(label).equals(filterKey))
+			{
+				wanted = label;
+			}
+		}
+		rewritingFilters = true;
+		try
+		{
+			filterBox.removeAllItems();
+			for (String label : labels)
+			{
+				filterBox.addItem(label);
+			}
+			filterBox.setSelectedItem(wanted != null ? wanted : labels.get(0));
+		}
+		finally
+		{
+			rewritingFilters = false;
+		}
+	}
+
+	/**
+	 * Gear its owner is wearing right now cannot be handed over, so it comes off
+	 * the board until they take it off, and a part-worn stack shows only what is
+	 * free. Returns null for a row that should not be shown at all.
+	 *
+	 * Your own listings always stay put and are marked instead - a row vanishing
+	 * from your own list is indistinguishable from losing it, and every way of
+	 * managing a listing hangs off that row.
+	 *
+	 * Only honoured while the owner is online. What they published means "worn
+	 * right now", and once they log off nothing can ever update it, so it goes
+	 * back to showing in full. Every branch here errs towards showing.
+	 */
+	private LendingEntry asAvailableNow(LendingEntry item)
+	{
+		if (item.wornQuantity() <= 0)
+		{
+			return item;
+		}
+		String me = getCurrentPlayerName();
+		if (me != null && me.equalsIgnoreCase(item.getLender()))
+		{
+			return item;
+		}
+		if (!groupService.getOnlineMembers().containsKey(item.getLender().toLowerCase()))
+		{
+			return item;
+		}
+		int free = item.availableQuantity();
+		if (free <= 0)
+		{
+			return null;
+		}
+		// Value is the whole stack's, so it has to come down with the count or the
+		// row contradicts itself.
+		LendingEntry shown = new LendingEntry(item);
+		shown.setQuantity(free);
+		if (item.getQuantity() > 0)
+		{
+			shown.setValue(item.getValue() * free / item.getQuantity());
+		}
+		shown.setWornQty(null);
+		return shown;
+	}
+
+	/**
+	 * Say what was just grouped. Listings folding into a set on their own would
+	 * otherwise look like they had gone missing.
+	 */
+	private void announceNewSets(java.util.List<String> made)
+	{
+		if (made == null || made.isEmpty())
+		{
+			return;
+		}
+		// Open the marketplace so the new set is actually on screen. It starts
+		// folded every session, so grouping something inside it otherwise looks
+		// exactly like grouping nothing at all.
+		collapsedSections.remove("marketplace");
+		plugin.getClientThread().invokeLater(() ->
+		{
+			if (plugin.getClient() == null || plugin.getClient().getLocalPlayer() == null)
+			{
+				return;
+			}
+			// The first run after an update can find several at once, so say them
+			// together rather than filling the chatbox.
+			String what = made.size() == 1 ? "'" + made.get(0) + "'"
+				: made.size() + " sets (" + String.join(", ", made.subList(0, Math.min(3, made.size())))
+					+ (made.size() > 3 ? ", ..." : "") + ")";
+			plugin.getClient().addChatMessage(net.runelite.api.ChatMessageType.GAMEMESSAGE, "",
+				"<col=ff0000>" + ("Lending Tracker: grouped your listings into " + what
+					+ ". Right-click a set to break it up."), "");
+		});
+	}
+
+	/**
+	 * An item icon with a line struck through it and the colour drained out: this
+	 * one is on your back right now, so the group cannot see it. Reads at a glance
+	 * where a line of text does not.
+	 */
+	private static class WornIcon extends JLabel
+	{
+		@Override
+		protected void paintComponent(Graphics g)
+		{
+			super.paintComponent(g);
+			Graphics2D g2 = (Graphics2D) g.create();
+			g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+			// Knock the icon back so the struck-through one reads as unavailable
+			// next to the ones that are.
+			g2.setColor(new Color(20, 22, 26, 130));
+			g2.fillRect(0, 0, getWidth(), getHeight());
+			g2.setStroke(new BasicStroke(2f));
+			g2.setColor(new Color(0xE0, 0xA8, 0x48));
+			int pad = 5;
+			g2.drawLine(pad, getHeight() - pad, getWidth() - pad, pad);
+			g2.dispose();
+		}
+	}
+
+	/** True when this listing is ours and is on our back this moment. */
+	private boolean wornByMe(LendingEntry e)
+	{
+		if (e == null || e.wornQuantity() <= 0)
+		{
+			return false;
+		}
+		String myName = getCurrentPlayerName();
+		return myName != null && myName.equalsIgnoreCase(e.getLender());
+	}
+
+	/**
+	 * Tick which pieces of a set to ask for. Opening the set and right-clicking one
+	 * row already worked, but nobody finds it, and wanting three pieces out of five
+	 * is an ordinary thing to want rather than an edge case.
+	 */
+	private void showPieceRequestDialog(String owner, List<LendingEntry> pieces, String label)
+	{
+		if (pieces == null || pieces.isEmpty())
+		{
+			return;
+		}
+		JPanel list = new JPanel();
+		list.setLayout(new BoxLayout(list, BoxLayout.Y_AXIS));
+		java.util.Map<JCheckBox, LendingEntry> boxes = new java.util.LinkedHashMap<>();
+		for (LendingEntry p : pieces)
+		{
+			JCheckBox box = new JCheckBox(p.getItem()
+				+ (p.getQuantity() > 1 ? " x" + p.getQuantity() : "")
+				+ "   " + QuantityFormatter.quantityToStackSize(p.getValue()), true);
+			boxes.put(box, p);
+			list.add(box);
+		}
+
+		JPanel body = new JPanel(new BorderLayout(0, 6));
+		body.add(new JLabel("Which pieces of " + label + " do you want?"), BorderLayout.NORTH);
+		body.add(list, BorderLayout.CENTER);
+		if (JOptionPane.showConfirmDialog(this, body, "Request Items",
+			JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION)
+		{
+			return;
+		}
+
+		List<LendingEntry> chosen = new java.util.ArrayList<>();
+		for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
+		{
+			if (b.getKey().isSelected())
+			{
+				chosen.add(b.getValue());
+			}
+		}
+		if (chosen.isEmpty())
+		{
+			JOptionPane.showMessageDialog(this, "Tick at least one item.", "Request Items",
+				JOptionPane.WARNING_MESSAGE);
+			return;
+		}
+		showBorrowRequestDialog(owner, chosen,
+			chosen.size() == pieces.size() ? label : chosen.size() + " from " + label);
+	}
+
 	private String searchQuery()
 	{
 		String q = searchField.getText();
@@ -500,13 +777,23 @@ public class DashboardPanel extends JPanel
 		final String owner;
 		final String setId;
 		final String setName;
+		// Set when these pieces were read as a kit just for drawing, because their
+		// owner's client has not grouped them into a real set. Nothing about the
+		// listings themselves changes - only how they are shown here.
+		final String autoKey;
 		final List<LendingEntry> pieces = new java.util.ArrayList<>();
 
 		ListingUnit(String owner, String setId, String setName)
 		{
+			this(owner, setId, setName, null);
+		}
+
+		ListingUnit(String owner, String setId, String setName, String autoKey)
+		{
 			this.owner = owner;
 			this.setId = setId;
 			this.setName = setName;
+			this.autoKey = autoKey;
 		}
 
 		long value()
@@ -514,9 +801,15 @@ public class DashboardPanel extends JPanel
 			return pieces.stream().mapToLong(LendingEntry::getValue).sum();
 		}
 
+		/** Drawn as one bundle rather than a single listing. */
+		boolean bundled()
+		{
+			return setId != null || autoKey != null;
+		}
+
 		String key()
 		{
-			return owner.toLowerCase() + "#" + setId;
+			return autoKey != null ? autoKey : owner.toLowerCase() + "#" + setId;
 		}
 
 		boolean matches(String query, String filter, String me)
@@ -530,7 +823,7 @@ public class DashboardPanel extends JPanel
 			}
 			if (filter == null || FILTER_ALL.equals(filter)) return true;
 			if (FILTER_MINE.equals(filter)) return owner.equalsIgnoreCase(me);
-			if (FILTER_SETS.equals(filter)) return setId != null;
+			if (FILTER_SETS.equals(filter)) return bundled();
 			if (FILTER_END_GAME.equals(filter)) return pieces.stream().anyMatch(DashboardPanel::isEndGame);
 			ItemCategories.Category wanted = null;
 			for (ItemCategories.Category c : ItemCategories.Category.values())
@@ -571,7 +864,7 @@ public class DashboardPanel extends JPanel
 	private List<ListingUnit> buildUnits(List<LendingEntry> items)
 	{
 		java.util.Map<String, ListingUnit> units = new java.util.LinkedHashMap<>();
-		int loose = 0;
+		List<LendingEntry> loose = new java.util.ArrayList<>();
 		for (LendingEntry e : items)
 		{
 			String owner = e.getLender();
@@ -582,20 +875,66 @@ public class DashboardPanel extends JPanel
 			}
 			else
 			{
-				ListingUnit u = new ListingUnit(owner, null, null);
-				u.pieces.add(e);
-				units.put("loose#" + (loose++), u);
+				loose.add(e);
 			}
+		}
+
+		// Whatever is still loose and belongs to somebody else is read for kits too,
+		// so the board looks the same to everyone looking at it rather than only to
+		// the people whose own client has grouped their gear. This is drawing only -
+		// nothing is written and nothing is published.
+		java.util.Map<LendingEntry, ListingUnit> drawn = new java.util.IdentityHashMap<>();
+		java.util.Map<String, List<LendingEntry>> looseByOwner = new java.util.LinkedHashMap<>();
+		String me = getCurrentPlayerName();
+		for (LendingEntry e : loose)
+		{
+			// Our own gear is governed by real sets; anything of ours still loose is
+			// loose because we said so.
+			if (e.getLender() == null || e.getLender().equalsIgnoreCase(me))
+			{
+				continue;
+			}
+			looseByOwner.computeIfAbsent(e.getLender(), k -> new java.util.ArrayList<>()).add(e);
+		}
+		for (java.util.Map.Entry<String, List<LendingEntry>> owned : looseByOwner.entrySet())
+		{
+			for (ArmourSets.Kit kit : armourSets.displayKits(owned.getValue()))
+			{
+				ListingUnit u = new ListingUnit(owned.getKey(), null, kit.getName(),
+					owned.getKey().toLowerCase() + "#auto:" + kit.getFamily());
+				u.pieces.addAll(kit.getPieces());
+				for (LendingEntry e : kit.getPieces())
+				{
+					drawn.put(e, u);
+				}
+			}
+		}
+
+		int singles = 0;
+		for (LendingEntry e : loose)
+		{
+			ListingUnit kit = drawn.get(e);
+			if (kit != null)
+			{
+				units.putIfAbsent(kit.key(), kit);
+				continue;
+			}
+			ListingUnit u = new ListingUnit(e.getLender(), null, null);
+			u.pieces.add(e);
+			units.put("loose#" + (singles++), u);
 		}
 		return new java.util.ArrayList<>(units.values());
 	}
 
-	private void addMarketplaceSection(List<LendingEntry> displayItems, String me, String query)
+	private void addMarketplaceSection(List<LendingEntry> displayItems, List<ListingUnit> built,
+		String me, String query)
 	{
-		String filter = (String) filterBox.getSelectedItem();
+		String filter = filterKey;
 		boolean filtering = !query.isEmpty() || (filter != null && !FILTER_ALL.equals(filter));
 
-		List<ListingUnit> units = buildUnits(displayItems);
+		// A copy: the filtering below removes from it, and the counts were taken
+		// from the original.
+		List<ListingUnit> units = new java.util.ArrayList<>(built);
 		if (filtering)
 		{
 			units.removeIf(u -> !u.matches(query, filter, me));
@@ -620,8 +959,11 @@ public class DashboardPanel extends JPanel
 			return;
 		}
 
+		// Bundles first, then single items, each lot by value. A lone item wedged
+		// between two set rows leaves a gap in the list for no reason.
 		java.util.Comparator<ListingUnit> byValue =
-			java.util.Comparator.comparingLong(ListingUnit::value).reversed();
+			java.util.Comparator.comparing((ListingUnit u) -> u.bundled() ? 0 : 1)
+				.thenComparing(java.util.Comparator.comparingLong(ListingUnit::value).reversed());
 
 		if (filtering)
 		{
@@ -671,7 +1013,7 @@ public class DashboardPanel extends JPanel
 
 	private void addUnit(ListingUnit u, boolean showOwner)
 	{
-		if (u.setId == null)
+		if (!u.bundled())
 		{
 			loanListPanel.add(new MarketplaceCard(u.pieces.get(0), showOwner, false));
 			return;
@@ -949,6 +1291,23 @@ public class DashboardPanel extends JPanel
 				b.getKey().setSelected(e.getItemId() == seed.getItemId()
 					|| (chosen != null && chosen.equals(e.getSetId())));
 			}
+
+			// Whatever is ticked, the pieces of it that form a real kit are locked in:
+			// they group themselves, and the way one leaves is by being sold or lent.
+			// Only the odds and ends can be unticked.
+			List<LendingEntry> ticked = new java.util.ArrayList<>();
+			for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
+			{
+				if (b.getKey().isSelected()) ticked.add(b.getValue());
+			}
+			java.util.Set<Integer> locked = armourSets.kitCore(ticked);
+			for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
+			{
+				boolean fixed = locked.contains(b.getValue().getItemId());
+				b.getKey().setEnabled(!fixed);
+				b.getKey().setToolTipText(fixed
+					? "Part of the kit - it leaves the set by being sold or lent" : null);
+			}
 		};
 		which.addActionListener(ev -> showChoice.run());
 		showChoice.run();
@@ -981,13 +1340,42 @@ public class DashboardPanel extends JPanel
 		int i = which.getSelectedIndex();
 		String setId = i > 0 ? setIds.get(i - 1) : java.util.UUID.randomUUID().toString();
 
+		// Real sets are the plugin's to make, whoever is doing the adding. If what
+		// was ticked contains a kit, the whole lot joins THAT kit's set instead of
+		// becoming a second claim on the same gear - two sets fighting over one
+		// piece would settle differently on different machines.
+		List<LendingEntry> picked = new java.util.ArrayList<>();
+		for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
+		{
+			if (b.getKey().isSelected()) picked.add(b.getValue());
+		}
+		ArmourSets.Kit kitSet = armourSets.kitSetFor(groupId, owner, picked);
+		if (kitSet != null)
+		{
+			if (picked.size() == kitSet.getPieces().size())
+			{
+				JOptionPane.showMessageDialog(this,
+					"Those already group themselves as a set - no need to make one.\n"
+						+ "Sets are for adding something to a kit, or mixing pieces that\n"
+						+ "don't go together on their own.",
+					"Item Set", JOptionPane.INFORMATION_MESSAGE);
+				return;
+			}
+			setId = ArmourSets.setIdOf(kitSet);
+			name = kitSet.getName();
+		}
+
 		List<Integer> chosen = new java.util.ArrayList<>();
 		List<Integer> dropped = new java.util.ArrayList<>();
+		List<LendingEntry> droppedRows = new java.util.ArrayList<>();
 		for (java.util.Map.Entry<JCheckBox, LendingEntry> b : boxes.entrySet())
 		{
 			LendingEntry e = b.getValue();
-			if (b.getKey().isSelected()) chosen.add(e.getItemId());
-			else if (setId.equals(e.getSetId())) dropped.add(e.getItemId());
+			if (b.getKey().isSelected())
+			{
+				chosen.add(e.getItemId());
+			}
+			else if (setId.equals(e.getSetId())) { dropped.add(e.getItemId()); droppedRows.add(e); }
 		}
 		if (chosen.isEmpty())
 		{
@@ -1008,19 +1396,45 @@ public class DashboardPanel extends JPanel
 	{
 		SetCard(ListingUnit unit, boolean showOwner)
 		{
+			boolean drawnOnly = unit.autoKey != null;
+			// Coloured by WHOSE it is, not by how it came about: yours in the warm
+			// colour, everyone else's in the cool one. Whether a set was worked out
+			// or built by hand is our business, and making people read it off a
+			// colour only taught them that two identical things looked different.
+			boolean yours = getCurrentPlayerName() != null
+				&& unit.owner.equalsIgnoreCase(getCurrentPlayerName());
 			setLayout(new BorderLayout(4, 2));
-			Color bg = new Color(48, 44, 38);
+			Color bg = yours ? new Color(48, 44, 38) : new Color(40, 44, 52);
 			setBackground(bg);
 			setBorder(BorderFactory.createCompoundBorder(
-				BorderFactory.createMatteBorder(0, 2, 1, 0, ColorScheme.BRAND_ORANGE),
+				BorderFactory.createMatteBorder(0, 2, 1, 0,
+					yours ? ColorScheme.BRAND_ORANGE : new Color(0x6E, 0x92, 0xB8)),
 				new EmptyBorder(5, 8, 5, 6)));
 			setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
 			boolean open = expandedSets.contains(unit.key());
 			String name = unit.setName != null && !unit.setName.isEmpty() ? unit.setName : "Set";
-			JLabel title = new JLabel((open ? "▼ " : "▶ ") + name + "  (" + unit.pieces.size() + ")");
+
+			// Gear of ours that is on our back is off the board for everyone else, and
+			// the row has to say so. It stays here rather than vanishing because this is
+			// where the owner manages it, and a listing that disappeared from your own
+			// list would read as one you had lost.
+			String myName = getCurrentPlayerName();
+			boolean mineHere = myName != null && unit.owner.equalsIgnoreCase(myName);
+			int wornPieces = 0;
+			for (LendingEntry piece : unit.pieces)
+			{
+				if (piece.wornQuantity() > 0) wornPieces++;
+			}
+			String wornTag = !mineHere || wornPieces == 0 ? ""
+				: wornPieces == unit.pieces.size() ? "  - worn"
+					: "  - " + wornPieces + " worn";
+
+			JLabel title = new JLabel((open ? "▼ " : "▶ ") + name
+				+ "  (" + unit.pieces.size() + ")" + wornTag);
 			title.setFont(FontManager.getRunescapeSmallFont());
-			title.setForeground(new Color(0xFF, 0xC0, 0x60));
+			title.setForeground(!wornTag.isEmpty() ? new Color(0xE0, 0xA8, 0x48)
+				: yours ? new Color(0xFF, 0xC0, 0x60) : new Color(0xA8, 0xC8, 0xE8));
 
 			JLabel worth = new JLabel(QuantityFormatter.quantityToStackSize(unit.value()));
 			worth.setFont(FontManager.getRunescapeSmallFont());
@@ -1038,7 +1452,7 @@ public class DashboardPanel extends JPanel
 			for (int i = 0; i < unit.pieces.size() && i < max; i++)
 			{
 				LendingEntry p = unit.pieces.get(i);
-				JLabel icon = new JLabel();
+				JLabel icon = wornByMe(p) ? new WornIcon() : new JLabel();
 				icon.setPreferredSize(new Dimension(36, 32));
 				AsyncBufferedImage img = itemManager.getImage(p.getItemId(), p.getQuantity(), p.getQuantity() > 1);
 				if (img != null) img.addTo(icon);
@@ -1068,6 +1482,10 @@ public class DashboardPanel extends JPanel
 				tip.append("<br>• ").append(escapeHtml(p.getItem()))
 					.append(" - ").append(QuantityFormatter.quantityToStackSize(p.getValue()));
 			}
+			if (drawnOnly)
+			{
+				tip.append("<br><i>Grouped from the names - each piece still lends on its own</i>");
+			}
 			setToolTipText(tip.append("<br><i>Click to open, right-click for options</i></html>").toString());
 
 			int h = showOwner ? 76 : 62;
@@ -1077,30 +1495,50 @@ public class DashboardPanel extends JPanel
 			String me = getCurrentPlayerName();
 			boolean mineSet = unit.owner.equalsIgnoreCase(me);
 			JPopupMenu menu = new JPopupMenu();
-			if (mineSet)
+			if (drawnOnly)
+			{
+				JMenuItem all = new JMenuItem("Request whole set");
+				all.addActionListener(e -> showBorrowRequestDialog(unit.owner, unit.pieces, name));
+				menu.add(all);
+				JMenuItem some = new JMenuItem("Request some items...");
+				some.addActionListener(e -> showPieceRequestDialog(unit.owner, unit.pieces, name));
+				menu.add(some);
+			}
+			else if (mineSet)
 			{
 				JMenuItem edit = new JMenuItem("Edit set...");
 				edit.addActionListener(e -> showSetDialog(unit.pieces.get(0)));
 				menu.add(edit);
-				JMenuItem breakUp = new JMenuItem("Break up set");
-				breakUp.addActionListener(e ->
+				// A set that IS a kit cannot be dissolved - a piece leaves it by being
+				// sold or lent, and the rest stay grouped. Only one the owner
+				// assembled out of odds and ends - a Bandos chest with Justiciar legs
+				// - comes apart wholesale. A kit with extras added to it keeps the kit
+				// and lets the extras go, which the Edit set dialog handles.
+				if (armourSets.kitCore(unit.pieces).isEmpty())
 				{
-					if (JOptionPane.showConfirmDialog(DashboardPanel.this,
-						"Break up '" + name + "'? The pieces stay listed on their own.",
-						"Break Up Set", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION)
+					JMenuItem breakUp = new JMenuItem("Break up set");
+					breakUp.addActionListener(e ->
 					{
-						String groupId = groupService.getCurrentGroupIdUnchecked();
-						if (groupId != null) dataService.breakSet(groupId, unit.owner, unit.setId);
-						refresh();
-					}
-				});
-				menu.add(breakUp);
+						if (JOptionPane.showConfirmDialog(DashboardPanel.this,
+							"Break up '" + name + "'? The pieces stay listed on their own.",
+							"Break Up Set", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION)
+						{
+							String groupId = groupService.getCurrentGroupIdUnchecked();
+							if (groupId != null) dataService.breakSet(groupId, unit.owner, unit.setId);
+							refresh();
+						}
+					});
+					menu.add(breakUp);
+				}
 			}
 			else
 			{
 				JMenuItem all = new JMenuItem("Request whole set");
 				all.addActionListener(e -> showBorrowRequestDialog(unit.owner, unit.pieces, name));
 				menu.add(all);
+				JMenuItem some = new JMenuItem("Request some items...");
+				some.addActionListener(e -> showPieceRequestDialog(unit.owner, unit.pieces, name));
+				menu.add(some);
 			}
 			setComponentPopupMenu(menu);
 
@@ -1140,8 +1578,8 @@ public class DashboardPanel extends JPanel
 			setMaximumSize(new Dimension(Integer.MAX_VALUE, 44));
 			setPreferredSize(new Dimension(200, 42));
 
-			// Left side: Item icon (fixed width)
-			JLabel iconLabel = new JLabel();
+			// Left side: Item icon (fixed width), struck through when we are wearing it
+			JLabel iconLabel = wornByMe(item) ? new WornIcon() : new JLabel();
 			iconLabel.setPreferredSize(new Dimension(36, 32));
 			try
 			{
@@ -1172,9 +1610,21 @@ public class DashboardPanel extends JPanel
 			// Under an owner's heading the owner is already said, so the second line
 			// says what the item is for instead.
 			String cats = categoryText(item);
-			JLabel subLabel = new JLabel(showOwner ? "By: " + item.getLender() : cats);
+			String sub = showOwner ? "By: " + item.getLender() : cats;
+			// Only ever our own rows: what a peer publishes about their own gear is
+			// used to hide the row, not to talk about it.
+			String meNow = getCurrentPlayerName();
+			boolean wornMine = item.wornQuantity() > 0
+				&& meNow != null && meNow.equalsIgnoreCase(item.getLender());
+			if (wornMine)
+			{
+				sub = item.availableQuantity() > 0
+					? "Worn " + item.wornQuantity() + " of " + item.getQuantity()
+					: "Worn - hidden";
+			}
+			JLabel subLabel = new JLabel(sub);
 			subLabel.setFont(FontManager.getRunescapeSmallFont());
-			subLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+			subLabel.setForeground(wornMine ? new Color(0xE0, 0xA8, 0x48) : ColorScheme.LIGHT_GRAY_COLOR);
 
 			detailsPanel.add(itemLabel);
 			detailsPanel.add(subLabel);
@@ -1229,7 +1679,24 @@ public class DashboardPanel extends JPanel
 					setItem.addActionListener(e -> showSetDialog(item));
 					menu.add(setItem);
 
+					// A piece of a real kit is not yours to pull out one at a time: it
+					// leaves by being sold or lent. Only the odds and ends added to a
+					// set can be taken back out.
+					boolean kitPiece = false;
 					if (item.isInSet())
+					{
+						String gid2 = groupService.getCurrentGroupIdUnchecked();
+						if (gid2 != null)
+						{
+							List<LendingEntry> sameSet = new java.util.ArrayList<>();
+							for (LendingEntry o : dataService.getOfferingsByOwner(gid2, item.getLender()))
+							{
+								if (item.getSetId().equals(o.getSetId())) sameSet.add(o);
+							}
+							kitPiece = armourSets.kitCore(sameSet).contains(item.getItemId());
+						}
+					}
+					if (item.isInSet() && !kitPiece)
 					{
 						JMenuItem outOfSet = new JMenuItem("Take out of set");
 						outOfSet.addActionListener(e ->
@@ -1339,7 +1806,9 @@ public class DashboardPanel extends JPanel
 				dataService.removeOffering(groupId, item.getLender(), item.getItem(), item.getItemId());
 				// Taken down on purpose, so it should not rejoin its set if relisted.
 				dataService.forgetSetMembership(groupId, item.getLender(), item.getItemId());
-				dataService.loadGroupData(groupId);
+				// No reload: removeAvailable has already changed memory and saved it,
+				// so re-reading config would only race the worn-state writer for
+				// nothing. See DataService.ensureHydrated.
 				refresh();
 			}
 		}
@@ -1964,7 +2433,7 @@ public class DashboardPanel extends JPanel
 						String name = comp.getName().toLowerCase();
 						if (name.contains(query) && comp.isTradeable())
 						{
-							int gePrice = itemManager.getItemPrice(canonId);
+							long gePrice = itemManager.getItemPrice(canonId);
 							results.add(new ItemSuggestion(canonId, comp.getName(), gePrice));
 						}
 					}
@@ -2003,9 +2472,9 @@ public class DashboardPanel extends JPanel
 	{
 		private final int itemId;
 		private final String name;
-		private final int gePrice;
+		private final long gePrice;
 
-		public ItemSuggestion(int itemId, String name, int gePrice)
+		public ItemSuggestion(int itemId, String name, long gePrice)
 		{
 			this.itemId = itemId;
 			this.name = name;
@@ -2014,7 +2483,7 @@ public class DashboardPanel extends JPanel
 
 		public int getItemId() { return itemId; }
 		public String getName() { return name; }
-		public int getGePrice() { return gePrice; }
+		public long getGePrice() { return gePrice; }
 
 		@Override
 		public String toString()
@@ -2279,7 +2748,7 @@ public class DashboardPanel extends JPanel
 				if (plugin.getClientThread() != null)
 				{
 					plugin.getClientThread().invokeLater(() -> {
-						try { plugin.getClient().addChatMessage(net.runelite.api.ChatMessageType.GAMEMESSAGE, "", chatMsg, null); }
+						try { plugin.getClient().addChatMessage(net.runelite.api.ChatMessageType.GAMEMESSAGE, "", "<col=ff0000>" + (chatMsg), null); }
 						catch (Exception ex) { log.warn("Failed to add chat message", ex); }
 					});
 				}
@@ -2793,6 +3262,60 @@ public class DashboardPanel extends JPanel
 		boolean isMultiItem() { return items.size() > 1; }
 	}
 
+	/** "2 x Shark" for a single-item post, from the item list where there is one. */
+	private static String wantedLine(LookingForRequest r)
+	{
+		LookingForItem only = r.items.isEmpty() ? null : r.items.get(0);
+		String name = only != null && only.itemName != null ? only.itemName : r.itemName;
+		int qty = only != null ? Math.max(1, only.quantity) : Math.max(1, r.quantity);
+		if (name.length() > 20) name = name.substring(0, 17) + "...";
+		return qty + " x " + name;
+	}
+
+	/** One wanted item, shown under an opened Looking For post. */
+	private class WantedItemRow extends JPanel
+	{
+		WantedItemRow(LookingForItem item)
+		{
+			setLayout(new BorderLayout(5, 0));
+			Color bg = new Color(38, 42, 50);
+			setBackground(bg);
+			setBorder(BorderFactory.createCompoundBorder(
+				BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.DARK_GRAY_COLOR),
+				new EmptyBorder(3, 18, 3, 6)));
+			setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+			setPreferredSize(new Dimension(200, 38));
+
+			JLabel icon = new JLabel();
+			icon.setPreferredSize(new Dimension(36, 32));
+			if (item.itemId > 0)
+			{
+				AsyncBufferedImage img = itemManager.getImage(item.itemId,
+					Math.max(1, item.quantity), item.quantity > 1);
+				if (img != null)
+				{
+					img.addTo(icon);
+				}
+			}
+			add(icon, BorderLayout.WEST);
+
+			String name = item.itemName != null ? item.itemName : "?";
+			if (name.length() > 18) name = name.substring(0, 15) + "...";
+			JLabel label = new JLabel(Math.max(1, item.quantity) + " x " + name);
+			label.setFont(FontManager.getRunescapeSmallFont());
+			label.setForeground(Color.WHITE);
+			add(label, BorderLayout.CENTER);
+
+			if (item.value > 0)
+			{
+				JLabel worth = new JLabel(QuantityFormatter.quantityToStackSize(item.value * Math.max(1, item.quantity)));
+				worth.setFont(FontManager.getRunescapeSmallFont());
+				worth.setForeground(Color.YELLOW);
+				add(worth, BorderLayout.EAST);
+			}
+		}
+	}
+
 	private static class LookingForItem
 	{
 		int itemId;
@@ -2820,8 +3343,8 @@ public class DashboardPanel extends JPanel
 				new EmptyBorder(8, 8, 8, 8)
 			));
 
-			setMaximumSize(new Dimension(Integer.MAX_VALUE, 65));
-			setPreferredSize(new Dimension(200, 60));
+			setMaximumSize(new Dimension(Integer.MAX_VALUE, 80));
+			setPreferredSize(new Dimension(200, 74));
 
 			if (request.isMultiItem())
 			{
@@ -2838,12 +3361,29 @@ public class DashboardPanel extends JPanel
 					(request.notes != null && !request.notes.isEmpty() ? "Note: " + request.notes : "") + "</html>");
 			}
 
-			// Left side: "Want" icon/indicator
-			JLabel iconLabel = new JLabel("WANT");
-			iconLabel.setFont(FontManager.getRunescapeSmallFont());
-			iconLabel.setForeground(ColorScheme.GRAND_EXCHANGE_PRICE);
-			iconLabel.setPreferredSize(new Dimension(36, 36));
+			// Left side: the item's own icon - the first one on a multi-item post
+			boolean multi = request.isMultiItem();
+			boolean open = multi && expandedWants.contains(request.id);
+			LookingForItem lead = request.items.isEmpty() ? null : request.items.get(0);
+			JLabel iconLabel = new JLabel();
+			iconLabel.setPreferredSize(new Dimension(36, 32));
 			iconLabel.setHorizontalAlignment(SwingConstants.CENTER);
+			if (lead != null && lead.itemId > 0)
+			{
+				AsyncBufferedImage img = itemManager.getImage(lead.itemId,
+					Math.max(1, lead.quantity), lead.quantity > 1);
+				if (img != null)
+				{
+					img.addTo(iconLabel);
+				}
+			}
+			else
+			{
+				// Posts made before item ids were recorded have only a name
+				iconLabel.setText("WANT");
+				iconLabel.setFont(FontManager.getRunescapeSmallFont());
+				iconLabel.setForeground(ColorScheme.GRAND_EXCHANGE_PRICE);
+			}
 			add(iconLabel, BorderLayout.WEST);
 
 			// Center: Request details
@@ -2851,12 +3391,21 @@ public class DashboardPanel extends JPanel
 			detailsPanel.setLayout(new BoxLayout(detailsPanel, BoxLayout.Y_AXIS));
 			detailsPanel.setBackground(bgColor);
 
-			// Item name
-			String itemName = request.itemName;
-			if (itemName.length() > 18) itemName = itemName.substring(0, 15) + "...";
-			JLabel itemLabel = new JLabel(itemName + " x" + request.quantity);
-			itemLabel.setFont(FontManager.getRunescapeSmallFont());
-			itemLabel.setForeground(Color.WHITE);
+			// The post's own title on top...
+			String title = request.itemName;
+			if (title.length() > 20) title = title.substring(0, 17) + "...";
+			JLabel titleLabel = new JLabel(title);
+			titleLabel.setFont(FontManager.getRunescapeSmallFont());
+			titleLabel.setForeground(Color.WHITE);
+
+			// ...and what they actually want underneath it. Several items read as a
+			// set: one line that opens on a click, closed until then.
+			JLabel wantLabel = new JLabel(multi
+				? (open ? "\u25BC " : "\u25B6 ") + request.getItemCount() + " items  \u00B7  "
+					+ QuantityFormatter.quantityToStackSize(request.getTotalValue())
+				: wantedLine(request));
+			wantLabel.setFont(FontManager.getRunescapeSmallFont());
+			wantLabel.setForeground(multi ? ColorScheme.GRAND_EXCHANGE_PRICE : ColorScheme.LIGHT_GRAY_COLOR);
 
 			// Requester name
 			String requesterText = "By: " + request.requesterName;
@@ -2864,7 +3413,8 @@ public class DashboardPanel extends JPanel
 			requesterLabel.setFont(FontManager.getRunescapeSmallFont());
 			requesterLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 
-			detailsPanel.add(itemLabel);
+			detailsPanel.add(titleLabel);
+			detailsPanel.add(wantLabel);
 			detailsPanel.add(requesterLabel);
 
 			// Matched against the marketplace, so nobody has to go looking.
@@ -2878,8 +3428,8 @@ public class DashboardPanel extends JPanel
 				match.setForeground(request.wantsMine ? ColorScheme.BRAND_ORANGE : new Color(0x8C, 0xE0, 0x8C));
 				match.setToolTipText("<html>Listed right now by:<br>" + String.join("<br>", request.listedBy) + "</html>");
 				detailsPanel.add(match);
-				setMaximumSize(new Dimension(Integer.MAX_VALUE, 78));
-				setPreferredSize(new Dimension(200, 72));
+				setMaximumSize(new Dimension(Integer.MAX_VALUE, 94));
+				setPreferredSize(new Dimension(200, 88));
 			}
 
 			add(detailsPanel, BorderLayout.CENTER);
@@ -2905,6 +3455,21 @@ public class DashboardPanel extends JPanel
 
 			setComponentPopupMenu(createLookingForPopupMenu());
 			addHoverEffect(this, new Color(55, 60, 70), bgColor, detailsPanel, rightPanel);
+
+			if (multi)
+			{
+				setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+				addMouseListener(new java.awt.event.MouseAdapter()
+				{
+					@Override
+					public void mouseClicked(java.awt.event.MouseEvent e)
+					{
+						if (!SwingUtilities.isLeftMouseButton(e)) return;
+						if (!expandedWants.remove(request.id)) expandedWants.add(request.id);
+						refresh();
+					}
+				});
+			}
 		}
 
 		private JPopupMenu createLookingForPopupMenu()

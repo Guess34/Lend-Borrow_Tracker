@@ -46,9 +46,18 @@ marketplace, its members, and your own loans. Cloud Sync must be on.
   List**.
 - Set quantity, value and any collateral you want for it. Values come from the GE and keep
   themselves up to date.
-- **Item sets:** right-click one of your listings → **Add to a set...** to group pieces
-  together, like a full Inquisitor's. Others can request the whole set, lending one piece
-  leaves the rest listed, and the piece rejoins the set when it comes home.
+- **Item sets group themselves.** List armour piece by piece and it becomes one set - Torva
+  helm, body and legs show as a single **Torva set**. Lending or selling one piece leaves the
+  rest grouped, and it rejoins the set when it comes home.
+- **Adding to a set:** right-click a listing → **Add to a set...** to put something with a kit
+  that isn't part of it, like a Serpentine helm with Torva. You can take those extras back out;
+  a kit's own pieces only leave by being lent or sold. You can also build a set from mixed gear,
+  like a Bandos chest with Justiciar legs, and break that one up whenever you like.
+- **Gear you're wearing** is hidden from the rest of the group until you take it off. You still
+  see it, with a line through its icon.
+- **Opening your bank** checks your listings against what you actually hold, and tells you in
+  chat about anything listed that isn't in your bank, inventory or worn gear - so a sold or lost
+  item doesn't sit on the marketplace. Nothing is taken down for you; delist it yourself.
 
 ## Lending and borrowing in a trade
 
@@ -77,6 +86,8 @@ A proof screenshot of the trade window is saved automatically, on your own compu
 
 - Right-click a listing → **Request to Borrow**, choose a duration and agree to the terms. The
   lender sees it in their panel.
+- Right-click a set → **Request whole set**, or **Request some items...** to tick just the
+  pieces you want.
 - **Looking For** posts what you need to the whole group, and shows who already has that item
   listed.
 
@@ -181,9 +192,11 @@ Every loan and return trade saves a screenshot on the lender's computer. Group s
   stick across computers, and group deletion that clears for everyone
 - **Loans from the trade window** — items, collateral in gear or GP, value, due date, partial
   returns tracked piece by piece, and proof screenshots
-- **Marketplace** — listings priced from the GE, item sets, gear categories worked out from
-  each item's own stats (melee, range, mage, tank, DPS, stab, slash, crush, end game), search
-  and filters, listings grouped by owner, Looking For board, borrow requests and lend offers
+- **Marketplace** — listings priced from the GE, armour grouped into sets automatically, gear
+  categories worked out from each item's own stats (melee, range, mage, tank, DPS, stab, slash,
+  crush, end game), search and filters with live counts, sets listed above single items, gear
+  you're wearing hidden until you take it off, listings checked against your bank, Looking For
+  board, borrow requests and lend offers
 - **Clan and Discord** — link a group to an in-game clan, choose whose loans it tracks, and
   post loan activity to a Discord channel with optional pings
 - **Roster** — every member with their rank, who is online, and the world they are on
@@ -196,6 +209,11 @@ Every loan and return trade saves a screenshot on the lender's computer. Group s
 
 - Cloud Sync sends your player name, world and online status to the relay server so your group
   can see who is online. RuneLite shows this warning when you turn it on.
+- It also tells your group which of the items **you have listed** you are currently wearing, so
+  they aren't offered gear you're using. Nothing you haven't listed is ever shared.
+- When you open your bank, the plugin checks your own listings against what you hold and
+  warns you in chat about anything missing. Your bank contents never leave your computer, and
+  nothing is changed or shared by the check itself.
 - Discord posting is off by default. When on, loans — names, items, values, due dates and a
   picture cropped to the trade window — are posted to the channel your staff set up. Your chat
   and inventory are never included.

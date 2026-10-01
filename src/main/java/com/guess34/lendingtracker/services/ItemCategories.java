@@ -1,10 +1,12 @@
 package com.guess34.lendingtracker.services;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -58,7 +60,29 @@ public class ItemCategories
 	private final ItemManager itemManager;
 	private final ClientThread clientThread;
 	private final Map<Integer, Set<Category>> cache = new ConcurrentHashMap<>();
+	// Where the item is worn, kept alongside the categories because the lookup
+	// that answers one already answers the other.
+	private final Map<Integer, Integer> slots = new ConcurrentHashMap<>();
 	private final Set<Integer> queued = ConcurrentHashMap.newKeySet();
+	// True once RuneLite's item stats have answered for anything at all. After
+	// that a blank answer is a real one ("this item has no equipment stats")
+	// rather than "not downloaded yet", so it can be cached instead of being
+	// asked again for ever.
+	private volatile boolean statsReady;
+
+	/**
+	 * The slots that hold actual armour. A cape, amulet, ring or arrow is worn
+	 * too, but it is a one-per-setup pick people hunt by name, so it stays its
+	 * own listing instead of disappearing into somebody's armour bundle.
+	 * Weapons stay separate for the same reason.
+	 */
+	private static final Set<Integer> ARMOUR_SLOTS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
+		EquipmentInventorySlot.HEAD.getSlotIdx(),
+		EquipmentInventorySlot.BODY.getSlotIdx(),
+		EquipmentInventorySlot.LEGS.getSlotIdx(),
+		EquipmentInventorySlot.GLOVES.getSlotIdx(),
+		EquipmentInventorySlot.BOOTS.getSlotIdx(),
+		EquipmentInventorySlot.SHIELD.getSlotIdx())));
 
 	@Inject
 	public ItemCategories(ItemManager itemManager, ClientThread clientThread)
@@ -71,6 +95,26 @@ public class ItemCategories
 	public Set<Category> get(int itemId)
 	{
 		return cache.get(itemId);
+	}
+
+	/**
+	 * Where this item is worn, or -1 if it is not worn at all - or simply not
+	 * known yet. Reads the cache only, so it is safe on every redraw.
+	 */
+	public int getSlot(int itemId)
+	{
+		Integer slot = slots.get(itemId);
+		return slot == null ? -1 : slot;
+	}
+
+	/**
+	 * True if this is worn as armour - head, body, legs, hands, feet or shield.
+	 * Anything nobody has asked about yet answers false, so whatever groups by
+	 * this has to draw again from prime()'s callback.
+	 */
+	public boolean isArmour(int itemId)
+	{
+		return ARMOUR_SLOTS.contains(getSlot(itemId));
 	}
 
 	/**
@@ -95,6 +139,7 @@ public class ItemCategories
 		clientThread.invokeLater(() ->
 		{
 			Map<Integer, Set<Category>> batch = new HashMap<>();
+			Map<Integer, Integer> slotBatch = new HashMap<>();
 			boolean anyStats = false;
 			for (int id : missing)
 			{
@@ -109,6 +154,7 @@ public class ItemCategories
 				}
 				anyStats |= stats != null;
 				batch.put(id, classify(stats));
+				slotBatch.put(id, slotOf(stats));
 			}
 			queued.removeAll(missing);
 			// A batch with no stats at all means RuneLite has not finished
@@ -116,13 +162,31 @@ public class ItemCategories
 			// nothing for the rest of the session, so leave it to be asked again.
 			if (anyStats)
 			{
+				statsReady = true;
+			}
+			if (anyStats || statsReady)
+			{
 				cache.putAll(batch);
+				// Has to stay in here with the categories: cached from an empty
+				// batch, every item would read as "worn nowhere" for the rest of
+				// the session and nothing would ever group.
+				slots.putAll(slotBatch);
 				if (onReady != null)
 				{
 					onReady.run();
 				}
 			}
 		});
+	}
+
+	/** -1 for anything not worn. Handles nulls exactly as classify() does. */
+	static int slotOf(ItemStats stats)
+	{
+		if (stats == null || !stats.isEquipable() || stats.getEquipment() == null)
+		{
+			return -1;
+		}
+		return stats.getEquipment().getSlot();
 	}
 
 	static Set<Category> classify(ItemStats stats)

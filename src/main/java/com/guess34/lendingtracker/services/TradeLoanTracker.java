@@ -2846,6 +2846,6 @@ public class TradeLoanTracker
 
 	private void addGameMessage(String message)
 	{
-		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, "");
+		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "<col=ff0000>" + (message), "");
 	}
 }

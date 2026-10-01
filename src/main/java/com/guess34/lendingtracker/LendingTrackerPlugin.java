@@ -6,6 +6,7 @@ import net.runelite.api.*;
 import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneScapeProfileType;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.eventbus.EventBus;
 
@@ -17,6 +18,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import com.guess34.lendingtracker.model.*;
 import com.guess34.lendingtracker.ui.LendingPanel;
+import com.guess34.lendingtracker.services.ArmourSets;
 import com.guess34.lendingtracker.services.ClanRoster;
 import net.runelite.client.discord.DiscordService;
 import net.runelite.client.discord.events.DiscordReady;
@@ -65,7 +67,28 @@ public class LendingTrackerPlugin extends Plugin
 	@Inject private LendingTrackerConfig config;
 	@Inject private ClientToolbar clientToolbar;
 	@Inject private ItemManager itemManager;
+	@Inject private ArmourSets armourSets;
 	@Inject private ScheduledExecutorService executor;
+
+	// What this account is wearing, carrying and last had in the bank, by EXACT
+	// item id. Used to work out which of our own listings can't be handed over
+	// right now. Session-only and never written to disk: it means "right now".
+	// Worked out once per item id: the bank can hold hundreds, and resolving one
+	// costs an item-definition lookup and a price lookup.
+	private final java.util.Map<Integer, Integer> lendableIds = new java.util.HashMap<>();
+	// Listings already warned about this session, so the bank check says each one
+	// once rather than on every deposit and withdrawal.
+	private final java.util.Set<Integer> missingOnce = new java.util.HashSet<>();
+	private final java.util.Map<Integer, Integer> wornNow = new java.util.HashMap<>();
+	private final java.util.Map<Integer, Integer> carriedNow = new java.util.HashMap<>();
+	private final java.util.Map<Integer, Integer> bankedNow = new java.util.HashMap<>();
+	// Until this account has opened its own bank we cannot rule out a spare
+	// sitting in it, so nothing is hidden. Same caution the trade guards take.
+	private boolean bankSeenThisSession;
+	// Gear changes are coalesced into one publish; see recomputeWornListings.
+	private static final long WORN_PUSH_DELAY_SECONDS = 30;
+	private final java.util.concurrent.atomic.AtomicBoolean wornPushQueued =
+		new java.util.concurrent.atomic.AtomicBoolean();
 
 	// The executor above is the CLIENT'S, shared with every other plugin - we must
 	// never shut it down. But that also means nothing stops our tasks when the
@@ -256,6 +279,21 @@ public class LendingTrackerPlugin extends Plugin
 		}
 		localDataSyncService.onAccountLogin();
 		configManager.setConfiguration("lendingtracker", "currentAccount", playerName);
+		// A hide only ever means "on my back right now". One restored from this
+		// computer's backup, or left over from another account's session, would hide
+		// gear this account is not wearing - so the slate is wiped before anything
+		// is published, then filled in again from the live containers.
+		for (LendingGroup g : groupService.getAllGroups())
+		{
+			if (g != null)
+			{
+				dataService.setWornQuantities(g.getId(), playerName, null, null);
+			}
+		}
+		// Containers can only be read on the client thread, and the equipment event
+		// may well have arrived before this account's data was loaded, so ask again
+		// here rather than waiting for the next gear change.
+		clientThread.invokeLater(this::readLiveContainers);
 		LendingGroup activeGroup = groupService.getActiveGroup();
 		if (activeGroup != null) { groupService.startSync(activeGroup.getId(), playerName); }
 		refreshPanel();
@@ -266,6 +304,11 @@ public class LendingTrackerPlugin extends Plugin
 	/** Runs whenever group data changes via sync (local poll or relay). */
 	private void onGroupDataSynced()
 	{
+		// A sync can reload our own rows wholesale from the stored snapshot, which
+		// brings back whatever "worn" flag was last written to disk - leaving gear
+		// hidden from the group that is in fact sitting in the bank. Re-apply what
+		// the containers actually say; it no-ops when nothing changed.
+		clientThread.invokeLater(this::readLiveContainers);
 		refreshPanel();
 		checkForRequestNotifications();
 		applyApprovedRemovals();
@@ -315,6 +358,22 @@ public class LendingTrackerPlugin extends Plugin
 		{
 			tradeLoanTracker.onTradeOfferUpdated();
 		}
+		// Gear on our own back can't be handed over, so it comes off the board
+		// until it comes off us. Only this client can see this account's equipment,
+		// and what we're carrying or have banked is what says whether a spare could
+		// cover the listing instead.
+		if (event.getContainerId() == net.runelite.api.gameval.InventoryID.WORN
+			&& event.getItemContainer() != null)
+		{
+			countById(wornNow, event.getItemContainer().getItems());
+			recomputeWornListings();
+		}
+		else if (event.getContainerId() == net.runelite.api.gameval.InventoryID.INV
+			&& event.getItemContainer() != null)
+		{
+			countById(carriedNow, event.getItemContainer().getItems());
+			recomputeWornListings();
+		}
 		// Bank snapshot for the fungible-duplicate guard logic: owning a spare copy
 		// of a collateral/borrowed item (safe in the bank) means carrying your own
 		// copy isn't at-risk. Only known once the bank has been opened this session.
@@ -322,6 +381,204 @@ public class LendingTrackerPlugin extends Plugin
 			&& event.getItemContainer() != null)
 		{
 			tradeLoanTracker.onBankUpdated(event.getItemContainer().getItems());
+			countById(bankedNow, event.getItemContainer().getItems());
+			bankSeenThisSession = true;
+			recomputeWornListings();
+			warnAboutListingsNotHeld();
+		}
+	}
+
+	/**
+	 * With the bank open we can see everything we own, so say so when something we
+	 * have listed is nowhere to be found - sold, traded, lost on a death, or parked
+	 * somewhere unreadable like a POH rack or a looting bag.
+	 *
+	 * It only ever WARNS. It changes nothing and publishes nothing; taking the
+	 * listing down is the owner's call. Removing it automatically needs a stricter
+	 * idea of "gone" than one bank visit can give - a death being reclaimed, or
+	 * collateral handed over in a trade, both look exactly like this.
+	 *
+	 * Standard worlds only. Leagues, Deadman and beta worlds have a bank of their
+	 * own under the same name, and every main-game listing would look missing.
+	 */
+	private void warnAboutListingsNotHeld()
+	{
+		if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD) { return; }
+		String groupId = groupService.getCurrentGroupId();
+		String me = client != null && client.getLocalPlayer() != null
+			? client.getLocalPlayer().getName() : null;
+		if (groupId == null || groupId.isEmpty() || me == null || !bankSeenThisSession) { return; }
+
+		// Both sides through the same resolver and the same family key, so a noted
+		// listing, a kitted copy in the bank or a charged one on your back all count.
+		java.util.Map<Integer, Integer> owned = new java.util.HashMap<>();
+		for (java.util.Map<Integer, Integer> where : java.util.Arrays.asList(bankedNow, carriedNow, wornNow))
+		{
+			where.forEach((id, qty) ->
+				owned.merge(net.runelite.client.game.ItemVariationMapping.map(id), qty, Integer::sum));
+		}
+
+		java.util.List<String> missing = new java.util.ArrayList<>();
+		for (LendingEntry e : dataService.getOfferingsByOwner(groupId, me))
+		{
+			if (e == null || e.getItemId() <= 0) { continue; }
+			// Out on loan: the borrower has it, which is the point.
+			if (e.getBorrower() != null && !e.getBorrower().isEmpty()) { continue; }
+			int family = net.runelite.client.game.ItemVariationMapping.map(owningIdFor(e.getItemId()));
+			int have = owned.getOrDefault(family, 0);
+			owned.put(family, Math.max(0, have - Math.max(1, e.getQuantity())));
+			// Once per item per session: the bank fires on every deposit.
+			if (have <= 0 && missingOnce.add(e.getItemId()))
+			{
+				missing.add(e.getItem());
+			}
+		}
+		if (missing.isEmpty()) { return; }
+		String said = missing.size() <= 3 ? String.join(", ", missing)
+			: missing.size() + " items (" + String.join(", ", missing.subList(0, 3)) + ", ...)";
+		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+			"<col=ff0000>" + ("Lending Tracker: you have " + said + " listed, but it isn't in your bank, inventory "
+				+ "or worn gear. Delist it if it's gone."), "");
+	}
+
+	/**
+	 * Re-key a tally by item family, so a Soulreaper axe with an ornament kit on it
+	 * counts as the plain axe that was listed - you only own the one, and it is on
+	 * your back. Nothing is wrongly hidden by this, because what we can SEE spare
+	 * is counted the same way: a plain Berserker ring in the bank still covers its
+	 * listing while an imbued one is worn.
+	 */
+	private static java.util.Map<Integer, Integer> byFamily(java.util.Map<Integer, Integer> byId)
+	{
+		java.util.Map<Integer, Integer> out = new java.util.HashMap<>();
+		byId.forEach((id, qty) ->
+			out.merge(net.runelite.client.game.ItemVariationMapping.map(id), qty, Integer::sum));
+		return out;
+	}
+
+	/** Re-read our own containers from scratch. Client thread only. */
+	private void readLiveContainers()
+	{
+		if (client == null) { return; }
+		net.runelite.api.ItemContainer worn = client.getItemContainer(net.runelite.api.gameval.InventoryID.WORN);
+		net.runelite.api.ItemContainer inv = client.getItemContainer(net.runelite.api.gameval.InventoryID.INV);
+		countById(wornNow, worn != null ? worn.getItems() : null);
+		countById(carriedNow, inv != null ? inv.getItems() : null);
+		recomputeWornListings();
+	}
+
+	/**
+	 * Tally a container by exact item id, replacing whatever was there. Client
+	 * thread only - canonicalize reads item definitions.
+	 *
+	 * canonicalize is what makes equipped gear match a listing at all: worn
+	 * Graceful reports its own "worn" item ids, and it maps those back to the ones
+	 * people actually list. It leaves imbues and degrade states alone, which is
+	 * what stops a Berserker ring (i) from being mistaken for a plain one.
+	 *
+	 * Anything with no quantity is skipped, which is how bank placeholders - empty
+	 * slots holding a ghost of the item - stay out of the count instead of looking
+	 * like a spare.
+	 */
+	/**
+	 * The id a thing we own should be counted under: the same id it would be
+	 * LISTED under. Canonicalize first, which settles notes, placeholders and the
+	 * separate ids worn Graceful uses, then resolve an ornament kit or a charge
+	 * back to the plain item.
+	 *
+	 * These two have to agree. When they did not, gear was listed as the plain
+	 * version and then counted as the kitted one, so it read as neither worn nor
+	 * owned - and the bank check deleted the listing.
+	 */
+	private int owningIdFor(int rawId)
+	{
+		int canon;
+		try
+		{
+			canon = itemManager.canonicalize(rawId);
+		}
+		catch (Exception e)
+		{
+			canon = rawId;
+		}
+		int known = lendableIdCached(canon);
+		return known > 0 ? known : canon;
+	}
+
+	private void countById(java.util.Map<Integer, Integer> into, Item[] items)
+	{
+		into.clear();
+		if (items == null) { return; }
+		for (Item it : items)
+		{
+			if (it == null || it.getId() <= 0 || it.getQuantity() <= 0) { continue; }
+			// A bank placeholder is the empty peg left behind when you withdraw the
+			// last one. It is not an item you own, and canonicalize would turn it
+			// into the real id and make it look like one.
+			try
+			{
+				if (itemManager.getItemComposition(it.getId()).getPlaceholderTemplateId() != -1)
+				{
+					continue;
+				}
+			}
+			catch (Exception e)
+			{
+				log.debug("No composition for {}: {}", it.getId(), e.getMessage());
+			}
+			into.merge(owningIdFor(it.getId()), it.getQuantity(), Integer::sum);
+		}
+	}
+
+	/**
+	 * Work out which of our own listings can't be handed over because we are
+	 * wearing them, and let the group know. Items we have not listed are ignored
+	 * outright, so an ordinary gear switch costs nothing.
+	 *
+	 * Gear on our back is gear in use, so it comes off the board as soon as we put
+	 * it on. A copy we can see elsewhere - in the inventory, or in the bank once it
+	 * has been opened - keeps the listing up, because then the worn one is not the
+	 * one being offered.
+	 */
+	private void recomputeWornListings()
+	{
+		// A Leagues, Deadman or beta world has its own gear; it says nothing about
+		// what this player's main-game listings are doing.
+		if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD) { return; }
+		String groupId = groupService.getCurrentGroupId();
+		String me = client != null && client.getLocalPlayer() != null
+			? client.getLocalPlayer().getName() : null;
+		if (groupId == null || groupId.isEmpty() || me == null) { return; }
+
+		// What we can positively see that is NOT on our back. An unopened bank
+		// contributes nothing, which means gear we are wearing comes off the board
+		// straight away - if it is on us, it is in use. Opening the bank later only
+		// makes this kinder: a spare found in there puts the listing back.
+		java.util.Map<Integer, Integer> worn = byFamily(wornNow);
+		java.util.Map<Integer, Integer> spare = byFamily(carriedNow);
+		byFamily(bankedNow).forEach((id, qty) -> spare.merge(id, qty, Integer::sum));
+		if (!dataService.setWornQuantities(groupId, me, worn, spare)) { return; }
+		refreshPanel();
+
+		// One push per burst of changes, never one per equip: every publish sends
+		// the whole group snapshot, so somebody flicking through gear switches must
+		// not broadcast to the clan on every tick. Worst case the group learns
+		// about it on the five-minute heartbeat instead.
+		if (wornPushQueued.compareAndSet(false, true))
+		{
+			try
+			{
+				executor.schedule(() ->
+				{
+					wornPushQueued.set(false);
+					groupService.announcePresence();
+				}, WORN_PUSH_DELAY_SECONDS, TimeUnit.SECONDS);
+			}
+			catch (Exception e)
+			{
+				wornPushQueued.set(false);
+				log.debug("Couldn't schedule a worn-gear push: {}", e.getMessage());
+			}
 		}
 	}
 
@@ -351,12 +608,12 @@ public class LendingTrackerPlugin extends Plugin
 		// untradeable item in the first place.
 		if (event.getOption().equals("Examine")
 			&& event.getType() == MenuAction.EXAMINE_ITEM.getId()
-			&& isTradeable(event.getItemId()))
+			&& canBeListed(event.getItemId()))
 		{
 			addMenuEntry("Add to Lending List", event);
 		}
 
-		if (event.getOption().equals("Drop") && isTradeable(event.getItemId()))
+		if (event.getOption().equals("Drop") && canBeListed(event.getItemId()))
 		{
 			addMenuEntry("Lend to Group", event);
 		}
@@ -383,12 +640,165 @@ public class LendingTrackerPlugin extends Plugin
 		}
 	}
 
+	/**
+	 * The item this one would actually be lent as. An ornament kit or a charge
+	 * makes gear untradeable, but taking the kit off - or uncharging it - hands the
+	 * plain item straight back, so there is no reason to make somebody strip their
+	 * gear before listing it. It goes up as the plain version, which is what
+	 * changes hands anyway.
+	 *
+	 * RuneLite already knows what reverts to what: ItemMapping is the table it uses
+	 * to price untradeable gear, so a Soulreaper axe with its ornament kit maps to
+	 * the plain axe, and a charged Serpentine helm to the plain helm. Guessing from
+	 * the name, or from the variation mapping, does not cover either case - which
+	 * is why the first version of this silently offered nothing at all.
+	 *
+	 * Where something maps to more than one component - a kitted axe is both an axe
+	 * AND a kit - the dearest one wins. That is the item being lent; the cheap half
+	 * is the cosmetic or sacrificial part.
+	 *
+	 * An imbue is deliberately not included. It is not a kit you take off: the
+	 * plain ring is a different item you would have to go and get, so an imbued one
+	 * is never offered as a plain one.
+	 *
+	 * @return the id to list, or -1 if this cannot be lent at all.
+	 */
+	private int lendableIdFor(int itemId)
+	{
+		if (itemId <= 0)
+		{
+			return itemId;
+		}
+		try
+		{
+			if (itemManager.getItemComposition(itemId).isTradeable())
+			{
+				return itemId;
+			}
+			String name = itemManager.getItemComposition(itemId).getName();
+			log.debug("Not tradeable: {} ({}) - looking for what it reverts to", name, itemId);
+			// An imbue is not a kit you take off, in any of its spellings: (i),
+			// (ri) and the (i1)-(i5) sets.
+			if (name != null && name.toLowerCase(java.util.Locale.ROOT).matches(".*\\((?:r?i|i\\d+)\\).*"))
+			{
+				return -1;
+			}
+
+			// Which of the things this reverts to IS the item, rather than a part
+			// of it. Decided without prices: they move every day, and when the
+			// price feed fails at startup they are all 0. Tested against every one
+			// of the 573 untradeable ids RuneLite maps - none comes out as a kit.
+			//   1. the candidate in the same item family: the plain item under the
+			//      kit (Occult necklace under Occult necklace (or));
+			//   2. otherwise one that is not an ornament kit (Echo Virtus robe top
+			//      maps to the robe AND the kit, but is not in the robe's family);
+			//   3. only a kit on offer - refuse rather than list the kit as gear.
+			// Lowest id breaks a tie, so the answer never depends on hash order.
+			java.util.Collection<net.runelite.client.game.ItemMapping> reverts =
+				net.runelite.client.game.ItemMapping.map(itemId);
+			int family = net.runelite.client.game.ItemVariationMapping.map(itemId);
+			int sameFamily = -1;
+			int notKit = -1;
+			if (reverts != null)
+			{
+				for (net.runelite.client.game.ItemMapping revert : reverts)
+				{
+					int candidate = revert.getTradeableItem();
+					if (candidate <= 0 || candidate == itemId
+						|| !itemManager.getItemComposition(candidate).isTradeable())
+					{
+						continue;
+					}
+					if (net.runelite.client.game.ItemVariationMapping.map(candidate) == family
+						&& (sameFamily < 0 || candidate < sameFamily))
+					{
+						sameFamily = candidate;
+					}
+					String candidateName = itemManager.getItemComposition(candidate).getName();
+					boolean kit = candidateName != null
+						&& candidateName.toLowerCase(java.util.Locale.ROOT).endsWith("kit");
+					if (!kit && (notKit < 0 || candidate < notKit))
+					{
+						notKit = candidate;
+					}
+				}
+			}
+			int best = sameFamily > 0 ? sameFamily : notKit;
+			if (best > 0)
+			{
+				log.debug("{} ({}) lists as {} ({})", name, itemId,
+					itemManager.getItemComposition(best).getName(), best);
+				return best;
+			}
+
+			int plain = net.runelite.client.game.ItemVariationMapping.map(itemId);
+			if (plain != itemId && itemManager.getItemComposition(plain).isTradeable())
+			{
+				log.debug("{} ({}) lists as variation base {}", name, itemId, plain);
+				return plain;
+			}
+			log.debug("Nothing to list {} ({}) as: {} revert mapping(s), variation base {}",
+				name, itemId, reverts == null ? 0 : reverts.size(), plain);
+		}
+		catch (Exception e)
+		{
+			log.debug("Couldn't work out a lendable id for {}: {}", itemId, e.getMessage());
+		}
+		return -1;
+	}
+
+	/**
+	 * Resolve once per item id and remember it. Menu entries are rebuilt every time
+	 * the mouse moves over the inventory, and a bank holds hundreds of items, so
+	 * this must not do an item-definition lookup every time.
+	 *
+	 * The first resolution of anything untradeable is logged at DEBUG. That is off
+	 * for this package by default (RuneLite only turns DEBUG on for its own), so
+	 * raise it locally in the dev client when an ornament kit refuses to list -
+	 * INFO would put a line per bank item into every user's log.
+	 */
+	private int lendableIdCached(int itemId)
+	{
+		Integer known = lendableIds.get(itemId);
+		if (known != null)
+		{
+			return known;
+		}
+		int resolved = lendableIdFor(itemId);
+		lendableIds.put(itemId, resolved);
+		if (resolved != itemId)
+		{
+			String name = "?";
+			try
+			{
+				name = itemManager.getItemComposition(itemId).getName();
+			}
+			catch (Exception ignored)
+			{
+				// name is only for the log line
+			}
+			log.debug("Lending Tracker: {} ({}) -> {}", name, itemId,
+				resolved > 0 ? "lists as " + resolved : "cannot be lent");
+		}
+		return resolved;
+	}
+
+	/** True when this can go on the marketplace, kit on or off. */
+	private boolean canBeListed(int itemId)
+	{
+		return itemId <= 0 || lendableIdCached(itemId) > 0;
+	}
+
 	private void addMenuEntry(String option, MenuEntryAdded event)
 	{
 		client.createMenuEntry(-1)
 			.setOption(option).setTarget(event.getTarget()).setType(MenuAction.RUNELITE)
 			.setParam0(event.getActionParam0()).setParam1(event.getActionParam1())
 			.setIdentifier(event.getIdentifier())
+			// The identifier is NOT the item id. Carry the item id across as well,
+			// or the click reads a different number than the check that offered the
+			// option in the first place.
+			.setItemId(event.getItemId())
 			// Never the left-click default (deprioritized); actual on-screen
 			// position is fixed in onMenuOpened, which moves our entries to the
 			// very bottom of the menu
@@ -502,6 +912,12 @@ public class LendingTrackerPlugin extends Plugin
 			groupService.stopSync();
 			tradeLoanTracker.reset();
 			tradeLoanTracker.clearPendingDecisions();
+			// The next account on this client holds different things.
+			wornNow.clear();
+			carriedNow.clear();
+			bankedNow.clear();
+			missingOnce.clear();
+			bankSeenThisSession = false;
 			refreshPanel();
 		}
 	}
@@ -773,7 +1189,7 @@ public class LendingTrackerPlugin extends Plugin
 				{
 					if (entry.getItemId() > 0)
 					{
-						int p = itemManager.getItemPrice(entry.getItemId());
+						long p = itemManager.getItemPrice(entry.getItemId());
 						if (p > 0 && p != entry.getValue()) { entry.setValue(p); changed.add(entry); }
 					}
 				}
@@ -795,23 +1211,55 @@ public class LendingTrackerPlugin extends Plugin
 	private void handleAddToAvailableList(MenuOptionClicked event)
 	{
 		String itemName = event.getMenuTarget().replaceAll("<[^>]*>", "").trim();
-		int itemId = event.getId();
+		// getItemId() is the item; getId() is the menu entry's identifier, which is
+		// only sometimes the same thing.
+		int itemId = event.getItemId() > 0 ? event.getItemId() : event.getId();
 		if (itemName.isEmpty()) { return; }
+
+		// Kit on? List the plain one. That is what would change hands, and it saves
+		// stripping gear just to put it up.
+		int lendable = lendableIdCached(itemId);
+		if (lendable <= 0)
+		{
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+				"<col=ff0000>" + ("Lending Tracker: " + itemName + " can't be lent as it is."), "");
+			return;
+		}
+		if (lendable != itemId)
+		{
+			itemId = lendable;
+			try
+			{
+				itemName = itemManager.getItemComposition(lendable).getName();
+			}
+			catch (Exception e)
+			{
+				log.debug("No name for {}: {}", lendable, e.getMessage());
+			}
+		}
+		final String listedName = itemName;
+		final int listedId = itemId;
 
 		SwingUtilities.invokeLater(() ->
 		{
 			String input = JOptionPane.showInputDialog(null,
-				"How many " + itemName + " are you lending?", "Add to Available List", JOptionPane.QUESTION_MESSAGE);
+				"How many " + listedName + " are you lending?", "Add to Available List", JOptionPane.QUESTION_MESSAGE);
 			if (input == null || input.isEmpty()) { return; }
 			try
 			{
 				int qty = Integer.parseInt(input);
+				if (qty <= 0)
+				{
+					JOptionPane.showMessageDialog(null, "Enter how many you are lending - one or more.",
+						"Invalid Input", JOptionPane.ERROR_MESSAGE);
+					return;
+				}
 				LendingEntry entry = new LendingEntry();
 				entry.setId(UUID.randomUUID().toString());
-				entry.setItem(itemName);
-				entry.setItemId(itemId);
+				entry.setItem(listedName);
+				entry.setItemId(listedId);
 				entry.setQuantity(qty);
-				entry.setValue(calculateItemValue(itemId, qty));
+				entry.setValue(calculateItemValue(listedId, qty));
 				entry.setLender(client != null && client.getLocalPlayer() != null
 					? client.getLocalPlayer().getName() : "Unknown");
 				entry.setLendTime(Instant.now().toEpochMilli());
@@ -846,24 +1294,30 @@ public class LendingTrackerPlugin extends Plugin
 
 		if (itemId == -1)
 		{
-			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Error: Could not determine item ID", "");
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "<col=ff0000>" + ("Error: Could not determine item ID"), "");
 			return;
 		}
 		String gid = groupService.getCurrentGroupId();
 		if (gid == null || gid.isEmpty())
 		{
-			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Error: You must be in a group to lend items", "");
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "<col=ff0000>" + ("Error: You must be in a group to lend items"), "");
 			return;
 		}
 
 		int itemPrice = 0;
 		try
 		{
-			itemPrice = itemManager.getItemPrice(itemId);
-			if (!itemManager.getItemComposition(itemId).isTradeable())
+			itemPrice = (int) Math.min(itemManager.getItemPrice(itemId), Integer.MAX_VALUE);
+			int lendableHere = lendableIdCached(itemId);
+			if (lendableHere > 0 && lendableHere != itemId)
+			{
+				itemId = lendableHere;
+				itemName = itemManager.getItemComposition(lendableHere).getName();
+			}
+			if (lendableHere <= 0)
 			{
 				client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-					"Cannot lend " + itemName + " - This item is untradeable", "");
+					"<col=ff0000>" + ("Cannot lend " + itemName + " - This item is untradeable"), "");
 				return;
 			}
 		}
@@ -877,7 +1331,7 @@ public class LendingTrackerPlugin extends Plugin
 			{
 				log.error("Error in showLendItemDialog", ex);
 				clientThread.invokeLater(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-					"ERROR: Could not open lend dialog - " + ex.getMessage(), ""));
+					"<col=ff0000>" + ("ERROR: Could not open lend dialog - " + ex.getMessage()), ""));
 			}
 		});
 	}
@@ -982,7 +1436,7 @@ public class LendingTrackerPlugin extends Plugin
 	{
 		try
 		{
-			int gePrice = itemPrice > 0 ? itemPrice : itemManager.getItemPrice(itemId);
+			long gePrice = itemPrice > 0 ? itemPrice : itemManager.getItemPrice(itemId);
 			StringBuilder s = new StringBuilder();
 			s.append("Item: ").append(itemName).append("\n");
 			s.append("GE Value: ").append(QuantityFormatter.quantityToStackSize(gePrice)).append(" GP\n");
@@ -1014,7 +1468,7 @@ public class LendingTrackerPlugin extends Plugin
 			dlg.dispose();
 			if (newPanel != null) { SwingUtilities.invokeLater(() -> newPanel.refresh()); }
 			clientThread.invokeLater(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-				"Added " + itemName + " to group marketplace", ""));
+				"<col=ff0000>" + ("Added " + itemName + " to group marketplace"), ""));
 		}
 		catch (Exception ex) { log.error("Error adding to marketplace", ex); }
 	}
@@ -1174,8 +1628,8 @@ public class LendingTrackerPlugin extends Plugin
 			notifier.notify("[Lending Tracker] You entered the Wilderness carrying " + summary + "!");
 		}
 		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-			"[Lending Tracker] WARNING: you are in the Wilderness carrying " + summary
-				+ ". Losing these still leaves you responsible for them!", "");
+			"<col=ff0000>" + ("[Lending Tracker] WARNING: you are in the Wilderness carrying " + summary
+				+ ". Losing these still leaves you responsible for them!"), "");
 	}
 
 	/**
@@ -1226,7 +1680,7 @@ public class LendingTrackerPlugin extends Plugin
 				}
 			}
 			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-				"[Lending Tracker] You've been in the Wilderness over 45 seconds with loaned property — the other party has been notified.", "");
+				"<col=ff0000>" + ("[Lending Tracker] You've been in the Wilderness over 45 seconds with loaned property — the other party has been notified."), "");
 		}), LENDER_ALERT_AFTER_MS, TimeUnit.MILLISECONDS);
 	}
 
@@ -1464,8 +1918,8 @@ public class LendingTrackerPlugin extends Plugin
 			{
 				discordWebhook.post(DiscordWebhook.Event.REMOVED, entry, me);
 				clientThread.invokeLater(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
-					"[Lending Tracker] Loan removed after approval: " + entry.getItemName()
-						+ " (" + entry.getLender() + " -> " + entry.getBorrower() + ").", ""));
+					"<col=ff0000>" + ("[Lending Tracker] Loan removed after approval: " + entry.getItemName()
+						+ " (" + entry.getLender() + " -> " + entry.getBorrower() + ")."), ""));
 				refreshPanel();
 			}
 		}
@@ -1668,6 +2122,7 @@ public class LendingTrackerPlugin extends Plugin
 		return (stored != null && !stored.isEmpty()) ? stored : null;
 	}
 
+	public ArmourSets getArmourSets() { return armourSets; }
 	public Client getClient() { return client; }
 	public ClientThread getClientThread() { return clientThread; }
 	public ConfigManager getConfigManager() { return configManager; }

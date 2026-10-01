@@ -1525,7 +1525,9 @@ public class RelaySyncService
 			notifyConnectionChanged(false);
 			if (doReconnect)
 			{
-				log.warn("Relay connection failed: {}", t.getMessage());
+				// The relay sleeps on the free tier and takes 30-60s to wake, so the
+				// first attempt after a quiet spell times out and the retry gets in.
+				log.warn("Relay connection failed ({}), retrying", t.getMessage());
 				scheduleReconnect();
 			}
 		}

@@ -118,7 +118,8 @@ public class GroupControlPanel extends JPanel
 					Collection<LendingGroup> groups = groupService.getAllGroups();
 					if (groups.isEmpty() && !groupService.hasCurrentAccount())
 					{
-						log.warn("No groups and no current account - triggering onAccountLogin for: {}", currentAccount);
+						// Ordinary first-run path, not a fault - it read as one in the console.
+						log.debug("No groups and no current account - triggering onAccountLogin for: {}", currentAccount);
 						groupService.onAccountLogin(currentAccount);
 						groups = groupService.getAllGroups();
 					}
