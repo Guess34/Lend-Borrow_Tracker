@@ -2538,6 +2538,20 @@ public class GroupService
 	 * executor when one is running so snapshot building never delays inbound
 	 * message delivery.
 	 */
+	/**
+	 * Publish the active group's state on this thread, straight away. For logout
+	 * and shutdown, where a push queued on the sync executor would be thrown away
+	 * as sync stops.
+	 */
+	public void pushStateNow()
+	{
+		String groupId = currentSyncGroupId;
+		if (groupId != null)
+		{
+			pushStateToRelay(groupId);
+		}
+	}
+
 	public void announcePresence()
 	{
 		final String groupId = currentSyncGroupId;

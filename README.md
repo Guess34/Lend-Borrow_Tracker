@@ -55,9 +55,13 @@ marketplace, its members, and your own loans. Cloud Sync must be on.
   like a Bandos chest with Justiciar legs, and break that one up whenever you like.
 - **Gear you're wearing** is hidden from the rest of the group until you take it off. You still
   see it, with a line through its icon.
-- **Opening your bank** checks your listings against what you actually hold, and tells you in
-  chat about anything listed that isn't in your bank, inventory or worn gear - so a sold or lost
-  item doesn't sit on the marketplace. Nothing is taken down for you; delist it yourself.
+- **Listings follow what you hold.** Once you've opened your bank, each listing shows what you
+  actually have across your bank, inventory and worn gear: list 1 and hold 5, and 5 are offered;
+  sell or lend 2 of 5, and it shows 3. Hold none and it's hidden from the group - you still see
+  it, marked **Not in bank** in red (or **Out on loan** while it's lent out), and it comes back
+  once you have it again. Nothing is ever deleted.
+  To stop a listing following your bank (gear in your house, or you only want to lend some),
+  right-click it → **Keep this amount**.
 
 ## Lending and borrowing in a trade
 
@@ -84,22 +88,45 @@ A proof screenshot of the trade window is saved automatically, on your own compu
 
 ## Asking to borrow
 
-- Right-click a listing → **Request to Borrow**, choose a duration and agree to the terms. The
-  lender sees it in their panel.
+- Right-click a listing → **Request to Borrow**, choose how many (if there's more than one) and
+  a duration, and agree to the terms. The lender sees it in their panel.
 - Right-click a set → **Request whole set**, or **Request some items...** to tick just the
   pieces you want.
 - **Looking For** posts what you need to the whole group, and shows who already has that item
   listed.
+
+## More time on a loan
+
+- **Borrowing:** right-click the loan → **Ask for more time...** and pick how many extra days.
+  The lender can accept, say no, or offer a different date. You can accept that, ask for a
+  different date once, or say no and return it on time. The lender's next answer is final.
+- **Lending:** right-click the loan → **Give more time...** to move the due date later straight
+  away, or to take the limit off.
+- If the other person isn't in the group, there is nobody to ask, so whoever keeps the loan's
+  record just sets the new date.
+- A due date only ever moves later, never earlier.
 
 ## While you hold borrowed gear
 
 The plugin warns you before you trade it away or take it into the Wilderness. Those settings
 live under **Borrowed Item Guards**.
 
+**Lookalike names.** If the player you're trading has a name that only looks like someone you
+have a loan with, or someone in your group or clan, the trade window flashes red with both
+names, e.g. "Guess 34" is NOT "Guess34". Swapped I, l and 1 or O and 0 count too. If you're
+handing them something you borrowed from the real player, Accept is blocked; hold Shift only
+if you're sure.
+
+## Stale loans
+
+An owner or co-owner can right-click someone else's loan → **Ask [lender] to remove this
+loan...**. Nothing comes off until the lender approves it, because it's their item.
+
 ## Reminders
 
-Overdue reminders cover your own loans only, once a day, with optional sound. Turn them off
-under **Notifications**.
+Overdue reminders cover your own loans only: in chat and as a popup when you log in, then once
+a day, with optional sound. Lenders and borrowers both get them. Turn them off under
+**Notifications**.
 
 ## Discord
 
@@ -108,8 +135,9 @@ If your staff have set up a channel:
 1. Plugin settings → **Discord** → tick **Post loans to Discord**. RuneLite shows a warning,
    because loans go to an outside site.
 2. You never paste a link — it comes with the group.
-3. Optional: tick **Ping me in Discord** to be tagged in posts about your loans. Your Discord
-   ID is read from the Discord app if it is open on the same computer, or you can paste it.
+3. Optional: tick **Ping me in Discord** to be tagged in posts about your loans, and when someone
+   is looking for an item you have listed. Your Discord ID is read from the Discord app if it is
+   open on the same computer, or you can paste it.
 
 ---
 
@@ -155,9 +183,12 @@ be cleared.
 Only co-owners and owners can set or change it. The posts' name and picture come from the
 webhook, so set those in Discord.
 
-Posted events: new loans, returns, incomplete returns, overdue loans, and loans forgiven or
-removed. Each post shows the players, items, values, collateral and a picture of the trade
-window.
+Posted events: new loans, returns, incomplete returns, overdue loans, loans forgiven or
+removed, due dates moved later, and requests for more time that were turned down. Each post
+shows the players, items, values, collateral and a picture of the trade window.
+
+**Looking For** posts go to the channel too, with the list of items and who in the group
+already has them listed. Those players are tagged if they turned on **Ping me in Discord**.
 
 ## Linking an in-game clan
 
@@ -192,10 +223,12 @@ Every loan and return trade saves a screenshot on the lender's computer. Group s
   stick across computers, and group deletion that clears for everyone
 - **Loans from the trade window** — items, collateral in gear or GP, value, due date, partial
   returns tracked piece by piece, and proof screenshots
+- **More time** — borrowers ask for a later due date and lenders accept, say no or offer
+  another date; lenders can also give more time straight away
 - **Marketplace** — listings priced from the GE, armour grouped into sets automatically, gear
   categories worked out from each item's own stats (melee, range, mage, tank, DPS, stab, slash,
   crush, end game), search and filters with live counts, sets listed above single items, gear
-  you're wearing hidden until you take it off, listings checked against your bank, Looking For
+  you're wearing hidden until you take it off, listings that follow what you hold, Looking For
   board, borrow requests and lend offers
 - **Clan and Discord** — link a group to an in-game clan, choose whose loans it tracks, and
   post loan activity to a Discord channel with optional pings
@@ -211,11 +244,13 @@ Every loan and return trade saves a screenshot on the lender's computer. Group s
   can see who is online. RuneLite shows this warning when you turn it on.
 - It also tells your group which of the items **you have listed** you are currently wearing, so
   they aren't offered gear you're using. Nothing you haven't listed is ever shared.
-- When you open your bank, the plugin checks your own listings against what you hold and
-  warns you in chat about anything missing. Your bank contents never leave your computer, and
-  nothing is changed or shared by the check itself.
+- Once you've opened your bank, each of your listings shows the group how many of that item you
+  hold across your bank, inventory and worn gear. Only items you've listed are counted - the rest
+  of your bank never leaves your computer. Pick **Keep this amount** on a listing to show a fixed
+  number instead.
 - Discord posting is off by default. When on, loans — names, items, values, due dates and a
-  picture cropped to the trade window — are posted to the channel your staff set up. Your chat
+  picture cropped to the trade window — are posted to the channel your staff set up, and so are
+  your Looking For posts (the items, your note, and which members have them listed). Your chat
   and inventory are never included.
 - Proof screenshots stay on your own computer, under `~/.runelite/lending-tracker/proof/`.
 

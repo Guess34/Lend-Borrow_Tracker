@@ -80,6 +80,7 @@ public class TradeLoanTracker
 	@Inject private ProofScreenshot proofScreenshot;
 	@Inject private DiscordWebhook discordWebhook;
 	@Inject private ClanRoster clanRoster;
+	@Inject private net.runelite.client.Notifier notifier;
 
 	/** Runnable the plugin sets to refresh the side panel after a change. */
 	private Runnable onLoanRecorded;
@@ -195,6 +196,62 @@ public class TradeLoanTracker
 	public void setOnLoanRecorded(Runnable callback)
 	{
 		this.onLoanRecorded = callback;
+	}
+
+	// Which item family a listing belongs to - the same as following the bank
+	// uses, so a noted or kitted loan finds the listing it came from. Client
+	// thread only.
+	private java.util.function.IntUnaryOperator familyOf = ItemVariationMapping::map;
+
+	public void setFamilyOf(java.util.function.IntUnaryOperator familyOf)
+	{
+		this.familyOf = familyOf;
+	}
+
+	// Did the owner tell this listing to keep its number rather than follow the bank?
+	private java.util.function.IntPredicate keptAmount;
+
+	public void setKeptAmount(java.util.function.IntPredicate check)
+	{
+		this.keptAmount = check;
+	}
+
+	// Told after each completed trade what of ours left and what of ours came home
+	// (item id -> quantity). Before the bank has been seen this session, that's
+	// the only way a listing following the bank can know.
+	private java.util.function.BiConsumer<Map<Integer, Integer>, Map<Integer, Integer>> onTradeSettled;
+
+	public void setOnTradeSettled(java.util.function.BiConsumer<Map<Integer, Integer>, Map<Integer, Integer>> callback)
+	{
+		this.onTradeSettled = callback;
+	}
+
+	/** Collateral this player holds for others, per item base. */
+	public Map<Integer, Integer> collateralHeldByBase()
+	{
+		Map<Integer, Integer> held = new HashMap<>();
+		String me = localPlayerName();
+		if (me == null)
+		{
+			return held;
+		}
+		for (LendingEntry e : dataService.getActiveEntries())
+		{
+			if (me.equalsIgnoreCase(e.getLender()))
+			{
+				for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
+				{
+					held.merge(ItemVariationMapping.map(pair[0]), pair[1], Integer::sum);
+				}
+			}
+		}
+		return held;
+	}
+
+	/** What this player owes per item base: things borrowed, and collateral held for others. */
+	public Map<Integer, Integer> owedByBase()
+	{
+		return totalOwedByBase();
 	}
 
 	public boolean isTradeOpen()
@@ -373,7 +430,7 @@ public class TradeLoanTracker
 		for (Item item : offerItems)
 		{
 			if (item != null && item.getId() > 0 && isListedForLending(item.getId())
-				&& !owedBases.contains(ItemVariationMapping.map(item.getId())))
+				&& !owedBases.contains(familyOf.applyAsInt(item.getId())))
 			{
 				listedNames.add(itemName(item.getId()));
 			}
@@ -867,10 +924,11 @@ public class TradeLoanTracker
 		{
 			return false;
 		}
-		int baseId = ItemVariationMapping.map(itemId);
+		// Grouped the way listings are, so notes of a listed item count as listed.
+		int family = familyOf.applyAsInt(itemId);
 		for (LendingEntry offering : dataService.getOfferingsByOwner(group.getId(), me))
 		{
-			if (ItemVariationMapping.map(offering.getItemId()) == baseId)
+			if (familyOf.applyAsInt(offering.getItemId()) == family)
 			{
 				return true;
 			}
@@ -993,6 +1051,8 @@ public class TradeLoanTracker
 		daysButton = null;
 		daysButtonBg = null;
 		loanDays = 0;
+		scamCheckedFor = null;
+		scamWarning = null;
 		// pendingDecisions deliberately survives reset() — it's how a popup answered
 		// after its trade ended still records the loans. It IS cleared on logout and
 		// shutdown via clearPendingDecisions().
@@ -1098,6 +1158,10 @@ public class TradeLoanTracker
 			&& (event.getParam1() == InterfaceID.Trademain.ACCEPT
 				|| event.getParam1() == InterfaceID.Tradeconfirm.TRADE2ACCEPT))
 		{
+			if (guardScamAccept(event))
+			{
+				return true;
+			}
 			return guardAcceptClick(event);
 		}
 
@@ -1109,6 +1173,204 @@ public class TradeLoanTracker
 		}
 
 		return false;
+	}
+
+	// --- Lookalike names ---
+
+	/** A trade partner whose name only looks like someone this player knows. */
+	public static final class ScamWarning
+	{
+		public final String partnerName;        // as the trade window shows it
+		public final String realName;           // who they look like
+		public final boolean loanParty;         // the real one is someone you have a loan with
+		public final boolean borrowedFromReal;  // ...and you borrowed from them
+		public final String detail;             // one line on who the real one is
+		public final String difference;         // how the names differ, in words, or null
+
+		ScamWarning(String partnerName, String realName, boolean loanParty, boolean borrowedFromReal, String detail)
+		{
+			this.partnerName = partnerName;
+			this.realName = realName;
+			this.loanParty = loanParty;
+			this.borrowedFromReal = borrowedFromReal;
+			this.detail = detail;
+			this.difference = LookalikeNames.describeDifference(partnerName, realName);
+		}
+	}
+
+	private String scamCheckedFor;
+	private ScamWarning scamWarning;
+
+	/**
+	 * The lookalike warning for the trade that's open, or null. Worked out once
+	 * per partner, and announced once - in chat, and as a RuneLite notification
+	 * so the client flashes. Client thread only: the overlay and menu clicks.
+	 */
+	public ScamWarning currentScamWarning()
+	{
+		if (!tradeOpen || partner == null || !config.lookalikeWarning())
+		{
+			return null;
+		}
+		if (partner.equals(scamCheckedFor))
+		{
+			return scamWarning;
+		}
+		scamCheckedFor = partner;
+		scamWarning = findLookalike(partner);
+		if (scamWarning != null)
+		{
+			addGameMessage("POSSIBLE SCAM: " + scamWarning.partnerName + " is NOT " + scamWarning.realName
+				+ (scamWarning.difference != null ? " - " + scamWarning.difference : "")
+				+ " (" + scamWarning.detail + "). Check carefully before you hand anything over.");
+			notifier.notify("Lending Tracker: possible scam trade - " + scamWarning.partnerName
+				+ " is not " + scamWarning.realName);
+		}
+		return scamWarning;
+	}
+
+	private ScamWarning findLookalike(String name)
+	{
+		// Someone you have a loan with comes first, and counts even when the
+		// partner is a member too - handing Guess34's gear to Guess 34 is the scam.
+		String me = localPlayerName();
+		if (me != null)
+		{
+			ScamWarning lentTo = null;
+			for (LendingEntry e : dataService.getActiveEntries())
+			{
+				boolean iBorrowed = me.equalsIgnoreCase(e.getBorrower());
+				boolean iLent = me.equalsIgnoreCase(e.getLender());
+				String other = iBorrowed ? e.getLender() : iLent ? e.getBorrower() : null;
+				if (other == null || !LookalikeNames.looksLike(name, other))
+				{
+					continue;
+				}
+				if (iBorrowed)
+				{
+					return new ScamWarning(name, other, true, true, other + " lent you " + e.getItemName());
+				}
+				if (lentTo == null)
+				{
+					lentTo = new ScamWarning(name, other, true, false, "you lent " + e.getItemName() + " to " + other);
+				}
+			}
+			if (lentTo != null)
+			{
+				return lentTo;
+			}
+		}
+
+		// Otherwise only a partner who ISN'T a member themselves, looking like one.
+		List<String> groupNames = new ArrayList<>();
+		LendingGroup group = groupService.getActiveGroup();
+		if (group != null && group.getMembers() != null)
+		{
+			for (com.guess34.lendingtracker.model.GroupMember m : group.getMembers())
+			{
+				if (m != null && m.getName() != null)
+				{
+					groupNames.add(m.getName());
+				}
+			}
+		}
+		clanRoster.refresh();
+		Set<String> clan = clanRoster.memberKeys();
+		if (clan.contains(LookalikeNames.accountKey(name)))
+		{
+			return null;
+		}
+		for (String n : groupNames)
+		{
+			if (LookalikeNames.sameAccount(name, n))
+			{
+				return null;
+			}
+		}
+		for (String n : groupNames)
+		{
+			if (LookalikeNames.looksLike(name, n))
+			{
+				return new ScamWarning(name, n, false, false, n + " is in your lending group");
+			}
+		}
+		for (String k : clan)
+		{
+			if (LookalikeNames.looksLike(name, k))
+			{
+				return new ScamWarning(name, k, false, false, k + " is in your clan");
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Accepting while handing items you borrowed from X to someone whose name only
+	 * looks like X: stopped every time, whatever the guard setting, because that
+	 * is exactly how a lookalike account walks off with borrowed gear. Shift lets
+	 * a player through who has checked the name.
+	 */
+	private boolean guardScamAccept(MenuOptionClicked event)
+	{
+		ScamWarning scam = currentScamWarning();
+		if (scam == null || !scam.borrowedFromReal || client.isKeyPressed(KeyCode.KC_SHIFT))
+		{
+			return false;
+		}
+		Item[] myOffer = copyContainerItems(InventoryID.TRADEOFFER);
+		if (myOffer == null)
+		{
+			return false;
+		}
+		for (Item item : myOffer)
+		{
+			String real = item != null && item.getId() > 0 ? realLenderOfOfferedItem(item.getId()) : null;
+			if (real != null)
+			{
+				event.consume();
+				String difference = LookalikeNames.describeDifference(partner, real);
+				addGameMessage("BLOCKED - possible scam: " + partner + " is NOT " + real
+					+ (difference != null ? " - " + difference : "")
+					+ ". " + real + " lent you " + itemName(item.getId())
+					+ ". Hold Shift and click Accept only if you are sure.");
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * The lender you borrowed this item from whose name the partner only LOOKS
+	 * like - or null if there's none, or if the partner really did lend you one of
+	 * these. Every open loan of the item counts, and each lender is compared with
+	 * the partner directly, so an impostor who resembles two of your lenders can't
+	 * slip one lender's item past a check made against the other.
+	 */
+	private String realLenderOfOfferedItem(int itemId)
+	{
+		String me = localPlayerName();
+		if (me == null || partner == null)
+		{
+			return null;
+		}
+		int baseId = ItemVariationMapping.map(itemId);
+		String real = null;
+		for (LendingEntry e : dataService.getActiveEntries())
+		{
+			if (e.isReturned() || !me.equalsIgnoreCase(e.getBorrower()) || ItemVariationMapping.map(e.getItemId()) != baseId)
+			{
+				continue;
+			}
+			if (LookalikeNames.sameAccount(e.getLender(), partner))
+			{
+				return null; // the partner really did lend you one of these
+			}
+			if (real == null && LookalikeNames.looksLike(partner, e.getLender()))
+			{
+				real = e.getLender();
+			}
+		}
+		return real;
 	}
 
 	// --- Guards ---
@@ -1146,6 +1408,21 @@ public class TradeLoanTracker
 				addGameMessage("Returning " + itemName(itemId) + " to " + borrowed.getLender()
 					+ " — the loan will be marked returned when the trade completes.");
 			}
+			return false;
+		}
+
+		// Handing the real lender's item to a name that only looks like theirs -
+		// say so loudly. The Accept is what gets blocked (guardScamAccept).
+		ScamWarning scam = currentScamWarning();
+		String realLender = scam != null && scam.borrowedFromReal ? realLenderOfOfferedItem(itemId) : null;
+		if (realLender != null)
+		{
+			String difference = LookalikeNames.describeDifference(partner, realLender);
+			addGameMessage("STOP: " + partner + " is NOT " + realLender
+				+ (difference != null ? " - " + difference : "")
+				+ ". " + realLender + " lent you " + itemName(itemId)
+				+ ". Accepting this trade will be blocked - hold Shift only if you are sure.");
+			// Nothing reassuring after that - the Accept guard does the blocking.
 			return false;
 		}
 
@@ -1493,6 +1770,50 @@ public class TradeLoanTracker
 			// below so they can never be re-recorded as new lends or collateral.
 			ReturnTally tally = applyReturnTallies();
 
+			// What of mine left and what of mine came home, for listings following
+			// the bank - before anything below relists a return, which would
+			// otherwise be counted twice. Handing back something that was never
+			// mine (a borrowed item, someone's collateral) is neither, and nor is
+			// getting it: the tally counts the loans this client records, and the
+			// loans the lender records are added here.
+			if (onTradeSettled != null)
+			{
+				String me = localPlayerName();
+				Map<Integer, Integer> notMine = new HashMap<>(tally.consumedMyQtyByBase);
+				Map<Integer, Integer> mine = new HashMap<>(tally.consumedTheirQtyByBase);
+				for (LendingEntry e : dataService.getActiveEntries())
+				{
+					if (e.isKeptByBorrower() || me == null || !me.equalsIgnoreCase(e.getBorrower())
+						|| !partner.equalsIgnoreCase(e.getLender()))
+					{
+						continue;
+					}
+					if (e.outstandingLentQty() > 0)
+					{
+						notMine.merge(ItemVariationMapping.map(e.getItemId()), e.outstandingLentQty(), Integer::sum);
+					}
+					for (int[] pair : parseIdQtyPairs(e.outstandingCollateralIds()))
+					{
+						mine.merge(ItemVariationMapping.map(pair[0]), pair[1], Integer::sum);
+					}
+				}
+				Map<Integer, Integer> left = offerCounts(finalMyOffer, notMine, false);
+				Map<Integer, Integer> cameHome = offerCounts(finalTheirOffer, mine, true);
+				if (!left.isEmpty() || !cameHome.isEmpty())
+				{
+					try
+					{
+						onTradeSettled.accept(left, cameHome);
+					}
+					catch (Exception ex)
+					{
+						// Listings catch up when the bank is next opened; the loans
+						// and returns below must still be recorded.
+						log.warn("Couldn't move listings for a trade", ex);
+					}
+				}
+			}
+
 			// Loans = everything I offered (Loan button ON) ∪ explicitly marked
 			// items ∪ (listed items, if the popup was answered yes). An unanswered
 			// popup stashes the listed items so a late "yes" can still record them.
@@ -1531,7 +1852,7 @@ public class TradeLoanTracker
 				Set<Integer> owedBases = baseIdsIOweTo(partner);
 				if (!owedBases.isEmpty())
 				{
-					loanItemIds.removeIf(id -> owedBases.contains(ItemVariationMapping.map(id)));
+					loanItemIds.removeIf(id -> owedBases.contains(familyOf.applyAsInt(id)));
 				}
 			}
 
@@ -1585,6 +1906,7 @@ public class TradeLoanTracker
 			discordWebhook.postBatch(DiscordWebhook.Event.PARTIAL, partLent, localPlayerName(), tradeStamp, tradePicture);
 			discordWebhook.postBatch(DiscordWebhook.Event.PARTIAL, partKept, localPlayerName(), tradeStamp, tradePicture);
 
+			Set<String> relistedNow = new HashSet<>();
 			for (LendingEntry e : tally.closed)
 			{
 				dataService.completeEntry(e.getId(), true);
@@ -1592,7 +1914,7 @@ public class TradeLoanTracker
 				// never mine to put on the marketplace.
 				if (!e.isKeptByBorrower())
 				{
-					relistReturnedItem(e);
+					relistReturnedItem(e, relistedNow);
 				}
 				String collat = collateralDescription(e);
 				addGameMessage("Return complete: " + e.getItemName() + " — loan with " + partner + " fully settled."
@@ -1677,6 +1999,37 @@ public class TradeLoanTracker
 		{
 			reset();
 		}
+	}
+
+	/**
+	 * An offer's items by id, coins and platinum left out. Per variation base,
+	 * `limits` says how many to keep (keepOnly) or how many to leave out; it is
+	 * used up as it goes.
+	 */
+	private static Map<Integer, Integer> offerCounts(Item[] offer, Map<Integer, Integer> limits, boolean keepOnly)
+	{
+		Map<Integer, Integer> out = new HashMap<>();
+		if (offer == null)
+		{
+			return out;
+		}
+		for (Item item : offer)
+		{
+			if (item == null || item.getId() <= 0
+				|| item.getId() == ItemID.COINS_995 || item.getId() == ItemID.PLATINUM_TOKEN)
+			{
+				continue;
+			}
+			int base = ItemVariationMapping.map(item.getId());
+			int matched = Math.min(Math.max(0, limits.getOrDefault(base, 0)), item.getQuantity());
+			limits.merge(base, -matched, Integer::sum);
+			int count = keepOnly ? matched : item.getQuantity() - matched;
+			if (count > 0)
+			{
+				out.merge(item.getId(), count, Integer::sum);
+			}
+		}
+		return out;
 	}
 
 	/** Outcome of matching one completed trade against the open loans with this partner. */
@@ -2115,7 +2468,9 @@ public class TradeLoanTracker
 				&& me.equalsIgnoreCase(e.getBorrower())
 				&& partnerName.equalsIgnoreCase(e.getLender()))
 			{
-				bases.add(ItemVariationMapping.map(e.getItemId()));
+				// Grouped the way listings are, so handing it back as notes is still
+				// a return.
+				bases.add(familyOf.applyAsInt(e.getItemId()));
 			}
 		}
 		return bases;
@@ -2368,7 +2723,7 @@ public class TradeLoanTracker
 	 * up visible to the group. addAvailable merges quantity into an existing
 	 * listing of the same item, so this never creates duplicates.
 	 */
-	private void relistReturnedItem(LendingEntry returned)
+	private void relistReturnedItem(LendingEntry returned, Set<String> relistedNow)
 	{
 		// One-time loans are recorded and tracked like any other, but the lender
 		// chose NOT to make the item a standing marketplace offer — coming home
@@ -2386,10 +2741,71 @@ public class TradeLoanTracker
 			return;
 		}
 
+		// The listing the loan came off, picked the way adjustListingForLoan picks
+		// it: this exact item, or its plain (un-noted) self.
+		int plainId = returned.getItemId();
+		try
+		{
+			plainId = itemManager.canonicalize(plainId);
+		}
+		catch (Exception e)
+		{
+			log.debug("Couldn't canonicalize {}: {}", plainId, e.getMessage());
+		}
+		LendingEntry target = listingFor(group.getId(), me, returned.getItemId(), plainId);
+		// Two loans of one item closing in the same trade: the second goes on the
+		// listing the first one just made.
+		boolean madeNow = target != null && relistedNow.contains(target.getId());
+		// With no listing left, it was kept if any form of the item was - and is
+		// made again under that one, so it comes back kept.
+		int keptId = target != null ? target.getItemId() : keptIdFor(returned.getItemId(), plainId);
+		boolean kept = keptAmount != null && keptAmount.test(keptId);
+		// A listing following the bank is never restocked by a return: it shows
+		// what's held, and what came home is counted that way - by the bank once
+		// it's been seen this session, by the trade itself before then. Adding it
+		// here as well counted it twice. With no listing of this item, one of its
+		// family following the bank counts it the same way - unless this item had
+		// a kept listing, taken down when the last one went out, which is made
+		// again below.
+		if (target != null && !madeNow && !kept)
+		{
+			addGameMessage(returned.getItemName() + " is home - back on the group marketplace.");
+			return;
+		}
+		if (target == null && !kept)
+		{
+			int family = familyOf.applyAsInt(returned.getItemId());
+			for (LendingEntry o : dataService.getOfferingsByOwner(group.getId(), me))
+			{
+				if (familyOf.applyAsInt(o.getItemId()) == family && !relistedNow.contains(o.getId())
+					&& (keptAmount == null || !keptAmount.test(o.getItemId())))
+				{
+					addGameMessage(returned.getItemName() + " is home - back on the group marketplace.");
+					return;
+				}
+			}
+		}
+		// A kept listing has a fixed number: put them back on it.
+		if (target != null)
+		{
+			String ownerKey = target.getLender() != null ? target.getLender() : me;
+			int typed = Math.max(0, target.getQuantity());
+			int back = Math.max(1, returned.getQuantity());
+			LendingEntry updated = new LendingEntry(target);
+			updated.setQuantity(typed + back);
+			updated.setValue(typed > 0 ? target.getValue() * (typed + back) / typed : returned.getValue());
+			updated.setHeldQty(null);
+			dataService.updateAvailable(group.getId(), ownerKey, target.getItem(), target.getItemId(), updated);
+			addGameMessage(returned.getItemName() + " re-listed on the group marketplace.");
+			return;
+		}
+
+		// None at all: a new listing, under the plain item rather than its note.
 		LendingEntry listing = new LendingEntry();
 		listing.setId(UUID.randomUUID().toString());
+		relistedNow.add(listing.getId());
 		listing.setItem(returned.getItem());
-		listing.setItemId(returned.getItemId());
+		listing.setItemId(kept ? keptId : plainId);
 		listing.setQuantity(Math.max(1, returned.getQuantity()));
 		listing.setValue(returned.getValue());
 		listing.setBorrower("");
@@ -2400,29 +2816,104 @@ public class TradeLoanTracker
 	}
 
 	/**
-	 * A listed item just went out on loan — reduce or remove the marketplace
-	 * listing so it doesn't still show as available while it's lent out.
+	 * A listed item just went out on loan. Only a kept listing (a fixed number) is
+	 * changed here: one following the bank shows what's held, so the items leaving
+	 * already took them off - by the bank once it's been seen this session, by the
+	 * trade itself before then. Taking them off here as well counted them twice.
 	 */
 	private void adjustListingForLoan(String groupId, String me, int itemId, int quantity)
 	{
-		int baseId = ItemVariationMapping.map(itemId);
-		for (LendingEntry offering : dataService.getOfferingsByOwner(groupId, me))
+		int plainId = itemId;
+		try
 		{
-			if (ItemVariationMapping.map(offering.getItemId()) == baseId)
+			plainId = itemManager.canonicalize(itemId);
+		}
+		catch (Exception e)
+		{
+			log.debug("Couldn't canonicalize {}: {}", itemId, e.getMessage());
+		}
+		LendingEntry offering = listingFor(groupId, me, itemId, plainId);
+		if (offering == null || keptAmount == null || !keptAmount.test(offering.getItemId()))
+		{
+			return;
+		}
+		String ownerKey = offering.getLender() != null ? offering.getLender() : me;
+		// Take the loan off the fixed number, or take it down when that's all of them.
+		int have = offering.shownQuantity();
+		if (have > quantity)
+		{
+			LendingEntry updated = new LendingEntry(offering);
+			updated.setQuantity(have - quantity);
+			updated.setValue(have > 0 ? offering.shownValue() * (have - quantity) / have : 0);
+			updated.setHeldQty(null);
+			dataService.updateAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId(), updated);
+		}
+		else
+		{
+			dataService.removeAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId());
+		}
+	}
+
+	/**
+	 * My listing of this item: the exact item, else one of the same item noted or
+	 * not. Never a sibling of its family - a kept listing is a fixed number of one
+	 * item, and lending a different one of the family doesn't change it. Client
+	 * thread only.
+	 */
+	private LendingEntry listingFor(String groupId, String me, int itemId, int plainId)
+	{
+		LendingEntry plain = null;
+		for (LendingEntry o : dataService.getOfferingsByOwner(groupId, me))
+		{
+			if (o.getItemId() == itemId)
 			{
-				String ownerKey = offering.getLender() != null ? offering.getLender() : me;
-				if (offering.getQuantity() > quantity)
-				{
-					LendingEntry updated = new LendingEntry(offering);
-					updated.setQuantity(offering.getQuantity() - quantity);
-					dataService.updateAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId(), updated);
-				}
-				else
-				{
-					dataService.removeAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId());
-				}
-				return;
+				return o;
 			}
+			if (plain == null && plainOf(o.getItemId()) == plainId)
+			{
+				plain = o;
+			}
+		}
+		return plain;
+	}
+
+	/** Which form of an item has a keep flag: plain, as returned, or noted. Client thread only. */
+	private int keptIdFor(int returnedId, int plainId)
+	{
+		if (keptAmount == null || keptAmount.test(plainId))
+		{
+			return plainId;
+		}
+		if (keptAmount.test(returnedId))
+		{
+			return returnedId;
+		}
+		try
+		{
+			int noted = itemManager.getItemComposition(plainId).getLinkedNoteId();
+			if (noted > 0 && keptAmount.test(noted))
+			{
+				return noted;
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("No composition for {}: {}", plainId, e.getMessage());
+		}
+		return plainId;
+	}
+
+	/** The un-noted id of an item. Client thread only. */
+	private int plainOf(int itemId)
+	{
+		try
+		{
+			return itemManager.canonicalize(itemId);
+		}
+		catch (Exception e)
+		{
+			log.debug("Couldn't canonicalize {}: {}", itemId, e.getMessage());
+			return itemId;
 		}
 	}
 
@@ -2449,7 +2940,7 @@ public class TradeLoanTracker
 		{
 			if (item != null && item.getId() > 0 && !alreadyRecorded.contains(item.getId())
 				&& isListedForLending(item.getId())
-				&& !owedBases.contains(ItemVariationMapping.map(item.getId())))
+				&& !owedBases.contains(familyOf.applyAsInt(item.getId())))
 			{
 				quantities.merge(item.getId(), item.getQuantity(), Integer::sum);
 			}

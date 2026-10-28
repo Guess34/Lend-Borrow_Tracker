@@ -55,6 +55,10 @@ final class LoanTooltip
 		}
 		sb.append("<br>Due: ").append(loan.getDueTime() <= 0 || loan.getDueTime() == Long.MAX_VALUE
 			? "no due date" : formatDate(loan.getDueTime()));
+		if (loan.wasExtended())
+		{
+			sb.append(" (extended)");
+		}
 		if (loan.getReturnedAt() > 0)
 		{
 			sb.append("<br>Returned: ").append(formatDate(loan.getReturnedAt()));

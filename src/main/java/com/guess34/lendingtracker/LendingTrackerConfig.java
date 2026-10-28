@@ -227,6 +227,18 @@ public interface LendingTrackerConfig extends Config
 		return true;
 	}
 
+	@ConfigItem(
+		keyName = "lookalikeWarning",
+		name = "Lookalike Name Warning",
+		description = "Flash a warning over the trade window when the other player's name only LOOKS like someone you have a loan with, or a group or clan member - 'Guess 34' for 'Guess34', or I, l and 1 swapped. Accepting while handing them items you borrowed from the real player is blocked; hold Shift to override.",
+		position = 6,
+		section = guardSection
+	)
+	default boolean lookalikeWarning()
+	{
+		return true;
+	}
+
 	// Sync
 
 	@ConfigItem(
@@ -236,7 +248,7 @@ public interface LendingTrackerConfig extends Config
 		// The first sentence is the canonical wording RuneLite requires verbatim for
 		// any third-party server feature; additional disclosure goes AFTER it, never
 		// spliced into the middle.
-		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It also sends your player name, current world, and online status; group members can see when you are online and what world you are on. It also tells your group which of the items you have listed you are currently wearing, so they are not offered gear you are using.",
+		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It also sends your player name, current world, and online status; group members can see when you are online and what world you are on. It also tells your group which of the items you have listed you are currently wearing, so they are not offered gear you are using. Once you have opened your bank, your listings also show how many of each listed item you hold.",
 		position = 0,
 		section = syncSection
 	)
@@ -262,9 +274,9 @@ public interface LendingTrackerConfig extends Config
 	@ConfigItem(
 		keyName = "webhookEnabled",
 		name = "Post loans to Discord",
-		description = "Post your loans to your group's Discord channel. The channel is set by the group's staff in the group settings, so each group's loans only go to that group. Only the lender posts, so each loan shows once - everyone who lends should turn this on.",
+		description = "Post your loans, and your Looking For posts, to your group's Discord channel. The channel is set by the group's staff in the group settings, so each group's loans only go to that group. Only the lender posts, so each loan shows once - everyone who lends should turn this on.",
 		// Canonical third-party wording first, verbatim; extra disclosure after it.
-		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It posts your loans - player names, items, values, due dates and a picture of the trade window - to the Discord channel your group's staff have set up.",
+		warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers. It posts your loans - player names, items, values, due dates and a picture of the trade window - and your Looking For posts to the Discord channel your group's staff have set up.",
 		position = 0,
 		section = discordSection
 	)
@@ -310,10 +322,34 @@ public interface LendingTrackerConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "webhookExtensions",
+		name = "Extensions",
+		description = "Post when a loan's due date is moved later, and when a request for more time is turned down",
+		position = 5,
+		section = discordSection
+	)
+	default boolean webhookExtensions()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "webhookLookingFor",
+		name = "Looking For posts",
+		description = "Post your Looking For posts, with the list of items, and tag anyone in the group who has one of them listed (if they turned on Ping me)",
+		position = 6,
+		section = discordSection
+	)
+	default boolean webhookLookingFor()
+	{
+		return true;
+	}
+
+	@ConfigItem(
 		keyName = "webhookScreenshot",
 		name = "Attach trade picture",
 		description = "Add a picture of the trade window to loan and return posts - the trade window only, never your chat or inventory. Needs Loan Trade Screenshots on.",
-		position = 5,
+		position = 7,
 		section = discordSection
 	)
 	default boolean webhookScreenshot()
@@ -324,9 +360,9 @@ public interface LendingTrackerConfig extends Config
 	@ConfigItem(
 		keyName = "webhookPingMe",
 		name = "Ping me in Discord",
-		description = "Tag you in your groups' Discord posts about loans you're part of. Your Discord ID is picked up from the Discord app when it's open on this computer, or from the box below.",
-		warning = "This shares your Discord user ID with the members of your groups so loan posts can tag you. It goes through the sync server locked with each group's key, so the server can't read it.",
-		position = 6,
+		description = "Tag you in your groups' Discord posts about loans you're part of, and when someone is looking for an item you have listed. Your Discord ID is picked up from the Discord app when it's open on this computer, or from the box below.",
+		warning = "This shares your Discord user ID with the members of your groups so posts about your loans and listings can tag you. It goes through the sync server locked with each group's key, so the server can't read it.",
+		position = 8,
 		section = discordSection
 	)
 	default boolean webhookPingMe()
@@ -338,7 +374,7 @@ public interface LendingTrackerConfig extends Config
 		keyName = "webhookDiscordId",
 		name = "My Discord user ID",
 		description = "Only needed if you use Discord in a browser or on your phone. In Discord: Settings > Advanced > turn on Developer Mode, then right-click your name > Copy User ID.",
-		position = 7,
+		position = 9,
 		section = discordSection
 	)
 	default String webhookDiscordId()

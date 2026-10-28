@@ -50,6 +50,9 @@ public class DataService
 
 	// Direct lending requests (borrow requests / lend offers): groupId -> requests
 	private final Map<String, List<LendingRequest>> groupRequests = new ConcurrentHashMap<>();
+	// Held while a due date is checked and moved, so two sync threads applying the
+	// same agreement can't both decide it is new.
+	private final Object extendLock = new Object();
 
 	// Delisting tombstones: groupId -> "lender:itemId" -> when it was removed.
 	//
@@ -149,6 +152,9 @@ public class DataService
 			{
 				if (existing.getItemId() == entry.getItemId())
 				{
+					// Value is the stack's, so what's added brings its value with it -
+					// otherwise every restock or relist drags the price per item down.
+					existing.setValue(existing.getValue() + Math.max(0, entry.getValue()));
 					existing.setQuantity(existing.getQuantity() + Math.max(0, entry.getQuantity()));
 					// Restocking is a change, so the stored row has to say so. Without
 					// this the row keeps its original time, which both loses the merge
@@ -570,7 +576,7 @@ public class DataService
 			if (spareByItemId != null)
 			{
 				int family = net.runelite.client.game.ItemVariationMapping.map(e.getItemId());
-				int listed = Math.max(0, e.getQuantity());
+				int listed = Math.max(0, e.shownQuantity());
 				int worn = Math.max(0, wornLeft.getOrDefault(family, 0));
 				int spare = Math.max(0, spareLeft.getOrDefault(family, 0));
 				int uncovered = Math.max(0, listed - spare);
@@ -606,6 +612,181 @@ public class DataService
 			changed = true;
 		}
 		return changed;
+	}
+
+	/**
+	 * Make OUR OWN listings follow what we actually hold - more or fewer than was
+	 * typed - so the group is offered exactly what could be handed over. Holding
+	 * none hides a listing; nothing is ever deleted, and it comes back the moment
+	 * the item is seen again.
+	 *
+	 * Not saved here: this can change on every arrow fired. The caller saves with
+	 * its coalesced push, and at logout and shutdown, and a reload from config in
+	 * between puts our own counts back from memory (restoreOwnHeldState).
+	 *
+	 * @param heldByFamily what we can lend - bank, inventory and worn, less what we
+	 *                     owe others - keyed by item family
+	 * @param fullView     true once the bank has been seen this session. Without it
+	 *                     we can't tell "gone" from "in the bank", so a listing may
+	 *                     only go UP (more turned up), never down.
+	 * @param kept         item ids the owner told not to follow their bank
+	 * @param familyOf     how a listing's item id maps onto heldByFamily's keys - the
+	 *                     same resolver the held side used, so a listing made from
+	 *                     noted items still matches the unnoted ones owned
+	 * @return the rows that changed
+	 */
+	public List<LendingEntry> setHeldQuantities(String groupId, String owner, Map<Integer, Integer> heldByFamily,
+		boolean fullView, Set<Integer> kept, java.util.function.IntUnaryOperator familyOf)
+	{
+		List<LendingEntry> changedRows = new ArrayList<>();
+		if (groupId == null || owner == null || heldByFamily == null || familyOf == null) return changedRows;
+		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
+		if (groupData == null) return changedRows;
+		String ownerKey = groupData.keySet().stream()
+			.filter(k -> k.equalsIgnoreCase(owner)).findFirst().orElse(null);
+		if (ownerKey == null) return changedRows;
+		List<LendingEntry> ownerItems = groupData.get(ownerKey);
+		if (ownerItems == null) return changedRows;
+
+		// Rows of one family share what's held. Each following row takes up to its
+		// own typed number in turn, and the last one takes whatever is left over -
+		// so the family as a whole shows exactly what is held. Kept rows show their
+		// own number and take nothing: the usual reason to keep one is that the
+		// gear is somewhere not counted, like a house.
+		Map<Integer, Integer> lastFollowing = new HashMap<>();
+		Map<Integer, Integer> shownByFamily = new HashMap<>();
+		for (int i = 0; i < ownerItems.size(); i++)
+		{
+			LendingEntry e = ownerItems.get(i);
+			if (!follows(e, kept)) continue;
+			int family = familyOf.applyAsInt(e.getItemId());
+			lastFollowing.put(family, i);
+			shownByFamily.merge(family, Math.max(0, e.shownQuantity()), Integer::sum);
+		}
+		// Part of the picture only (the bank not seen yet): a family may go up,
+		// never down, and only by what's seen beyond what it shows already - shared
+		// out the same way.
+		Map<Integer, Integer> left = new HashMap<>();
+		heldByFamily.forEach((family, have) -> left.put(family,
+			fullView ? have : Math.max(0, have - shownByFamily.getOrDefault(family, 0))));
+		for (int i = 0; i < ownerItems.size(); i++)
+		{
+			LendingEntry e = ownerItems.get(i);
+			if (e == null) continue;
+			Integer value = null;
+			if (follows(e, kept))
+			{
+				int family = familyOf.applyAsInt(e.getItemId());
+				int typed = Math.max(0, e.getQuantity());
+				int have = Math.max(0, left.getOrDefault(family, 0));
+				boolean last = Integer.valueOf(i).equals(lastFollowing.get(family));
+				int target;
+				if (fullView)
+				{
+					int take = last ? have : Math.min(typed, have);
+					left.put(family, have - take);
+					target = take;
+				}
+				else
+				{
+					int current = Math.max(0, e.shownQuantity());
+					int add = last ? have : Math.min(Math.max(0, typed - current), have);
+					left.put(family, have - add);
+					target = current + add;
+				}
+				value = target == typed ? null : (Integer) target;
+			}
+			if (java.util.Objects.equals(e.getHeldQty(), value)) continue;
+			// The one field, in place, and updatedAt left alone - for the same
+			// reasons as setWornQuantities: no torn rows, and following the bank must
+			// never outrank a delisting made on another computer.
+			e.setHeldQty(value);
+			changedRows.add(e);
+		}
+		return changedRows;
+	}
+
+	/**
+	 * Move what our own following listings show by what a trade changed, per item
+	 * family - before the bank has been seen this session, when the trade is the
+	 * only news of what left or came home. A drop comes off the last listing of
+	 * the family first; a rise fills listings up to their own number in turn and
+	 * the last one takes the rest, as following the bank shares out what's held.
+	 * In place, updatedAt left alone, as setHeldQuantities.
+	 *
+	 * @return the rows that changed; not saved here
+	 */
+	public List<LendingEntry> adjustHeldQuantities(String groupId, String owner, Map<Integer, Integer> changeByFamily,
+		Set<Integer> kept, java.util.function.IntUnaryOperator familyOf)
+	{
+		List<LendingEntry> changedRows = new ArrayList<>();
+		if (groupId == null || owner == null || changeByFamily == null || familyOf == null) return changedRows;
+		Map<String, List<LendingEntry>> groupData = groupAvailable.get(groupId);
+		if (groupData == null) return changedRows;
+		String ownerKey = groupData.keySet().stream()
+			.filter(k -> k.equalsIgnoreCase(owner)).findFirst().orElse(null);
+		if (ownerKey == null) return changedRows;
+		List<LendingEntry> ownerItems = groupData.get(ownerKey);
+		if (ownerItems == null) return changedRows;
+
+		for (Map.Entry<Integer, Integer> c : changeByFamily.entrySet())
+		{
+			int change = c.getValue() != null ? c.getValue() : 0;
+			if (change == 0) continue;
+			List<LendingEntry> rows = new ArrayList<>();
+			for (int i = 0; i < ownerItems.size(); i++)
+			{
+				LendingEntry e = ownerItems.get(i);
+				if (follows(e, kept) && familyOf.applyAsInt(e.getItemId()) == c.getKey()) rows.add(e);
+			}
+			if (rows.isEmpty()) continue;
+			int[] shown = new int[rows.size()];
+			for (int i = 0; i < rows.size(); i++) shown[i] = Math.max(0, rows.get(i).shownQuantity());
+			if (change < 0)
+			{
+				int drop = -change;
+				for (int i = rows.size() - 1; i >= 0 && drop > 0; i--)
+				{
+					int take = Math.min(shown[i], drop);
+					shown[i] -= take;
+					drop -= take;
+				}
+			}
+			else
+			{
+				int add = change;
+				for (int i = 0; i < rows.size() - 1 && add > 0; i++)
+				{
+					int put = Math.min(Math.max(0, rows.get(i).getQuantity() - shown[i]), add);
+					shown[i] += put;
+					add -= put;
+				}
+				shown[rows.size() - 1] += add;
+			}
+			for (int i = 0; i < rows.size(); i++)
+			{
+				LendingEntry e = rows.get(i);
+				Integer value = shown[i] == Math.max(0, e.getQuantity()) ? null : (Integer) shown[i];
+				if (java.util.Objects.equals(e.getHeldQty(), value)) continue;
+				e.setHeldQty(value);
+				changedRows.add(e);
+			}
+		}
+		return changedRows;
+	}
+
+	/** A row that follows the bank: ours, a real item, not out on loan, not kept. */
+	private static boolean follows(LendingEntry e, Set<Integer> kept)
+	{
+		return e != null && e.getItemId() > 0
+			&& (e.getBorrower() == null || e.getBorrower().isEmpty())
+			&& (kept == null || !kept.contains(e.getItemId()));
+	}
+
+	/** Save our listings now - what following the bank changed, mainly. */
+	public void saveListings(String groupId)
+	{
+		persist(groupId, "available");
 	}
 
 	public List<LendingEntry> getOfferingsByOwner(String groupId, String ownerName)
@@ -1038,9 +1219,22 @@ public class DataService
 			for (LendingRequest r : requests)
 			{
 				if (r == null || !r.isPending()) continue;
-				if (playerName.equalsIgnoreCase(r.getFrom()) || playerName.equalsIgnoreCase(r.getTo()))
+				// A more-time step names nobody: it waits on whichever side of its loan
+				// didn't send it, so it goes when either side of that loan leaves.
+				LendingEntry stepLoan = r.isExtension() && r.getEntryId() != null ? allEntries.get(r.getEntryId()) : null;
+				if (playerName.equalsIgnoreCase(r.getFrom()) || playerName.equalsIgnoreCase(r.getTo())
+					|| (stepLoan != null && (playerName.equalsIgnoreCase(stepLoan.getLender())
+						|| playerName.equalsIgnoreCase(stepLoan.getBorrower()))))
 				{
 					r.setStatus(LendingRequest.STATUS_CANCELLED);
+					// A more-time step left hanging by someone leaving lapsed - nobody
+					// withdrew it - so it carries the expiry flag. That flag already
+					// reaches every client, older ones included, and keeps a lapsed
+					// counter from ever being read as a "no".
+					if (r.isExtension())
+					{
+						r.setExpired(true);
+					}
 					r.setUpdatedAt(now);
 					changed++;
 				}
@@ -1342,6 +1536,221 @@ public class DataService
 		return true;
 	}
 
+	/**
+	 * The player whose client keeps a loan - records it, tracks its returns, posts
+	 * it, and is the only one who may change it. The lender, unless the borrower
+	 * recorded it because the lender can't run the plugin.
+	 */
+	public static String keeperOf(LendingEntry loan)
+	{
+		return loan.isKeptByBorrower() ? loan.getBorrower() : loan.getLender();
+	}
+
+	/** True when the loan has a due date that can be moved (not "no limit"). */
+	public static boolean hasDueDate(LendingEntry loan)
+	{
+		return loan.getDueTime() > 0 && loan.getDueTime() < Long.MAX_VALUE / 2;
+	}
+
+	/** A due date for people to read: "Oct 23, 18:00", or "no due date". */
+	public static String dueText(long due)
+	{
+		if (due <= 0 || due >= Long.MAX_VALUE / 2)
+		{
+			return "no due date";
+		}
+		return java.time.format.DateTimeFormatter.ofPattern("MMM d, HH:mm")
+			.format(java.time.Instant.ofEpochMilli(due).atZone(java.time.ZoneId.systemDefault()));
+	}
+
+	/**
+	 * Move an active loan's due date LATER. Never earlier: a shorter loan needs the
+	 * borrower's say-so, and "later only" is also what makes re-applying an old
+	 * agreement harmless - it can't wind back a date that has since moved on.
+	 * newDue 0 lifts the limit altogether.
+	 *
+	 * Only the keeper may do this. The row it stamps replaces every other client's
+	 * copy outright, return tallies and all, so a write from anyone else would
+	 * fight the keeper's own record. Stamped at least one past the row's previous
+	 * time, so a peer whose clock runs ahead can't make the change look old.
+	 *
+	 * @return the old due date, or -1 when nothing changed
+	 */
+	public long extendLoan(String entryId, long newDue, String actor)
+	{
+		LendingEntry entry;
+		long oldDue;
+		synchronized (extendLock)
+		{
+			entry = entryId != null ? allEntries.get(entryId) : null;
+			if (entry == null || entry.isReturned() || actor == null
+				|| !actor.equalsIgnoreCase(keeperOf(entry)) || !hasDueDate(entry))
+			{
+				return -1;
+			}
+			oldDue = entry.getDueTime();
+			if (newDue != 0 && newDue <= oldDue)
+			{
+				return -1;
+			}
+			long now = System.currentTimeMillis();
+			long stamp = Math.max(now, entry.getUpdatedAt() + 1);
+			// After a reload the same loan can sit in the lent and borrowed lists as
+			// separate objects; move them all, or the published lists keep the old
+			// date.
+			for (LendingEntry copy : copiesOf(entry))
+			{
+				copy.setDueTime(newDue);
+				copy.setDueExtendedAt(now);
+				copy.setUpdatedAt(stamp);
+			}
+		}
+		saveEntries();
+		if (entry.getGroupId() != null)
+		{
+			persist(entry.getGroupId(), "loan");
+			if (groupService != null)
+			{
+				groupService.publishEvent(GroupService.SyncEventType.ITEM_UPDATED, entry.getId(), entry);
+			}
+		}
+		return oldDue;
+	}
+
+	/** This loan's row plus any separate copy of it in its group's lent and borrowed lists. */
+	private List<LendingEntry> copiesOf(LendingEntry entry)
+	{
+		Set<LendingEntry> found = Collections.newSetFromMap(new IdentityHashMap<>());
+		found.add(entry);
+		String id = entry.getId();
+		if (entry.getGroupId() != null && id != null)
+		{
+			for (Map<String, Map<String, List<LendingEntry>>> category : Arrays.asList(groupLent, groupBorrowed))
+			{
+				Map<String, List<LendingEntry>> byName = category.get(entry.getGroupId());
+				if (byName == null)
+				{
+					continue;
+				}
+				for (List<LendingEntry> rows : byName.values())
+				{
+					for (LendingEntry row : rows)
+					{
+						if (row != null && id.equals(row.getId()))
+						{
+							found.add(row);
+						}
+					}
+				}
+			}
+		}
+		return new ArrayList<>(found);
+	}
+
+	/**
+	 * Is this extension step really from the side its type says? One that isn't
+	 * is ignored everywhere - nobody gets to answer their own request by writing
+	 * the other side's step.
+	 */
+	public static boolean isGenuineExtensionStep(LendingRequest r, LendingEntry loan)
+	{
+		if (r == null || loan == null || !r.isExtension() || r.getFrom() == null)
+		{
+			return false;
+		}
+		String author = r.isBorrowerExtensionStep() ? loan.getBorrower() : loan.getLender();
+		return r.getFrom().equalsIgnoreCase(author);
+	}
+
+	/** Who answers an extension step: the loan's other party. */
+	public static String extensionAnswerer(LendingRequest r, LendingEntry loan)
+	{
+		return r.isBorrowerExtensionStep() ? loan.getLender() : loan.getBorrower();
+	}
+
+	/** Extension steps waiting on this player's answer, for loans still open. */
+	public List<LendingRequest> getPendingExtensionsFor(String groupId, String player)
+	{
+		List<LendingRequest> out = new ArrayList<>();
+		if (player == null)
+		{
+			return out;
+		}
+		for (LendingRequest r : getRequests(groupId))
+		{
+			if (!r.isExtension() || !r.isPending())
+			{
+				continue;
+			}
+			LendingEntry loan = getActiveEntry(r.getEntryId());
+			if (isGenuineExtensionStep(r, loan) && player.equalsIgnoreCase(extensionAnswerer(r, loan)))
+			{
+				out.add(r);
+			}
+		}
+		return out;
+	}
+
+	/** The extension step still waiting for an answer on this loan, or null. */
+	public LendingRequest getPendingExtension(String groupId, String entryId)
+	{
+		if (entryId == null)
+		{
+			return null;
+		}
+		for (LendingRequest r : getRequests(groupId))
+		{
+			if (r.isExtension() && r.isPending() && entryId.equals(r.getEntryId()))
+			{
+				return r;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Answer a request only if it is still waiting. Unlike updateRequestStatus this
+	 * won't overwrite an answer that already landed - the other side cancelling,
+	 * an expiry, or this same player on a second computer.
+	 */
+	public boolean resolvePendingRequest(String groupId, String requestId, String status)
+	{
+		List<LendingRequest> requests = groupRequests.get(groupId);
+		if (requests == null || requestId == null)
+		{
+			return false;
+		}
+		LendingRequest done = null;
+		synchronized (requests)
+		{
+			for (LendingRequest r : requests)
+			{
+				if (requestId.equals(r.getId()))
+				{
+					if (!r.isPending())
+					{
+						return false;
+					}
+					r.setStatus(status);
+					r.setExpired(false);
+					r.setUpdatedAt(Math.max(System.currentTimeMillis(), r.getUpdatedAt() + 1));
+					done = r;
+					break;
+				}
+			}
+		}
+		if (done == null)
+		{
+			return false;
+		}
+		persist(groupId, "requests");
+		if (groupService != null)
+		{
+			groupService.publishEvent(GroupService.SyncEventType.REQUEST_UPDATED, requestId, done);
+		}
+		return true;
+	}
+
 	/** Look up an active loan by id, or null. */
 	public LendingEntry getActiveEntry(String entryId)
 	{
@@ -1358,10 +1767,16 @@ public class DataService
 	/** Was a MUTUAL removal request for this loan already declined (escalation grounds)? */
 	public boolean hasDeclinedMutualRemovalFor(String groupId, String entryId)
 	{
+		// Only a "no" between the two parties counts. A lender turning down staff
+		// who asked them to clear the loan is the lender's safety check working -
+		// it mustn't open the way to escalating round them.
+		LendingEntry loan = entryId != null ? allEntries.get(entryId) : null;
 		return getRequests(groupId).stream()
 			.anyMatch(r -> LendingRequest.TYPE_REMOVAL_MUTUAL.equals(r.getType())
 				&& LendingRequest.STATUS_DECLINED.equals(r.getStatus())
-				&& entryId != null && entryId.equals(r.getEntryId()));
+				&& entryId != null && entryId.equals(r.getEntryId())
+				&& (loan == null || (r.getFrom() != null && (r.getFrom().equalsIgnoreCase(loan.getLender())
+					|| r.getFrom().equalsIgnoreCase(loan.getBorrower())))));
 	}
 
 	/**
@@ -1662,7 +2077,22 @@ public class DataService
 		snapshot.put("lent", groupLent.getOrDefault(groupId, new HashMap<>()));
 		snapshot.put("borrowed", groupBorrowed.getOrDefault(groupId, new HashMap<>()));
 		snapshot.put("available", groupAvailable.getOrDefault(groupId, new HashMap<>()));
-		snapshot.put("requests", getRequests(groupId));
+		// Serialised under the list's own lock. A merge flips statuses on these very
+		// objects, and a snapshot written half way through one could carry a step's
+		// "no" without the counter that came with it.
+		List<LendingRequest> liveRequests = groupRequests.get(groupId);
+		if (liveRequests == null)
+		{
+			snapshot.put("requests", new ArrayList<>());
+		}
+		else
+		{
+			synchronized (liveRequests)
+			{
+				snapshot.put("requests", gson.toJsonTree(new ArrayList<>(liveRequests),
+					new TypeToken<List<LendingRequest>>() { }.getType()));
+			}
+		}
 		// Active loans live in the global allEntries map, which never crossed
 		// machines before — include this group's entries so loans sync too.
 		snapshot.put("entries", allEntries.values().stream()
@@ -1873,44 +2303,64 @@ public class DataService
 			.computeIfAbsent(groupId, k -> new CopyOnWriteArrayList<>());
 		long staleBefore = System.currentTimeMillis() - PENDING_REQUEST_EXPIRY_MS;
 
+		// Parsed first, then applied in one go under the lock - every new row before
+		// any status change. A reader on another thread sees all of this snapshot or
+		// none of it, and so never a step's "no" without the counter that came with
+		// it, which would be taken for a refusal.
+		List<LendingRequest> remotes = new ArrayList<>();
 		for (Object raw : (List<?>) rawRequests)
 		{
 			LendingRequest remote = gson.fromJson(gson.toJson(raw), LendingRequest.class);
-			if (remote == null || remote.getId() == null)
+			if (remote != null && remote.getId() != null)
 			{
-				continue;
+				remotes.add(remote);
+			}
+		}
+
+		synchronized (localRequests)
+		{
+			Set<String> added = new HashSet<>();
+			for (LendingRequest remote : remotes)
+			{
+				if (added.contains(remote.getId())
+					|| localRequests.stream().anyMatch(r -> remote.getId().equals(r.getId())))
+				{
+					continue;
+				}
+				// A pending request older than the expiry age is one everybody
+				// else already retired and pruned. Re-adding it hands the
+				// recipient a live, actionable request from months ago, which
+				// they answer into a loan that may involve someone long gone -
+				// and re-stamping it on expiry buys it another full retention
+				// window, so the same peer resurrects it again on every login.
+				//
+				// PEERS ONLY. "local == null" means "not in memory", and at
+				// startup nothing has been loaded yet - so on the config reload
+				// every one of our OWN saved requests looks unknown. Dropping
+				// them there deletes the user's own unanswered disputes instead
+				// of expiring them, which loses the record and the notification
+				// with it. Our own file is reloaded as-is; expiry retires it.
+				long born = requestAge(remote);
+				if (fromPeer && remote.isPending() && born > 0 && born < staleBefore)
+				{
+					continue;
+				}
+				localRequests.add(remote);
+				added.add(remote.getId());
 			}
 
-			synchronized (localRequests)
+			for (LendingRequest remote : remotes)
 			{
+				if (added.contains(remote.getId()))
+				{
+					continue; // just taken whole - it carries its own status and flags
+				}
 				LendingRequest local = localRequests.stream()
 					.filter(r -> remote.getId().equals(r.getId()))
 					.findFirst().orElse(null);
 				if (local == null)
 				{
-					// A pending request older than the expiry age is one everybody
-					// else already retired and pruned. Re-adding it hands the
-					// recipient a live, actionable request from months ago, which
-					// they answer into a loan that may involve someone long gone -
-					// and re-stamping it on expiry buys it another full retention
-					// window, so the same peer resurrects it again on every login.
-					//
-					// PEERS ONLY. "local == null" means "not in memory", and at
-					// startup nothing has been loaded yet - so on the config reload
-					// every one of our OWN saved requests looks unknown. Dropping
-					// them there deletes the user's own unanswered disputes instead
-					// of expiring them, which loses the record and the notification
-					// with it. Our own file is reloaded as-is; expiry retires it.
-					long born = requestAge(remote);
-					if (fromPeer && remote.isPending() && born > 0 && born < staleBefore)
-					{
-						continue;
-					}
-					localRequests.add(remote);
-					// Nothing to reconcile - the row we just took carries its own
-					// status and flags. Everything below compares against a local
-					// copy that does not exist here.
-					continue;
+					continue; // a stale pending row left out above
 				}
 
 				// Outcome first, timestamp second. Expiry runs on a timer against
@@ -2255,6 +2705,7 @@ public class DataService
 		// every row with a fresh object built from the stored snapshot.
 		String selfNow = configManager.getConfiguration(CONFIG_GROUP, "currentAccount");
 		Map<Integer, Integer> wornBefore = ownWornState(groupId, selfNow);
+		Map<Integer, Integer> heldBefore = ownHeldState(groupId, selfNow);
 
 		String json = configManager.getConfiguration(CONFIG_GROUP, KEY_PREFIX + groupId);
 		if (json != null && !json.isEmpty())
@@ -2270,6 +2721,10 @@ public class DataService
 				// come back even if an earlier save wrote the flag to disk. Everyone
 				// else's stays exactly as they published it.
 				restoreOwnWornState(groupId, selfNow, wornBefore);
+				if (heldBefore != null)
+				{
+					restoreOwnHeldState(groupId, selfNow, heldBefore);
+				}
 				loadGroupEntries(getCategory(snapshot, "lent"), groupId, groupLent);
 				loadGroupEntries(getCategory(snapshot, "borrowed"), groupId, groupBorrowed);
 				mergeRequests(groupId, snapshot.get("requests"), false);
@@ -2322,6 +2777,48 @@ public class DataService
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * Our own listings' held counts by item id, or null when none of our rows is
+	 * in memory yet - the first load, where the saved counts are all there is.
+	 */
+	private Map<Integer, Integer> ownHeldState(String groupId, String self)
+	{
+		if (self == null || self.isEmpty()) return null;
+		Map<String, List<LendingEntry>> owners = groupAvailable.get(groupId);
+		if (owners == null) return null;
+		Map<Integer, Integer> out = null;
+		for (Map.Entry<String, List<LendingEntry>> owner : owners.entrySet())
+		{
+			if (!owner.getKey().equalsIgnoreCase(self)) continue;
+			if (out == null) out = new HashMap<>();
+			for (LendingEntry e : owner.getValue())
+			{
+				if (e != null && e.getHeldQty() != null) out.put(e.getItemId(), e.getHeldQty());
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Put our own held counts back after a reload replaced the rows. Memory is the
+	 * truth once loaded: the counts are saved with a delay, so what's on disk can
+	 * be a little behind.
+	 */
+	private void restoreOwnHeldState(String groupId, String self, Map<Integer, Integer> held)
+	{
+		if (self == null || self.isEmpty()) return;
+		Map<String, List<LendingEntry>> owners = groupAvailable.get(groupId);
+		if (owners == null) return;
+		for (Map.Entry<String, List<LendingEntry>> owner : owners.entrySet())
+		{
+			if (!owner.getKey().equalsIgnoreCase(self)) continue;
+			for (LendingEntry e : owner.getValue())
+			{
+				if (e != null) e.setHeldQty(held.get(e.getItemId()));
+			}
+		}
 	}
 
 	/**

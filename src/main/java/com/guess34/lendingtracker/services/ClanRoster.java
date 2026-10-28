@@ -71,6 +71,12 @@ public class ClanRoster
 		return clanName;
 	}
 
+	/** Everyone in this player's clan, as lower-case name keys. Empty until the clan has loaded. */
+	public Set<String> memberKeys()
+	{
+		return members;
+	}
+
 	/** Is player in the named clan, as far as this client can tell? */
 	public Membership check(String clan, String player)
 	{

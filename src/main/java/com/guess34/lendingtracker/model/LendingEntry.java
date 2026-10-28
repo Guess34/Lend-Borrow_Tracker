@@ -95,6 +95,23 @@ public class LendingEntry {
     // here on purpose.
     private Integer wornQty;
 
+    // How many of this listing the owner actually holds - bank, inventory and
+    // worn gear - once their client has checked. The listing follows it, up as
+    // well as down: list 1 and hold 5, and 5 are offered; sell 2 of 5, and 3 are.
+    // Holding none hides it from the group without deleting it, and it comes back
+    // the moment the item is seen again.
+    //
+    // Only the owner's client ever writes this; absent means "not checked", so the
+    // number typed is shown. Kept across sessions - having sold something stays
+    // true after logging out.
+    private Integer heldQty;
+
+    // When this loan's due date was last moved later; absent = never. Only the
+    // client that keeps the loan writes it. Losing it on the way through an older
+    // client only means this loan's overdue posts are keyed the way they always
+    // were, so nothing needs to repair it.
+    private Long dueExtendedAt;
+
     // Convenience
 
     public long getDueDate() { return this.dueTime; }
@@ -102,10 +119,19 @@ public class LendingEntry {
     public boolean isReturned() { return this.returnedAt > 0; }
 
     /** How many of this listing are on the owner's back right now. */
-    public int wornQuantity() { return wornQty == null ? 0 : Math.max(0, Math.min(wornQty, quantity)); }
+    public int wornQuantity() { return wornQty == null ? 0 : Math.max(0, Math.min(wornQty, shownQuantity())); }
+
+    /** How many to show: what the owner holds once their bank has been checked, else what they typed. */
+    public int shownQuantity() { return heldQty != null ? Math.max(0, heldQty) : quantity; }
+
+    /** The value for the shown quantity - value is stored for the typed one. */
+    public long shownValue() { return heldQty != null && quantity > 0 ? value * shownQuantity() / quantity : value; }
+
+    /** The owner holds none of it, so the group doesn't see it. */
+    public boolean heldNone() { return heldQty != null && heldQty <= 0; }
 
     /** How many could actually be handed over right now. */
-    public int availableQuantity() { return Math.max(0, quantity - wornQuantity()); }
+    public int availableQuantity() { return Math.max(0, shownQuantity() - wornQuantity()); }
 
     // --- Null-safe outstanding accessors (legacy records fall back to the old
     // all-or-nothing model: everything outstanding while active, nothing after) ---
@@ -156,6 +182,8 @@ public class LendingEntry {
 
     public boolean isKeptByBorrower() { return Boolean.TRUE.equals(keptByBorrower); }
 
+    public boolean wasExtended() { return dueExtendedAt != null && dueExtendedAt > 0; }
+
     public boolean isOverdue() {
         return returnedAt == 0 && dueTime > 0 && System.currentTimeMillis() > dueTime;
     }
@@ -188,6 +216,8 @@ public class LendingEntry {
         this.setName = other.setName;
         this.keptByBorrower = other.keptByBorrower;
         this.wornQty = other.wornQty;
+        this.heldQty = other.heldQty;
+        this.dueExtendedAt = other.dueExtendedAt;
     }
 
     public String getPlayerName() { return borrower != null ? borrower : lender; }

@@ -373,8 +373,8 @@ public class DashboardPanel extends JPanel
 			// claim gear that is on somebody's back or outside the group.
 			totalValueLabel.setText("Available: "
 				+ QuantityFormatter.quantityToStackSize(displayItems.stream()
-					.mapToLong(LendingEntry::getValue).sum()) + " GP");
-			activeLoansLabel.setText("Marketplace: " + displayItems.size()
+					.filter(i -> !heldNoneByMe(i)).mapToLong(LendingEntry::shownValue).sum()) + " GP");
+			activeLoansLabel.setText("Marketplace: " + displayItems.stream().filter(i -> !heldNoneByMe(i)).count()
 				+ " | Loans: " + activeLoans.size());
 
 			// Categories come from the client thread; ask for anything not seen yet
@@ -396,9 +396,13 @@ public class DashboardPanel extends JPanel
 				// Staff-review removals visible to eligible uninvolved owners/co-owners
 				incomingRequests.addAll(dataService.getPendingStaffRemovalsFor(groupId, me,
 					groupService.getGroup(groupId)));
+				// More-time steps are addressed to nobody so older clients can't
+				// mistake them; who answers comes from the loan.
+				incomingRequests.addAll(dataService.getPendingExtensionsFor(groupId, me));
 				// Looking For posts are requests too, but they have their own section.
 				outgoingRequests.addAll(dataService.getRequestsFrom(groupId, me).stream()
-					.filter(r -> r.isPending() && !r.isLookingFor())
+					.filter(r -> r.isPending() && !r.isLookingFor()
+						&& (!r.isExtension() || dataService.getActiveEntry(r.getEntryId()) != null))
 					.collect(java.util.stream.Collectors.toList()));
 			}
 
@@ -407,7 +411,7 @@ public class DashboardPanel extends JPanel
 			java.util.Set<Integer> myBases = new java.util.HashSet<>();
 			for (LendingEntry item : displayItems)
 			{
-				if (me.equalsIgnoreCase(item.getLender())) myBases.add(ItemVariationMapping.map(item.getItemId()));
+				if (me.equalsIgnoreCase(item.getLender()) && !item.heldNone()) myBases.add(ItemVariationMapping.map(item.getItemId()));
 			}
 			int wantsMine = 0;
 			for (LookingForRequest r : lookingForRequests)
@@ -615,26 +619,26 @@ public class DashboardPanel extends JPanel
 	 */
 	private LendingEntry asAvailableNow(LendingEntry item)
 	{
-		if (item.wornQuantity() <= 0)
+		if (item.wornQuantity() <= 0 && item.getHeldQty() == null)
 		{
 			return item;
 		}
 		String me = getCurrentPlayerName();
-		if (me != null && me.equalsIgnoreCase(item.getLender()))
+		if (item.getLender() == null || (me != null && me.equalsIgnoreCase(item.getLender())))
 		{
 			return item;
 		}
-		if (!groupService.getOnlineMembers().containsKey(item.getLender().toLowerCase()))
-		{
-			return item;
-		}
-		int free = item.availableQuantity();
+		// What they hold counts always - it's what they own, and stays true after
+		// they log off. What they're wearing only counts while they're online.
+		int worn = groupService.getOnlineMembers().containsKey(item.getLender().toLowerCase())
+			? item.wornQuantity() : 0;
+		int free = Math.max(0, item.shownQuantity() - worn);
 		if (free <= 0)
 		{
 			return null;
 		}
-		// Value is the whole stack's, so it has to come down with the count or the
-		// row contradicts itself.
+		// Value is the whole stack's, so it has to follow the count or the row
+		// contradicts itself.
 		LendingEntry shown = new LendingEntry(item);
 		shown.setQuantity(free);
 		if (item.getQuantity() > 0)
@@ -642,7 +646,35 @@ public class DashboardPanel extends JPanel
 			shown.setValue(item.getValue() * free / item.getQuantity());
 		}
 		shown.setWornQty(null);
+		shown.setHeldQty(null);
 		return shown;
+	}
+
+	/** True when this listing is ours and we hold none of it, so the group can't see it. */
+	/** Is some of this item out on loan from me? For what a row says only. */
+	private boolean lentOutByMe(int itemId)
+	{
+		String myName = getCurrentPlayerName();
+		int family = net.runelite.client.game.ItemVariationMapping.map(itemId);
+		for (LendingEntry e : dataService.getActiveEntries())
+		{
+			if (myName.equalsIgnoreCase(e.getLender()) && !e.isKeptByBorrower() && e.outstandingLentQty() > 0
+				&& net.runelite.client.game.ItemVariationMapping.map(e.getItemId()) == family)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean heldNoneByMe(LendingEntry e)
+	{
+		if (e == null || !e.heldNone())
+		{
+			return false;
+		}
+		String myName = getCurrentPlayerName();
+		return myName != null && myName.equalsIgnoreCase(e.getLender());
 	}
 
 	/**
@@ -798,7 +830,7 @@ public class DashboardPanel extends JPanel
 
 		long value()
 		{
-			return pieces.stream().mapToLong(LendingEntry::getValue).sum();
+			return pieces.stream().mapToLong(LendingEntry::shownValue).sum();
 		}
 
 		/** Drawn as one bundle rather than a single listing. */
@@ -1064,7 +1096,7 @@ public class DashboardPanel extends JPanel
 		java.util.Set<String> owners = new java.util.LinkedHashSet<>();
 		for (LendingEntry e : listings)
 		{
-			if (e.getLender() == null || e.getLender().equalsIgnoreCase(r.requesterName)) continue;
+			if (e.getLender() == null || e.getLender().equalsIgnoreCase(r.requesterName) || e.heldNone()) continue;
 			if (r.wants(e)) owners.add(e.getLender());
 		}
 		return new java.util.ArrayList<>(owners);
@@ -1180,6 +1212,18 @@ public class DashboardPanel extends JPanel
 		gbc.gridy = 4;
 		panel.add(new JLabel("<html><font color='orange'>Breaking terms may result in group removal!</font></html>"), gbc);
 
+		// One piece offered more than once - a stack, or gear held several times:
+		// ask how many, starting at one, rather than asking for the lot.
+		JSpinner howMany = null;
+		if (pieces.size() == 1 && pieces.get(0).getQuantity() > 1)
+		{
+			gbc.gridx = 0; gbc.gridy = 5; gbc.gridwidth = 1;
+			panel.add(new JLabel("How many:"), gbc);
+			gbc.gridx = 1;
+			howMany = new JSpinner(new SpinnerNumberModel(1, 1, pieces.get(0).getQuantity(), 1));
+			panel.add(howMany, gbc);
+		}
+
 		int result = JOptionPane.showConfirmDialog(this, panel,
 			"Borrow Request", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
 		if (result != JOptionPane.OK_OPTION)
@@ -1203,7 +1247,8 @@ public class DashboardPanel extends JPanel
 			int sent = 0;
 			for (LendingEntry p : pieces)
 			{
-				if (plugin.sendBorrowRequest(borrower, lender, p.getItem(), p.getItemId(), p.getQuantity(), durationDays))
+				int asking = howMany != null ? (Integer) howMany.getValue() : p.getQuantity();
+				if (plugin.sendBorrowRequest(borrower, lender, p.getItem(), p.getItemId(), asking, durationDays))
 				{
 					sent++;
 				}
@@ -1422,19 +1467,29 @@ public class DashboardPanel extends JPanel
 			String myName = getCurrentPlayerName();
 			boolean mineHere = myName != null && unit.owner.equalsIgnoreCase(myName);
 			int wornPieces = 0;
+			int missingPieces = 0;
+			int lentPieces = 0;
 			for (LendingEntry piece : unit.pieces)
 			{
 				if (piece.wornQuantity() > 0) wornPieces++;
+				else if (piece.heldNone() && lentOutByMe(piece.getItemId())) lentPieces++;
+				else if (piece.heldNone()) missingPieces++;
 			}
-			String wornTag = !mineHere || wornPieces == 0 ? ""
-				: wornPieces == unit.pieces.size() ? "  - worn"
-					: "  - " + wornPieces + " worn";
+			// Not in the bank may mean sold or dropped, so it stands out in red; worn
+			// and out on loan come back by themselves.
+			String wornTag = !mineHere ? ""
+				: wornPieces > 0 ? (wornPieces == unit.pieces.size() ? " - worn" : " - " + wornPieces + " worn")
+				: missingPieces > 0 ? " - " + missingPieces + " not in bank"
+				: lentPieces > 0 ? " - " + lentPieces + " out on loan"
+				: "";
+			String tagColour = wornPieces == 0 && missingPieces > 0 ? "#FF0000" : "#E0A848";
 
-			JLabel title = new JLabel((open ? "▼ " : "▶ ") + name
-				+ "  (" + unit.pieces.size() + ")" + wornTag);
+			String head = (open ? "▼ " : "▶ ") + name + "  (" + unit.pieces.size() + ")";
+			JLabel title = new JLabel(wornTag.isEmpty() ? head
+				: "<html>" + escapeHtml(head).replace("  ", "&nbsp; ")
+					+ "<font color='" + tagColour + "'>&nbsp;" + escapeHtml(wornTag) + "</font></html>");
 			title.setFont(FontManager.getRunescapeSmallFont());
-			title.setForeground(!wornTag.isEmpty() ? new Color(0xE0, 0xA8, 0x48)
-				: yours ? new Color(0xFF, 0xC0, 0x60) : new Color(0xA8, 0xC8, 0xE8));
+			title.setForeground(yours ? new Color(0xFF, 0xC0, 0x60) : new Color(0xA8, 0xC8, 0xE8));
 
 			JLabel worth = new JLabel(QuantityFormatter.quantityToStackSize(unit.value()));
 			worth.setFont(FontManager.getRunescapeSmallFont());
@@ -1452,9 +1507,9 @@ public class DashboardPanel extends JPanel
 			for (int i = 0; i < unit.pieces.size() && i < max; i++)
 			{
 				LendingEntry p = unit.pieces.get(i);
-				JLabel icon = wornByMe(p) ? new WornIcon() : new JLabel();
+				JLabel icon = wornByMe(p) || heldNoneByMe(p) ? new WornIcon() : new JLabel();
 				icon.setPreferredSize(new Dimension(36, 32));
-				AsyncBufferedImage img = itemManager.getImage(p.getItemId(), p.getQuantity(), p.getQuantity() > 1);
+				AsyncBufferedImage img = itemManager.getImage(p.getItemId(), p.shownQuantity(), p.shownQuantity() > 1);
 				if (img != null) img.addTo(icon);
 				icons.add(icon);
 			}
@@ -1480,7 +1535,7 @@ public class DashboardPanel extends JPanel
 			for (LendingEntry p : unit.pieces)
 			{
 				tip.append("<br>• ").append(escapeHtml(p.getItem()))
-					.append(" - ").append(QuantityFormatter.quantityToStackSize(p.getValue()));
+					.append(" - ").append(QuantityFormatter.quantityToStackSize(p.shownValue()));
 			}
 			if (drawnOnly)
 			{
@@ -1579,11 +1634,11 @@ public class DashboardPanel extends JPanel
 			setPreferredSize(new Dimension(200, 42));
 
 			// Left side: Item icon (fixed width), struck through when we are wearing it
-			JLabel iconLabel = wornByMe(item) ? new WornIcon() : new JLabel();
+			JLabel iconLabel = wornByMe(item) || heldNoneByMe(item) ? new WornIcon() : new JLabel();
 			iconLabel.setPreferredSize(new Dimension(36, 32));
 			try
 			{
-				AsyncBufferedImage itemImage = itemManager.getImage(item.getItemId(), item.getQuantity(), item.getQuantity() > 1);
+				AsyncBufferedImage itemImage = itemManager.getImage(item.getItemId(), item.shownQuantity(), item.shownQuantity() > 1);
 				if (itemImage != null)
 				{
 					itemImage.addTo(iconLabel);
@@ -1603,7 +1658,7 @@ public class DashboardPanel extends JPanel
 			// Item name (truncate if too long)
 			String itemName = item.getItem() != null ? item.getItem() : "?";
 			if (itemName.length() > 18) itemName = itemName.substring(0, 15) + "...";
-			JLabel itemLabel = new JLabel(itemName + (item.getQuantity() > 1 ? " x" + item.getQuantity() : ""));
+			JLabel itemLabel = new JLabel(itemName + (item.shownQuantity() > 1 ? " x" + item.shownQuantity() : ""));
 			itemLabel.setFont(FontManager.getRunescapeSmallFont());
 			itemLabel.setForeground(Color.WHITE);
 
@@ -1616,15 +1671,28 @@ public class DashboardPanel extends JPanel
 			String meNow = getCurrentPlayerName();
 			boolean wornMine = item.wornQuantity() > 0
 				&& meNow != null && meNow.equalsIgnoreCase(item.getLender());
+			boolean missingMine = !wornMine && heldNoneByMe(item);
+			// Out on loan comes back by itself. Not in the bank may mean it was sold
+			// or dropped, so that one stands out in red.
+			boolean lentMine = missingMine && lentOutByMe(item.getItemId());
 			if (wornMine)
 			{
 				sub = item.availableQuantity() > 0
-					? "Worn " + item.wornQuantity() + " of " + item.getQuantity()
+					? "Worn " + item.wornQuantity() + " of " + item.shownQuantity()
 					: "Worn - hidden";
+			}
+			else if (lentMine)
+			{
+				sub = "Out on loan - hidden";
+			}
+			else if (missingMine)
+			{
+				sub = "Not in bank - hidden";
 			}
 			JLabel subLabel = new JLabel(sub);
 			subLabel.setFont(FontManager.getRunescapeSmallFont());
-			subLabel.setForeground(wornMine ? new Color(0xE0, 0xA8, 0x48) : ColorScheme.LIGHT_GRAY_COLOR);
+			subLabel.setForeground(missingMine && !lentMine ? Color.RED
+				: wornMine || missingMine ? new Color(0xE0, 0xA8, 0x48) : ColorScheme.LIGHT_GRAY_COLOR);
 
 			detailsPanel.add(itemLabel);
 			detailsPanel.add(subLabel);
@@ -1635,7 +1703,7 @@ public class DashboardPanel extends JPanel
 			rightPanel = new JPanel(new BorderLayout());
 			rightPanel.setBackground(bgColor);
 
-			JLabel valueLabel = new JLabel(QuantityFormatter.quantityToStackSize(item.getValue()));
+			JLabel valueLabel = new JLabel(QuantityFormatter.quantityToStackSize(item.shownValue()));
 			valueLabel.setFont(FontManager.getRunescapeSmallFont());
 			valueLabel.setForeground(Color.YELLOW);
 			rightPanel.add(valueLabel, BorderLayout.CENTER);
@@ -1644,6 +1712,8 @@ public class DashboardPanel extends JPanel
 
 			setToolTipText("<html><b>" + escapeHtml(item.getItem()) + "</b> by " + escapeHtml(item.getLender())
 				+ (cats.isEmpty() ? "" : "<br>" + escapeHtml(cats))
+				+ (item.getHeldQty() != null && item.shownQuantity() != item.getQuantity()
+					? "<br>You listed " + item.getQuantity() + "; showing " + item.shownQuantity() + " - what you hold" : "")
 				+ (item.isInSet() ? "<br>Part of set: " + escapeHtml(item.getSetName()) : "")
 				+ (item.getNotes() != null && !item.getNotes().isEmpty() ? "<br>Note: " + escapeHtml(item.getNotes()) : "")
 				+ "</html>");
@@ -1712,6 +1782,18 @@ public class DashboardPanel extends JPanel
 						menu.add(outOfSet);
 					}
 
+					// Listings follow what you hold. This stops one doing so - for gear in
+					// your house or a bag, or when you only mean to lend some of it.
+					boolean keeping = plugin.isKeepAmount(item.getItemId());
+					JMenuItem keep = new JMenuItem(keeping ? "Follow my bank again"
+						: "Keep this amount (don't follow my bank)");
+					keep.addActionListener(e ->
+					{
+						plugin.setKeepAmount(item.getItemId(), !keeping);
+						refresh();
+					});
+					menu.add(keep);
+
 					JMenuItem removeItem = new JMenuItem("Remove from Marketplace");
 					removeItem.addActionListener(e -> removeFromMarketplace());
 					menu.add(removeItem);
@@ -1732,8 +1814,11 @@ public class DashboardPanel extends JPanel
 						List<LendingEntry> pieces = new java.util.ArrayList<>();
 						for (LendingEntry o : dataService.getOfferingsByOwner(groupId, item.getLender()))
 						{
-							if (item.getSetId().equals(o.getSetId())) pieces.add(o);
+							// Only what this player can actually see on the board.
+							LendingEntry onBoard = item.getSetId().equals(o.getSetId()) ? asAvailableNow(o) : null;
+							if (onBoard != null) pieces.add(onBoard);
 						}
+						if (pieces.isEmpty()) return;
 						showBorrowRequestDialog(item.getLender(), pieces, item.getSetName());
 					});
 					menu.add(whole);
@@ -1758,9 +1843,13 @@ public class DashboardPanel extends JPanel
 			gbc.gridx = 0; gbc.gridy = 0; p.add(new JLabel("Item:"), gbc);
 			gbc.gridx = 1; p.add(new JLabel(item.getItem()), gbc);
 			gbc.gridx = 0; gbc.gridy = 1; p.add(new JLabel("Quantity:"), gbc);
-			gbc.gridx = 1; JTextField qtyField = new JTextField(String.valueOf(item.getQuantity()), 10); p.add(qtyField, gbc);
+			// What the listing shows - or, for one hidden because none is held, what
+			// was listed, so notes and collateral can be edited without un-hiding it.
+			final int q0 = item.heldNone() ? item.getQuantity() : item.shownQuantity();
+			final long v0 = item.heldNone() ? item.getValue() : item.shownValue();
+			gbc.gridx = 1; JTextField qtyField = new JTextField(String.valueOf(q0), 10); p.add(qtyField, gbc);
 			gbc.gridx = 0; gbc.gridy = 2; p.add(new JLabel("Value (GP):"), gbc);
-			gbc.gridx = 1; JTextField valueField = new JTextField(String.valueOf(item.getValue()), 10); p.add(valueField, gbc);
+			gbc.gridx = 1; JTextField valueField = new JTextField(String.valueOf(v0), 10); p.add(valueField, gbc);
 			gbc.gridx = 0; gbc.gridy = 3; p.add(new JLabel("Collateral:"), gbc);
 			gbc.gridx = 1; JTextField collateralField = new JTextField(
 				item.getCollateralValue() != null ? String.valueOf(item.getCollateralValue()) : "0", 10); p.add(collateralField, gbc);
@@ -1776,12 +1865,34 @@ public class DashboardPanel extends JPanel
 					long newValue = Long.parseLong(valueField.getText().trim());
 					int newCollateral = Integer.parseInt(collateralField.getText().trim());
 					if (newQty <= 0) { JOptionPane.showMessageDialog(DashboardPanel.this, "Quantity must be > 0.", "Error", JOptionPane.ERROR_MESSAGE); return; }
-					item.setQuantity(newQty);
-					item.setValue(newValue);
+					// Changing the number means the owner wants that number, so the
+					// listing keeps it rather than following their bank. Leaving it
+					// alone keeps it following - or hidden, if none is held.
+					boolean qtyChanged = newQty != q0;
+					boolean valueChanged = newValue != v0;
+					if (qtyChanged)
+					{
+						item.setValue(valueChanged ? newValue : (q0 > 0 ? v0 * newQty / q0 : v0));
+						item.setQuantity(newQty);
+						item.setHeldQty(null);
+					}
+					else if (valueChanged)
+					{
+						// Entered for the number shown; stored for the number typed.
+						item.setValue(item.getHeldQty() != null && q0 > 0 ? newValue * item.getQuantity() / q0 : newValue);
+					}
+					boolean newlyKept = qtyChanged && !plugin.isKeepAmount(item.getItemId());
 					item.setCollateralValue(newCollateral);
 					item.setCollateralType(newCollateral > 0 ? "GP" : "none");
 					item.setNotes(notesField.getText().trim());
 					dataService.updateAvailable(groupId, item.getLender(), item.getItem(), item.getItemId(), item);
+					if (newlyKept)
+					{
+						plugin.setKeepAmount(item.getItemId(), true, false);
+						JOptionPane.showMessageDialog(DashboardPanel.this, "This listing now stays at " + newQty
+							+ " instead of following your bank.\nRight-click it and pick Follow my bank again to undo.",
+							"Amount Kept", JOptionPane.INFORMATION_MESSAGE);
+					}
 					refresh();
 				}
 				catch (NumberFormatException ex)
@@ -1804,8 +1915,10 @@ public class DashboardPanel extends JPanel
 			{
 				dataService.removeAvailable(groupId, item.getLender(), item.getItem(), item.getItemId());
 				dataService.removeOffering(groupId, item.getLender(), item.getItem(), item.getItemId());
-				// Taken down on purpose, so it should not rejoin its set if relisted.
+				// Taken down on purpose, so it should not rejoin its set if relisted -
+				// nor keep a fixed number if listed again.
 				dataService.forgetSetMembership(groupId, item.getLender(), item.getItemId());
+				plugin.forgetKeepAmount(item.getLender(), item.getItemId());
 				// No reload: removeAvailable has already changed memory and saved it,
 				// so re-reading config would only race the worn-state writer for
 				// nothing. See DataService.ensureHydrated.
@@ -2021,6 +2134,44 @@ public class DashboardPanel extends JPanel
 				menu.add(forgive);
 			}
 
+			// More time. The keeper moves the date and the other side asks. When the
+			// other side isn't on the group's member list there's nobody to ask or
+			// to answer, so the keeper just sets it - a request nobody can answer
+			// would only sit there.
+			com.guess34.lendingtracker.model.LendingGroup loanGroup =
+				groupId != null ? groupService.getGroup(groupId) : null;
+			if ((iAmLender || iAmBorrower) && loanGroup != null && DataService.hasDueDate(loan))
+			{
+				boolean iKeep = me.equalsIgnoreCase(DataService.keeperOf(loan));
+				String other = iAmLender ? loan.getBorrower() : loan.getLender();
+				boolean otherInGroup = other != null && loanGroup.hasMember(other);
+				if (iKeep && (iAmLender || !otherInGroup))
+				{
+					JMenuItem more = new JMenuItem(iAmLender ? "Give more time…" : "Set a new due date…");
+					more.addActionListener(e -> giveMoreTime(loan));
+					menu.add(more);
+				}
+				else if (iAmBorrower && otherInGroup && loan.getLendTime() > 0)
+				{
+					LendingRequest pendingStep = dataService.getPendingExtension(groupId, loan.getId());
+					if (pendingStep != null)
+					{
+						boolean onMe = me.equalsIgnoreCase(DataService.extensionAnswerer(pendingStep, loan));
+						JMenuItem waiting = new JMenuItem(onMe
+							? loan.getLender() + " offered a new date — answer it under Requests"
+							: "More time asked for — awaiting an answer");
+						waiting.setEnabled(false);
+						menu.add(waiting);
+					}
+					else
+					{
+						JMenuItem ask = new JMenuItem("Ask for more time…");
+						ask.addActionListener(e -> askExtension(loan));
+						menu.add(ask);
+					}
+				}
+			}
+
 			// Any party to the loan can propose removal. Routing is decided by the
 			// plugin: the counterparty approves when they're a group member (first
 			// course of action, even if offline); staff review only when the
@@ -2041,6 +2192,37 @@ public class DashboardPanel extends JPanel
 					final boolean escalate = canEscalate;
 					remove.addActionListener(e -> proposeRemoval(loan, escalate));
 					menu.add(remove);
+				}
+			}
+
+			// An owner or co-owner can ask the lender to clear a stale loan that
+			// isn't theirs. The lender has to approve it - it's their item.
+			if (!iAmLender && !iAmBorrower && groupId != null && !loan.isKeptByBorrower()
+				&& loan.getLender() != null
+				&& (groupService.isOwner(groupId, me) || groupService.isCoOwner(groupId, me)))
+			{
+				com.guess34.lendingtracker.model.LendingGroup ownGroup = groupService.getGroup(groupId);
+				if (ownGroup != null && ownGroup.hasMember(loan.getLender()))
+				{
+					if (DataService.hasCollateral(loan))
+					{
+						JMenuItem held = new JMenuItem("Holds collateral — " + loan.getLender() + " and "
+							+ loan.getBorrower() + " must agree");
+						held.setEnabled(false);
+						menu.add(held);
+					}
+					else if (dataService.hasPendingRemovalFor(groupId, loan.getId()))
+					{
+						JMenuItem pending = new JMenuItem("Removal asked for — waiting on " + loan.getLender());
+						pending.setEnabled(false);
+						menu.add(pending);
+					}
+					else
+					{
+						JMenuItem clear = new JMenuItem("Ask " + loan.getLender() + " to remove this loan…");
+						clear.addActionListener(e -> askLenderToRemove(loan));
+						menu.add(clear);
+					}
 				}
 			}
 
@@ -2865,6 +3047,11 @@ public class DashboardPanel extends JPanel
 		// An edit goes out as a fresh post. The request merge only carries the
 		// STATUS forward for a row a peer already holds, so edited text would
 		// never reach anyone who had seen the original.
+		// Never cancel the old post for one that can't be read back.
+		if (LookingForRequest.parse(requestId, requestData) == null)
+		{
+			return;
+		}
 		boolean exists = dataService.getLookingForPosts(groupId).stream()
 			.anyMatch(r -> requestId.equals(r.getId()));
 		String id = requestId;
@@ -2874,6 +3061,50 @@ public class DashboardPanel extends JPanel
 			id = java.util.UUID.randomUUID().toString();
 		}
 		publishLookingFor(groupId, id, requestData);
+		postLookingForToDiscord(groupId, id, requestData, exists);
+	}
+
+	/**
+	 * Tell the group's Discord about a Looking For: the items, and who in the
+	 * group already has some of them listed - they're tagged if they chose to be.
+	 * Only for posts made here and now, never for old ones being moved over.
+	 */
+	private void postLookingForToDiscord(String groupId, String id, String requestData, boolean edited)
+	{
+		LookingForRequest parsed = LookingForRequest.parse(id, requestData);
+		if (parsed == null)
+		{
+			return;
+		}
+		List<Object[]> wanted = new java.util.ArrayList<>();
+		for (LookingForItem it : parsed.items)
+		{
+			wanted.add(new Object[] { it.quantity, it.itemName, it.itemId });
+		}
+		if (wanted.isEmpty() && parsed.itemName != null)
+		{
+			wanted.add(new Object[] { Math.max(1, parsed.quantity), parsed.itemName, 0 });
+		}
+		com.guess34.lendingtracker.model.LendingGroup group = groupService.getGroup(groupId);
+		java.util.Map<String, List<String>> listedBy = new java.util.LinkedHashMap<>();
+		for (LendingEntry e : dataService.getAvailable(groupId))
+		{
+			String owner = e.getLender();
+			// The same rule the panel's own "Listed by" line uses: someone offline who
+			// logged out wearing it still has it listed.
+			if (owner == null || owner.equalsIgnoreCase(parsed.requesterName) || asAvailableNow(e) == null
+				|| (group != null && !group.hasMember(owner)) || !parsed.wants(e))
+			{
+				continue;
+			}
+			List<String> theirs = listedBy.computeIfAbsent(owner, k -> new java.util.ArrayList<>());
+			if (!theirs.contains(e.getItem()))
+			{
+				theirs.add(e.getItem());
+			}
+		}
+		plugin.getDiscordWebhook().postLookingFor(groupId, parsed.requesterName, id, wanted, parsed.notes,
+			listedBy, edited);
 	}
 
 	private void publishLookingFor(String groupId, String id, String requestData)
@@ -2930,13 +3161,19 @@ public class DashboardPanel extends JPanel
 			setMaximumSize(new Dimension(Integer.MAX_VALUE, 65));
 			setPreferredSize(new Dimension(200, 60));
 
+			LendingEntry extLoan = request.isExtension() ? dataService.getActiveEntry(request.getEntryId()) : null;
 			String title;
-			if (request.isRemoval())
+			if (extLoan != null)
+			{
+				title = extensionTitle(request, extLoan, incoming);
+			}
+			else if (request.isRemoval())
 			{
 				if (incoming)
 				{
 					title = request.isStaffRemoval()
 						? "STAFF REVIEW: " + request.getFrom() + " asks to remove loan"
+						: fromOutsideLoan(request) ? request.getFrom() + " (staff) asks to remove your loan of"
 						: request.getFrom() + " asks to remove the loan of";
 				}
 				else
@@ -2970,7 +3207,8 @@ public class DashboardPanel extends JPanel
 
 			JLabel itemLabel = new JLabel(request.getItemName()
 				+ (request.getQuantity() > 1 ? " x" + request.getQuantity() : "")
-				+ (request.isRemoval() ? "" : "  • " + request.getDurationDays() + " days"));
+				+ (extLoan != null ? "  • until " + DataService.dueText(request.proposedDueTime(extLoan.getLendTime()))
+					: request.isRemoval() ? "" : "  • " + request.getDurationDays() + " days"));
 			itemLabel.setFont(FontManager.getRunescapeBoldFont());
 			itemLabel.setForeground(Color.WHITE);
 			detailsPanel.add(itemLabel);
@@ -2993,7 +3231,11 @@ public class DashboardPanel extends JPanel
 		private JPopupMenu createRequestPopupMenu()
 		{
 			JPopupMenu menu = new JPopupMenu();
-			if (incoming)
+			if (incoming && request.isExtension())
+			{
+				addExtensionAnswers(menu, request);
+			}
+			else if (incoming)
 			{
 				JMenuItem acceptItem = new JMenuItem("Accept");
 				acceptItem.addActionListener(e -> acceptRequest(request));
@@ -3079,6 +3321,18 @@ public class DashboardPanel extends JPanel
 		String lender = request.isBorrowRequest() ? me : request.getFrom();
 		String borrower = request.isBorrowRequest() ? request.getFrom() : me;
 		int quantity = Math.max(1, request.getQuantity());
+		// Never more than the listing shows now: a request made against a bigger
+		// number, or from an older version, can't promise items no longer held.
+		if (request.isBorrowRequest() && request.getItemId() > 0)
+		{
+			for (LendingEntry o : dataService.getOfferingsByOwner(groupId, me))
+			{
+				if (o.getItemId() == request.getItemId() && o.shownQuantity() > 0 && o.shownQuantity() < quantity)
+				{
+					quantity = o.shownQuantity();
+				}
+			}
+		}
 
 		String summary = String.format("%s\nLender: %s\nBorrower: %s\nDuration: %d days\n\nRecord this loan?",
 			request.getItemName() + (quantity > 1 ? " x" + quantity : ""),
@@ -3124,10 +3378,21 @@ public class DashboardPanel extends JPanel
 				if (offering.getItemId() == request.getItemId())
 				{
 					String ownerKey = offering.getLender() != null ? offering.getLender() : me;
-					if (offering.getQuantity() > quantity)
+					// A listing following the bank shows what's held. These are still
+					// here until the hand-over trade, and come off it when they leave.
+					if (!plugin.isKeepAmount(offering.getItemId()))
+					{
+						break;
+					}
+					// A kept listing has a fixed number: take the loan off it, or take it
+					// down when that's all of them.
+					int have = offering.shownQuantity();
+					if (have > quantity)
 					{
 						LendingEntry updated = new LendingEntry(offering);
-						updated.setQuantity(offering.getQuantity() - quantity);
+						updated.setQuantity(have - quantity);
+						updated.setValue(have > 0 ? offering.shownValue() * (have - quantity) / have : 0);
+						updated.setHeldQty(null);
 						dataService.updateAvailable(groupId, ownerKey, offering.getItem(), offering.getItemId(), updated);
 					}
 					else
@@ -3139,6 +3404,370 @@ public class DashboardPanel extends JPanel
 			}
 		}
 
+		refresh();
+	}
+
+	/** A removal request from someone who is neither the lender nor the borrower - staff. */
+	private boolean fromOutsideLoan(LendingRequest r)
+	{
+		LendingEntry loan = dataService.getActiveEntry(r.getEntryId());
+		return loan != null && r.getFrom() != null
+			&& !r.getFrom().equalsIgnoreCase(loan.getLender()) && !r.getFrom().equalsIgnoreCase(loan.getBorrower());
+	}
+
+	/** Staff ask the lender to take a stale loan off the board. */
+	private void askLenderToRemove(LendingEntry loan)
+	{
+		String reason = (String) JOptionPane.showInputDialog(this,
+			"Ask " + loan.getLender() + " to take this loan off the board?\n"
+				+ loan.getItemName() + " lent to " + loan.getBorrower() + ".\n"
+				+ "Nothing is removed until " + loan.getLender() + " approves it.\n\n"
+				+ "Why? (e.g. \"The borrower left the clan\")",
+			"Remove Stale Loan", JOptionPane.QUESTION_MESSAGE, null, null, "");
+		if (reason == null)
+		{
+			return;
+		}
+		if (plugin.requestStaleLoanRemoval(loan, reason.trim()))
+		{
+			JOptionPane.showMessageDialog(this, "Sent to " + loan.getLender() + ". The loan comes off once they"
+				+ " approve it - they'll see it even if they're offline right now.",
+				"Sent", JOptionPane.INFORMATION_MESSAGE);
+		}
+		else
+		{
+			JOptionPane.showMessageDialog(this, "Couldn't send that - a removal may already be waiting,"
+				+ " or the lender has left the group.", "Not Sent", JOptionPane.ERROR_MESSAGE);
+		}
+		refresh();
+	}
+
+	// --- More time on a loan ---
+
+	/** First line of a more-time request card. */
+	private static String extensionTitle(LendingRequest r, LendingEntry loan, boolean incoming)
+	{
+		if (incoming)
+		{
+			switch (r.getType())
+			{
+				case LendingRequest.TYPE_EXTEND_ASK:
+					return r.getFrom() + " asks for more time";
+				case LendingRequest.TYPE_EXTEND_COUNTER:
+					return r.getFrom() + " offers more time";
+				case LendingRequest.TYPE_EXTEND_REPLY:
+					return r.getFrom() + " asks for a later date";
+				default:
+					return r.getFrom() + "'s final offer";
+			}
+		}
+		String other = DataService.extensionAnswerer(r, loan);
+		return r.isBorrowerExtensionStep() ? "You asked " + other + " for more time" : "You offered " + other + " more time";
+	}
+
+	/** The answers a more-time step allows, by step. */
+	private void addExtensionAnswers(JPopupMenu menu, LendingRequest request)
+	{
+		JMenuItem accept = new JMenuItem("Accept");
+		accept.addActionListener(e -> acceptExtension(request));
+		menu.add(accept);
+
+		String next = request.nextExtensionStep();
+		if (next != null)
+		{
+			String label = LendingRequest.TYPE_EXTEND_REPLY.equals(request.getType()) ? "Make a final offer…"
+				: LendingRequest.TYPE_EXTEND_COUNTER.equals(request.getType()) ? "Ask for a different date…"
+				: "Offer a different date…";
+			JMenuItem counter = new JMenuItem(label);
+			counter.addActionListener(e -> counterExtension(request, next));
+			menu.add(counter);
+		}
+
+		JMenuItem decline = new JMenuItem(request.isBorrowerExtensionStep()
+			? "Decline" : "Decline - I'll return it on time");
+		decline.addActionListener(e -> declineExtension(request));
+		menu.add(decline);
+	}
+
+	/**
+	 * Ask for a later due date: a number of extra days, counted from the current
+	 * due date, or from now if the loan is already overdue. Returns the chosen
+	 * time, 0 for "no due date", or null if cancelled.
+	 *
+	 * @param viaRequest the date goes into a request, which carries whole days
+	 *                   from the loan's start - show that date, not a near miss
+	 * @param messageOut if not null, a message box is shown and its text added here
+	 */
+	private Long pickNewDue(LendingEntry loan, String title, String intro, boolean allowNoLimit,
+		boolean viaRequest, StringBuilder messageOut)
+	{
+		final long base = Math.max(System.currentTimeMillis(), loan.getDueTime());
+		JPanel panel = new JPanel();
+		panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+		JLabel introLabel = new JLabel("<html><div style='width:220px'>" + intro
+			+ "<br><br>Due now: " + DataService.dueText(loan.getDueTime()) + "</div></html>");
+		introLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(introLabel);
+
+		final JSpinner days = new JSpinner(new SpinnerNumberModel(7, 1, 365, 1));
+		JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 6));
+		row.setAlignmentX(Component.LEFT_ALIGNMENT);
+		row.add(new JLabel("Extra days: "));
+		row.add(days);
+		panel.add(row);
+
+		final JCheckBox noLimit = new JCheckBox("No due date at all");
+		noLimit.setAlignmentX(Component.LEFT_ALIGNMENT);
+		if (allowNoLimit)
+		{
+			panel.add(noLimit);
+		}
+
+		final JLabel preview = new JLabel();
+		preview.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(preview);
+		Runnable update = () ->
+		{
+			long target = base + ((Integer) days.getValue()) * 86400000L;
+			if (viaRequest)
+			{
+				target = LendingTrackerPlugin.requestableDue(loan, target);
+			}
+			preview.setText("New due date: " + (noLimit.isSelected() ? "none" : DataService.dueText(target)));
+			days.setEnabled(!noLimit.isSelected());
+		};
+		days.addChangeListener(e -> update.run());
+		noLimit.addActionListener(e -> update.run());
+		update.run();
+
+		final JTextField note = messageOut != null ? new JTextField(20) : null;
+		if (note != null)
+		{
+			JLabel noteLabel = new JLabel("Message (optional):");
+			noteLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+			note.setAlignmentX(Component.LEFT_ALIGNMENT);
+			panel.add(Box.createVerticalStrut(6));
+			panel.add(noteLabel);
+			panel.add(note);
+		}
+
+		if (JOptionPane.showConfirmDialog(this, panel, title, JOptionPane.OK_CANCEL_OPTION,
+			JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION)
+		{
+			return null;
+		}
+		if (note != null)
+		{
+			messageOut.append(note.getText().trim());
+		}
+		if (allowNoLimit && noLimit.isSelected())
+		{
+			return 0L;
+		}
+		long target = base + ((Integer) days.getValue()) * 86400000L;
+		return viaRequest ? LendingTrackerPlugin.requestableDue(loan, target) : target;
+	}
+
+	/** The keeper moves the due date later straight away. */
+	private void giveMoreTime(LendingEntry loan)
+	{
+		boolean asLender = getCurrentPlayerName().equalsIgnoreCase(loan.getLender());
+		String intro = asLender
+			? "Give " + loan.getBorrower() + " longer with " + loan.getItemName() + "."
+			: loan.getLender() + " isn't in the group, so you keep this loan's record. Set the new due date"
+				+ " you agreed with them - the group's Discord will show that you set it.";
+		// On the same whole-day grid as requests, so "+7 days" here covers an ask for
+		// 7 more days to the millisecond, and settles it.
+		Long target = pickNewDue(loan, asLender ? "Give More Time" : "Set a New Due Date", intro,
+			asLender, loan.getLendTime() > 0, null);
+		if (target == null)
+		{
+			return;
+		}
+		if (!plugin.extendLoanNow(loan, target))
+		{
+			JOptionPane.showMessageDialog(this,
+				"The due date didn't change - the loan may have closed, or already be due later than that.",
+				"Not Changed", JOptionPane.INFORMATION_MESSAGE);
+		}
+		refresh();
+	}
+
+	/** The borrower asks the lender to let them keep it longer. */
+	private void askExtension(LendingEntry loan)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		if (groupId == null)
+		{
+			return;
+		}
+		StringBuilder message = new StringBuilder();
+		Long target = pickNewDue(loan, "Ask for More Time",
+			"Ask " + loan.getLender() + " to let you keep " + loan.getItemName() + " longer.",
+			false, true, message);
+		if (target == null)
+		{
+			return;
+		}
+		if (dataService.getPendingExtension(groupId, loan.getId()) != null)
+		{
+			JOptionPane.showMessageDialog(this, "You've already asked - wait for " + loan.getLender() + "'s answer.",
+				"Already Asked", JOptionPane.INFORMATION_MESSAGE);
+			return;
+		}
+		if (plugin.sendExtensionStep(loan, LendingRequest.TYPE_EXTEND_ASK, target, message.toString()) == null)
+		{
+			JOptionPane.showMessageDialog(this, "Couldn't send that - check you're logged in with the group open.",
+				"Not Sent", JOptionPane.ERROR_MESSAGE);
+			return;
+		}
+		JOptionPane.showMessageDialog(this,
+			"Asked. " + loan.getLender() + " will see it in their panel, even if they're offline right now.\n"
+				+ "If they haven't updated the plugin yet, they'll see it once they do.",
+			"More Time Asked For", JOptionPane.INFORMATION_MESSAGE);
+		refresh();
+	}
+
+	/** Say yes to the date this step proposes. */
+	private void acceptExtension(LendingRequest request)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		LendingEntry loan = dataService.getActiveEntry(request.getEntryId());
+		if (groupId == null || loan == null)
+		{
+			JOptionPane.showMessageDialog(this, "That loan is closed.", "More Time", JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+		long proposed = request.proposedDueTime(loan.getLendTime());
+		if (!DataService.hasDueDate(loan) || proposed <= loan.getDueTime())
+		{
+			// Already given at least this much (more time was given directly, or the
+			// limit lifted) - so this is settled as a yes, quietly.
+			boolean done = dataService.resolvePendingRequest(groupId, request.getId(), LendingRequest.STATUS_ACCEPTED);
+			JOptionPane.showMessageDialog(this, done
+				? "It's already due " + DataService.dueText(loan.getDueTime()) + " - at least that long - so this is settled."
+				: "This request has already been handled.", "More Time", JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+		if (proposed <= System.currentTimeMillis())
+		{
+			JOptionPane.showMessageDialog(this, "That date (" + DataService.dueText(proposed) + ") has already passed."
+				+ "\nOffer a different date, or decline.", "More Time", JOptionPane.INFORMATION_MESSAGE);
+			return;
+		}
+		if (JOptionPane.showConfirmDialog(this, "Agree to a new due date for " + loan.getItemName() + "?\n"
+				+ loan.getBorrower() + " keeps it until " + DataService.dueText(proposed) + ".",
+			"Accept More Time", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION)
+		{
+			return;
+		}
+		if (!dataService.resolvePendingRequest(groupId, request.getId(), LendingRequest.STATUS_ACCEPTED))
+		{
+			JOptionPane.showMessageDialog(this, "This request has already been handled.", "Already Handled",
+				JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+		String keeper = DataService.keeperOf(loan);
+		if (getCurrentPlayerName().equalsIgnoreCase(keeper))
+		{
+			plugin.applyAgreedExtensions();
+		}
+		else
+		{
+			JOptionPane.showMessageDialog(this, "Agreed. The due date moves when " + keeper
+				+ "'s plugin next syncs - they keep this loan's record.", "Agreed", JOptionPane.INFORMATION_MESSAGE);
+		}
+		refresh();
+	}
+
+	/** Answer with a different date: a new step goes back the other way. */
+	private void counterExtension(LendingRequest request, String nextType)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		LendingEntry loan = dataService.getActiveEntry(request.getEntryId());
+		if (groupId == null || loan == null || !DataService.hasDueDate(loan))
+		{
+			JOptionPane.showMessageDialog(this, "That loan is closed, or has no due date any more.",
+				"More Time", JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+		boolean finalOffer = LendingRequest.TYPE_EXTEND_FINAL.equals(nextType);
+		StringBuilder message = new StringBuilder();
+		Long target = pickNewDue(loan, finalOffer ? "Final Offer" : "Different Date",
+			request.getFrom() + (request.isBorrowerExtensionStep() ? " asked to keep " : " offered you ")
+				+ loan.getItemName() + " until "
+				+ DataService.dueText(request.proposedDueTime(loan.getLendTime())) + "."
+				+ (finalOffer ? " This is your last offer - they accept it or return it on time." : ""),
+			false, true, message);
+		if (target == null)
+		{
+			return;
+		}
+		if (target <= loan.getDueTime())
+		{
+			JOptionPane.showMessageDialog(this, "That isn't later than it's due now.", "More Time",
+				JOptionPane.INFORMATION_MESSAGE);
+			return;
+		}
+		LendingRequest current = dataService.getRequests(groupId).stream()
+			.filter(r -> request.getId().equals(r.getId())).findFirst().orElse(null);
+		if (current == null || !current.isPending())
+		{
+			JOptionPane.showMessageDialog(this, "This request has already been handled.", "Already Handled",
+				JOptionPane.INFORMATION_MESSAGE);
+			refresh();
+			return;
+		}
+		// The counter goes out BEFORE the step it answers is marked declined, so
+		// nobody ever sees the "no" without the counter and takes it for a refusal.
+		LendingRequest sent = plugin.sendExtensionStep(loan, nextType, target, message.toString());
+		if (sent == null)
+		{
+			JOptionPane.showMessageDialog(this, "Couldn't send that - check you're logged in with the group open.",
+				"Not Sent", JOptionPane.ERROR_MESSAGE);
+			return;
+		}
+		if (!dataService.resolvePendingRequest(groupId, request.getId(), LendingRequest.STATUS_DECLINED))
+		{
+			dataService.resolvePendingRequest(groupId, sent.getId(), LendingRequest.STATUS_CANCELLED);
+			JOptionPane.showMessageDialog(this, "This request has already been handled.", "Already Handled",
+				JOptionPane.INFORMATION_MESSAGE);
+		}
+		refresh();
+	}
+
+	/** Say no: the loan stays due when it was. */
+	private void declineExtension(LendingRequest request)
+	{
+		String groupId = groupService.getCurrentGroupIdUnchecked();
+		LendingEntry loan = dataService.getActiveEntry(request.getEntryId());
+		if (groupId == null || loan == null)
+		{
+			refresh();
+			return;
+		}
+		String question = request.isBorrowerExtensionStep()
+			? "Say no to more time? " + loan.getItemName() + " stays due " + DataService.dueText(loan.getDueTime()) + "."
+			: "Turn down this offer? You'll need to return " + loan.getItemName() + " by "
+				+ DataService.dueText(loan.getDueTime()) + ".";
+		if (JOptionPane.showConfirmDialog(this, question, "Decline", JOptionPane.YES_NO_OPTION)
+			!= JOptionPane.YES_OPTION)
+		{
+			return;
+		}
+		if (!dataService.resolvePendingRequest(groupId, request.getId(), LendingRequest.STATUS_DECLINED))
+		{
+			JOptionPane.showMessageDialog(this, "This request has already been handled.", "Already Handled",
+				JOptionPane.INFORMATION_MESSAGE);
+		}
+		else
+		{
+			plugin.applyAgreedExtensions();
+		}
 		refresh();
 	}
 
@@ -3604,7 +4233,7 @@ public class DashboardPanel extends JPanel
 								.append(":").append(it.quantity).append(":").append(it.value);
 						}
 						String requestData = String.format("%s|%s|%d|%d|%s|%s",
-							request.requesterName, newItemName, newQty, newDuration,
+							request.requesterName, newItemName.replace("|", "/"), newQty, newDuration,
 							newNotes.replace("|", "/"), itemsStr);
 						saveLookingForRequest(groupId, request.id, requestData);
 						refresh();

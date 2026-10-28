@@ -76,7 +76,9 @@ public class DiscordWebhook
 		OVERDUE("Overdue", 0xFEE75C, "\u23F0"),
 		FORGIVEN("Forgiven", 0x99AAB5, "\uD83E\uDD1D"),
 		PARTIAL("Incomplete return", 0xF0A020, "\u26A0"),
-		REMOVED("Removed", 0x99AAB5, "\uD83D\uDDD1");
+		REMOVED("Removed", 0x99AAB5, "\uD83D\uDDD1"),
+		EXTENDED("Due date extended", 0x1ABC9C, "\uD83D\uDCC5"),
+		EXTENSION_REFUSED("More time refused", 0xE67E22, "\u23F3");
 
 		private final String label;
 		private final int color;
@@ -149,6 +151,167 @@ public class DiscordWebhook
 		boolean discord = host.equals("discord.com") || host.equals("discordapp.com")
 			|| host.equals("ptb.discord.com") || host.equals("canary.discord.com");
 		return discord && parsed.encodedPath().startsWith("/api/webhooks/");
+	}
+
+	/** What an extension post says that the loan row alone can't. */
+	public static final class ExtensionNote
+	{
+		// Who moved the date, or who said no:
+		public static final String LENDER = "LENDER";                     // the lender gave more time
+		public static final String AGREED = "AGREED";                     // asked for, and agreed
+		public static final String BORROWER_KEEPER = "BORROWER_KEEPER";   // set by a borrower who keeps the loan
+		public static final String LENDER_SAID_NO = "LENDER_SAID_NO";
+		public static final String BORROWER_SAID_NO = "BORROWER_SAID_NO";
+
+		final long oldDue;
+		final long newDue;
+		final String how;
+		final long madeAt = System.currentTimeMillis();
+
+		public ExtensionNote(long oldDue, long newDue, String how)
+		{
+			this.oldDue = oldDue;
+			this.newDue = newDue;
+			this.how = how;
+		}
+	}
+
+	// Handed from postExtension to the post builder, which runs later on another
+	// thread. Keyed by the very loan object the post carries - every extension
+	// post is given its own copy - so two posts for one loan in flight together
+	// can never take each other's note.
+	private final java.util.Map<LendingEntry, ExtensionNote> extensionNotes =
+		java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
+
+	/**
+	 * Post a due date moving later, or a request for more time being turned down.
+	 *
+	 * @param loan       a copy made for this post alone; the note is matched to it
+	 * @param occurrence keeps two of these for one loan apart - the new due date,
+	 *                   or the request that was refused
+	 */
+	public void postExtension(Event event, LendingEntry loan, String reporter, String occurrence, ExtensionNote note)
+	{
+		if (loan == null || loan.getId() == null)
+		{
+			return;
+		}
+		synchronized (extensionNotes)
+		{
+			// Notes for posts that never got built - posting off, the scope said
+			// no, already posted - go after ten minutes.
+			long now = System.currentTimeMillis();
+			extensionNotes.values().removeIf(n -> now - n.madeAt > 600_000L);
+			extensionNotes.put(loan, note);
+		}
+		postBatch(event, Collections.singletonList(loan), reporter, occurrence, null);
+	}
+
+	/**
+	 * Post a Looking For to the group's channel: who wants what, and who already
+	 * has some of it listed - tagged, if they chose to be. It isn't a loan, so the
+	 * loan rules don't apply: it goes from the poster's own client to their own
+	 * group's channel, once per post.
+	 *
+	 * @param wanted   one line per item: quantity, name and item id
+	 * @param listedBy owner -> what they have listed from the post
+	 * @param edited   an edit of an earlier post - shown as updated, and nobody is
+	 *                 tagged again for it
+	 */
+	public void postLookingFor(String groupId, String poster, String postId, List<Object[]> wanted,
+		String notes, java.util.Map<String, List<String>> listedBy, boolean edited)
+	{
+		if (groupId == null || poster == null || postId == null || wanted == null || wanted.isEmpty()
+			|| !config.webhookEnabled() || !config.webhookLookingFor())
+		{
+			return;
+		}
+		String url = groupService.getGroupWebhook(groupId);
+		if (url == null || !claim("lf:" + postId))
+		{
+			return;
+		}
+
+		StringBuilder items = new StringBuilder();
+		int shown = 0;
+		for (Object[] w : wanted)
+		{
+			if (shown++ >= MAX_LINES)
+			{
+				items.append("\n...and ").append(wanted.size() - MAX_LINES).append(" more");
+				break;
+			}
+			int qty = Math.max(1, (Integer) w[0]);
+			String name = md(String.valueOf(w[1])).replace("[", "(").replace("]", ")");
+			int itemId = (Integer) w[2];
+			items.append('\n').append(qty).append(" x ").append(itemId > 0
+				? "[" + name + "](https://oldschool.runescape.wiki/w/Special:Lookup?type=item&id=" + itemId + ")"
+				: name);
+		}
+
+		JsonObject embed = new JsonObject();
+		LendingGroup group = groupService.getGroup(groupId);
+		if (group != null && group.getName() != null)
+		{
+			JsonObject author = new JsonObject();
+			author.addProperty("name", safe(group.getName()));
+			embed.add("author", author);
+		}
+		embed.addProperty("title", "\uD83D\uDD0E Looking for" + (edited ? " (updated)" : ""));
+		String trimmed = notes != null ? notes.trim() : "";
+		if (trimmed.length() > 500)
+		{
+			trimmed = trimmed.substring(0, 500) + "...";
+		}
+		String note = !trimmed.isEmpty() ? "\n\n_" + md(trimmed) + "_" : "";
+		String description = "**" + md(poster) + "** is looking for:" + items + note;
+		// Discord refuses the whole post past 4096.
+		embed.addProperty("description", description.length() > 4096 ? description.substring(0, 4093) + "..." : description);
+		embed.addProperty("color", 0x9B59B6);
+		embed.addProperty("timestamp", Instant.now().toString());
+
+		JsonArray pingIds = new JsonArray();
+		StringBuilder content = new StringBuilder();
+		JsonArray fields = new JsonArray();
+		if (listedBy != null && !listedBy.isEmpty())
+		{
+			StringBuilder who = new StringBuilder();
+			for (java.util.Map.Entry<String, List<String>> e : listedBy.entrySet())
+			{
+				String line = md(e.getKey()) + " - " + md(String.join(", ", e.getValue()));
+				if (who.length() + line.length() + 1 > 1000)
+				{
+					who.append("\n...");
+					break;
+				}
+				who.append(who.length() > 0 ? "\n" : "").append(line);
+				String id = edited ? null : groupService.getMemberDiscordId(groupId, e.getKey());
+				if (id != null && !pingIds.contains(new com.google.gson.JsonPrimitive(id)))
+				{
+					pingIds.add(id);
+					content.append(content.length() > 0 ? " " : "").append("<@").append(id).append(">");
+				}
+			}
+			fields.add(field("Already listed by", who.toString(), false));
+		}
+		embed.add("fields", fields);
+		JsonObject footer = new JsonObject();
+		footer.addProperty("text", "Lending Tracker");
+		embed.add("footer", footer);
+
+		JsonObject body = new JsonObject();
+		if (content.length() > 0)
+		{
+			body.addProperty("content", content.toString());
+		}
+		JsonObject mentions = new JsonObject();
+		mentions.add("parse", new JsonArray());
+		mentions.add("users", pingIds);
+		body.add("allowed_mentions", mentions);
+		JsonArray embeds = new JsonArray();
+		embeds.add(embed);
+		body.add("embeds", embeds);
+		send(url.trim(), RequestBody.create(JSON, gson.toJson(body)));
 	}
 
 	/** Post this event if the webhook is on, the event type is wanted, and we are the client that should. */
@@ -448,7 +611,9 @@ public class DiscordWebhook
 			embed.add("author", author);
 		}
 		embed.addProperty("title", event.icon + " " + event.label);
-		embed.addProperty("description", lead(event, first) + "\n"
+		ExtensionNote note = (event == Event.EXTENDED || event == Event.EXTENSION_REFUSED) && first.getId() != null
+			? extensionNotes.remove(first) : null;
+		embed.addProperty("description", (note != null ? extensionLead(event, first, note) : lead(event, first)) + "\n"
 			+ (event == Event.PARTIAL ? missingList(fresh)
 				: event == Event.RETURNED ? returnedList(fresh, collateral)
 			: event == Event.OVERDUE ? overdueList(fresh)
@@ -476,6 +641,15 @@ public class DiscordWebhook
 			// "in 7 days" / "2 days ago", in each reader's own time zone. Can't sit
 			// inside a code box - Discord wouldn't render it there.
 			fields.add(field("Due", "<t:" + (first.getDueTime() / 1000) + ":R>", true));
+		}
+		if (event == Event.EXTENDED)
+		{
+			fields.add(field("Was due", dueStamp(note != null ? note.oldDue : 0, false), true));
+			fields.add(field("Now due", dueStamp(note != null ? note.newDue : first.getDueTime(), true), true));
+		}
+		else if (event == Event.EXTENSION_REFUSED)
+		{
+			fields.add(field("Due", dueStamp(first.getDueTime(), true), true));
 		}
 		embed.add("fields", fields);
 
@@ -646,6 +820,9 @@ public class DiscordWebhook
 				return config.webhookLoans();
 			case OVERDUE:
 				return config.webhookOverdue();
+			case EXTENDED:
+			case EXTENSION_REFUSED:
+				return config.webhookExtensions();
 			default:
 				return config.webhookReturns();
 		}
@@ -676,6 +853,44 @@ public class DiscordWebhook
 	}
 
 	/** The sentence above the item list. Names bolded, markdown in them escaped. */
+	/** The opening line of an extension post, which depends on who moved the date. */
+	private static String extensionLead(Event event, LendingEntry first, ExtensionNote note)
+	{
+		if (note == null || note.how == null)
+		{
+			return lead(event, first);
+		}
+		String lender = "**" + md(first.getLender()) + "**";
+		String borrower = "**" + md(first.getBorrower()) + "**";
+		switch (note.how)
+		{
+			case ExtensionNote.LENDER:
+				return lender + " gave " + borrower + " more time:";
+			case ExtensionNote.AGREED:
+				return lender + " and " + borrower + " agreed a new due date:";
+			case ExtensionNote.BORROWER_KEEPER:
+				return borrower + " set a new due date on their loan from " + lender + " - " + lender
+					+ " isn't in the group, so " + borrower + " keeps the record:";
+			case ExtensionNote.LENDER_SAID_NO:
+				return lender + " turned down " + borrower + "'s request for more time - it's due back as agreed:";
+			case ExtensionNote.BORROWER_SAID_NO:
+				return borrower + " turned down " + lender + "'s offer of a new date and will return it as agreed:";
+			default:
+				return lead(event, first);
+		}
+	}
+
+	/** A due date as Discord shows it, in each reader's own time zone. */
+	private static String dueStamp(long due, boolean withRelative)
+	{
+		if (due <= 0 || due >= Long.MAX_VALUE / 2)
+		{
+			return "`No limit`";
+		}
+		long s = due / 1000;
+		return "<t:" + s + ":f>" + (withRelative ? " (<t:" + s + ":R>)" : "");
+	}
+
 	private static String lead(Event event, LendingEntry first)
 	{
 		String lender = "**" + md(first.getLender()) + "**";
@@ -693,6 +908,10 @@ public class DiscordWebhook
 				return borrower + " returned part of the loan to " + lender + " - it stays open until everything is back.";
 			case FORGIVEN:
 				return lender + " forgave " + borrower + ":";
+			case EXTENDED:
+				return lender + " and " + borrower + " moved the due date:";
+			case EXTENSION_REFUSED:
+				return "No new due date for " + borrower + "'s loan from " + lender + ":";
 			default:
 				return "Loan between " + lender + " and " + borrower + " removed:";
 		}
