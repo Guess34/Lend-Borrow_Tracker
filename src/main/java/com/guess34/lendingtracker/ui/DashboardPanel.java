@@ -58,6 +58,8 @@ public class DashboardPanel extends JPanel
 	private static final int FOLD_OWNERS_ABOVE = 15;
 	private static final long END_GAME_VALUE = 10_000_000L;
 	private static final String FILTER_ALL = "All items";
+	// The most buttons the "Needs you" box shows; past it, one less and a button for the rest.
+	private static final int NEEDS_SHOWN = 4;
 	private static final String FILTER_MINE = "My listings";
 	private static final String FILTER_SETS = "Sets";
 	private static final String FILTER_END_GAME = "End game (10m+)";
@@ -75,6 +77,10 @@ public class DashboardPanel extends JPanel
 	private final java.util.Set<String> collapsedSections = new java.util.HashSet<>(
 		java.util.Arrays.asList("marketplace", "lookingfor", "loans")
 	);
+
+	// Set by a "Needs you" button whose section was folded: the row to open once
+	// the list is rebuilt with it showing.
+	private Need jumpTo;
 
 	public DashboardPanel(LendingTrackerPlugin plugin)
 	{
@@ -192,7 +198,9 @@ public class DashboardPanel extends JPanel
 
 		// Create loan list panel (scrollable)
 		// Wrapper panel with BorderLayout ensures items stack top-down
-		JPanel loanListWrapper = new JPanel(new BorderLayout());
+		// As wide as the visible area, never wider: one row wider than the panel
+		// would otherwise widen them all, pushing what sits on their right out of sight.
+		JPanel loanListWrapper = new WidthTrackingPanel();
 		loanListWrapper.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
 		loanListPanel = new JPanel();
@@ -241,6 +249,8 @@ public class DashboardPanel extends JPanel
 		header.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		header.setBorder(new EmptyBorder(8, 10, 5, 10));
 		header.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+		// Lets a "Needs you" line find this header to scroll to.
+		header.setName(sectionId);
 
 		String arrow = collapsed ? "\u25B6 " : "\u25BC "; // Right or Down triangle
 		JLabel label = new JLabel(arrow + title);
@@ -413,27 +423,39 @@ public class DashboardPanel extends JPanel
 			{
 				if (me.equalsIgnoreCase(item.getLender()) && !item.heldNone()) myBases.add(ItemVariationMapping.map(item.getItemId()));
 			}
-			int wantsMine = 0;
+			List<LookingForRequest> wantMine = new java.util.ArrayList<>();
 			for (LookingForRequest r : lookingForRequests)
 			{
 				r.listedBy = whoListed(r, displayItems);
 				r.wantsMine = !me.equalsIgnoreCase(r.requesterName) && r.wantsAny(myBases, displayItems, me);
-				if (r.wantsMine) wantsMine++;
+				if (r.wantsMine) wantMine.add(r);
 			}
 			if (!query.isEmpty())
 			{
-				lookingForRequests.removeIf(r -> !r.matches(query));
+				// Posts wanting this player's gear stay, as they do in the "Needs you" box,
+				// so its buttons always have their list to open.
+				lookingForRequests.removeIf(r -> !r.wantsMine && !r.matches(query));
 			}
 
-			long myOverdue = java.util.stream.Stream.concat(activeLoans.stream(), otherGroupLoans.stream())
+			// What needs this player's attention, before anything to browse: requests
+			// to answer, their overdue loans either way round, posts wanting their gear.
+			List<Need> needs = new java.util.ArrayList<>();
+			for (LendingRequest r : incomingRequests)
+			{
+				needs.add(requestNeed(r));
+			}
+			java.util.stream.Stream.concat(activeLoans.stream(), otherGroupLoans.stream())
 				.filter(LendingEntry::isOverdue)
 				.filter(e -> me.equalsIgnoreCase(e.getLender()) || me.equalsIgnoreCase(e.getBorrower()))
-				.count();
-
-			// What needs this player's attention, before anything to browse.
-			if (!incomingRequests.isEmpty() || myOverdue > 0 || wantsMine > 0)
+				.sorted(java.util.Comparator.comparingLong(LendingEntry::getDueTime))
+				.forEach(e -> needs.add(loanNeed(e, me, otherGroupLoans.contains(e))));
+			for (LookingForRequest r : wantMine)
 			{
-				loanListPanel.add(createNeedsYouStrip(incomingRequests.size(), myOverdue, wantsMine));
+				needs.add(wantNeed(r));
+			}
+			if (!needs.isEmpty())
+			{
+				loanListPanel.add(createNeedsYouStrip(needs));
 			}
 
 			if (!incomingRequests.isEmpty() || !outgoingRequests.isEmpty())
@@ -507,6 +529,7 @@ public class DashboardPanel extends JPanel
 						tag.setFont(FontManager.getRunescapeSmallFont());
 						tag.setForeground(Color.GRAY);
 						tag.setBorder(new EmptyBorder(2, 6, 0, 0));
+						fullWidthRow(tag);
 						loanListPanel.add(tag);
 						loanListPanel.add(new LoanCard(loan, true));
 					}
@@ -546,7 +569,97 @@ public class DashboardPanel extends JPanel
 
 			loanListPanel.revalidate();
 			loanListPanel.repaint();
+			Need jump = jumpTo;
+			jumpTo = null;
+			jumpToRow(jump);
 		});
+	}
+
+	/**
+	 * A "Needs you" button was clicked at a point on it. One with a menu opens it right
+	 * there. The rest show their row in the list: in place when it's there, otherwise
+	 * once its folded section is opened and the list rebuilt.
+	 */
+	private void openNeed(Need need, JComponent button, Point at)
+	{
+		JPopupMenu menu = need.getMenu() != null ? need.getMenu().get() : null;
+		if (menu != null)
+		{
+			menu.show(button, at.x, at.y);
+			return;
+		}
+		if (collapsedSections.remove(need.getSection()) || findRow(need.getRow()) == null)
+		{
+			jumpTo = need;
+			refresh();
+			return;
+		}
+		jumpToRow(need);
+	}
+
+	/**
+	 * Brings a "Needs you" button's row into view and outlines it for a moment. A
+	 * search can hide the row; its section's header is shown then.
+	 */
+	private void jumpToRow(Need need)
+	{
+		JViewport viewport = (JViewport) SwingUtilities.getAncestorOfClass(JViewport.class, loanListPanel);
+		if (need == null || viewport == null) return;
+		JComponent row = findRow(need.getRow());
+		if (row == null) row = findRow(need.getSection());
+		if (row == null) return;
+		// Rows only just rebuilt have no place until they're laid out.
+		viewport.getParent().validate();
+		row.scrollRectToVisible(new Rectangle(0, 0, row.getWidth(), row.getHeight()));
+		flash(row);
+	}
+
+	/** The list's row by its name: a section's id for its header, or "loan:", "request:", "lookingfor:" and an id. */
+	private JComponent findRow(String name)
+	{
+		for (Component row : loanListPanel.getComponents())
+		{
+			if (name.equals(row.getName()) && row instanceof JComponent) return (JComponent) row;
+		}
+		return null;
+	}
+
+	/** Outlines a row in red for a moment, so the eye lands on it. Its own border stays, so nothing moves. */
+	private static void flash(JComponent row)
+	{
+		if (row.getClientProperty("flashing") != null) return;
+		row.putClientProperty("flashing", Boolean.TRUE);
+		javax.swing.border.Border own = row.getBorder();
+		row.setBorder(new javax.swing.border.Border()
+		{
+			@Override
+			public void paintBorder(Component c, Graphics g, int x, int y, int width, int height)
+			{
+				if (own != null) own.paintBorder(c, g, x, y, width, height);
+				g.setColor(Color.RED);
+				g.drawRect(x, y, width - 1, height - 1);
+				g.drawRect(x + 1, y + 1, width - 3, height - 3);
+			}
+
+			@Override
+			public Insets getBorderInsets(Component c)
+			{
+				return own != null ? own.getBorderInsets(c) : new Insets(0, 0, 0, 0);
+			}
+
+			@Override
+			public boolean isBorderOpaque()
+			{
+				return false;
+			}
+		});
+		javax.swing.Timer done = new javax.swing.Timer(1500, e ->
+		{
+			row.setBorder(own);
+			row.putClientProperty("flashing", null);
+		});
+		done.setRepeats(false);
+		done.start();
 	}
 
 	// ---------------------------------------------------------------- marketplace
@@ -987,6 +1100,7 @@ public class DashboardPanel extends JPanel
 			none.setFont(FontManager.getRunescapeSmallFont());
 			none.setForeground(Color.GRAY);
 			none.setBorder(new EmptyBorder(4, 12, 6, 0));
+			fullWidthRow(none);
 			loanListPanel.add(none);
 			return;
 		}
@@ -1011,6 +1125,7 @@ public class DashboardPanel extends JPanel
 				more.setFont(FontManager.getRunescapeSmallFont());
 				more.setForeground(Color.GRAY);
 				more.setBorder(new EmptyBorder(4, 12, 6, 0));
+				fullWidthRow(more);
 				loanListPanel.add(more);
 			}
 			return;
@@ -1102,55 +1217,288 @@ public class DashboardPanel extends JPanel
 		return new java.util.ArrayList<>(owners);
 	}
 
-	private JPanel createNeedsYouStrip(int requests, long overdue, int wanted)
+	private JPanel createNeedsYouStrip(List<Need> needs)
 	{
 		JPanel strip = new JPanel();
 		strip.setLayout(new BoxLayout(strip, BoxLayout.Y_AXIS));
-		strip.setBackground(new Color(58, 46, 34));
+		// Red on purpose: an overdue loan or a waiting request shouldn't be missed.
+		strip.setBackground(new Color(48, 26, 26));
 		strip.setBorder(BorderFactory.createCompoundBorder(
-			BorderFactory.createMatteBorder(0, 3, 0, 0, ColorScheme.BRAND_ORANGE),
-			new EmptyBorder(6, 8, 6, 8)));
+			BorderFactory.createMatteBorder(1, 4, 1, 1, Color.RED),
+			new EmptyBorder(6, 8, 8, 8)));
 
 		JLabel title = new JLabel("Needs you");
 		title.setFont(FontManager.getRunescapeBoldFont());
-		title.setForeground(ColorScheme.BRAND_ORANGE);
+		title.setForeground(Color.RED);
 		strip.add(title);
 
-		if (requests > 0)
+		// Four at most, so the box never buries the lists; past that, three and a
+		// button for the rest, which opens the next one's list.
+		int width = needWordsWidth();
+		int shown = needs.size() > NEEDS_SHOWN ? NEEDS_SHOWN - 1 : needs.size();
+		for (int i = 0; i < shown; i++)
 		{
-			addNeedsYouLine(strip, requests + (requests == 1 ? " request is" : " requests are") + " waiting for you",
-				"requests");
+			strip.add(Box.createVerticalStrut(5));
+			strip.add(needButton(needs.get(i), width));
 		}
-		if (overdue > 0)
+		if (shown < needs.size())
 		{
-			addNeedsYouLine(strip, overdue + (overdue == 1 ? " loan is" : " loans are") + " overdue", "loans", "otherloans");
+			Need next = needs.get(shown);
+			strip.add(Box.createVerticalStrut(5));
+			strip.add(needButton(new Need((needs.size() - shown) + " more", "In the lists below", null, "Show",
+				"Opens the list they're in", next.getSection(), next.getSection(), null), width));
 		}
-		if (wanted > 0)
-		{
-			addNeedsYouLine(strip, wanted + (wanted == 1 ? " member wants" : " members want") + " gear you listed",
-				"lookingfor");
-		}
-		strip.setMaximumSize(new Dimension(Integer.MAX_VALUE, strip.getPreferredSize().height));
+		fullWidthRow(strip);
 		return strip;
 	}
 
-	private void addNeedsYouLine(JPanel strip, String text, String... sections)
+	/**
+	 * How wide the words on a "Needs you" button may be: the list's width with room for
+	 * the scroll bar even while it isn't showing, less the box's edges (21), the button's
+	 * own (16) and 4 to spare, as words measured before they are on screen can come out
+	 * a little wider.
+	 */
+	private int needWordsWidth()
 	{
-		JLabel line = new JLabel("› " + text);
-		line.setFont(FontManager.getRunescapeSmallFont());
-		line.setForeground(Color.WHITE);
-		line.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-		line.setToolTipText("Show them");
-		line.addMouseListener(new java.awt.event.MouseAdapter()
+		JScrollPane pane = (JScrollPane) SwingUtilities.getAncestorOfClass(JScrollPane.class, loanListPanel);
+		int list = 200;
+		if (pane != null && pane.getViewport().getWidth() > 0)
 		{
+			JScrollBar bar = pane.getVerticalScrollBar();
+			list = pane.getViewport().getWidth() - (bar.isVisible() ? 0 : bar.getPreferredSize().width);
+		}
+		return list - 21 - 16 - 4;
+	}
+
+	/**
+	 * One thing waiting for the player, laid out like a small loan card: the item on
+	 * top, who and how late under it, and beside those the action word, which is the
+	 * one part to click.
+	 */
+	private JPanel needButton(Need need, int wordsWidth)
+	{
+		NeedAction action = new NeedAction(need.getAction());
+		// On its own in a box, the word keeps its own height in the middle of its lines.
+		JPanel actionBox = new JPanel(new GridBagLayout());
+		actionBox.setOpaque(false);
+		actionBox.add(action);
+
+		// Broken into lines beforehand, so a long name is never cut off. The item has
+		// the button's whole width; the lines under it share theirs with the action word.
+		int lineWidth = wordsWidth - action.getPreferredSize().width - 6;
+		JPanel lines = new JPanel();
+		lines.setLayout(new BoxLayout(lines, BoxLayout.Y_AXIS));
+		lines.setOpaque(false);
+		lines.add(needWords(need.getStatus(), FontManager.getRunescapeSmallFont(), ColorScheme.LIGHT_GRAY_COLOR, lineWidth));
+		if (need.getDetail() != null)
+		{
+			lines.add(needWords(need.getDetail(), FontManager.getRunescapeSmallFont(), Color.RED, lineWidth));
+		}
+
+		JPanel under = new JPanel(new BorderLayout(6, 0));
+		under.setOpaque(false);
+		under.add(lines, BorderLayout.CENTER);
+		under.add(actionBox, BorderLayout.EAST);
+
+		NeedButton button = new NeedButton();
+		button.add(needWords(need.getTitle(), FontManager.getRunescapeBoldFont(), Color.WHITE, wordsWidth), BorderLayout.NORTH);
+		button.add(under, BorderLayout.CENTER);
+
+		action.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+		action.setToolTipText(need.getTooltip());
+		action.addMouseListener(new java.awt.event.MouseAdapter()
+		{
+			// On release over the word: a click that drifts a pixel still counts, and
+			// the menu it opens can't take the release as a pick.
 			@Override
-			public void mouseClicked(java.awt.event.MouseEvent e)
+			public void mouseReleased(java.awt.event.MouseEvent e)
 			{
-				for (String s : sections) collapsedSections.remove(s);
-				refresh();
+				if (SwingUtilities.isLeftMouseButton(e) && action.contains(e.getPoint()))
+				{
+					openNeed(need, action, e.getPoint());
+				}
+			}
+
+			@Override
+			public void mouseEntered(java.awt.event.MouseEvent e)
+			{
+				action.setHover(true);
+			}
+
+			@Override
+			public void mouseExited(java.awt.event.MouseEvent e)
+			{
+				action.setHover(false);
 			}
 		});
-		strip.add(line);
+		// Left-aligned like the box's title, and as wide as the box, so BoxLayout lines them up.
+		button.setAlignmentX(Component.LEFT_ALIGNMENT);
+		button.setMaximumSize(new Dimension(Integer.MAX_VALUE, button.getPreferredSize().height));
+		return button;
+	}
+
+	private static JLabel needWords(String text, Font font, Color color, int width)
+	{
+		JLabel label = new JLabel();
+		label.setFont(font);
+		label.setForeground(color);
+		label.setText("<html>" + breakLines(text, label.getFontMetrics(label.getFont()), width) + "</html>");
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		return label;
+	}
+
+	/** The text as escaped HTML lines no wider than width; a word too long for a line has one to itself. */
+	private static String breakLines(String text, FontMetrics metrics, int width)
+	{
+		StringBuilder out = new StringBuilder();
+		String line = "";
+		for (String word : (text == null ? "" : text).split(" "))
+		{
+			String longer = line.isEmpty() ? word : line + " " + word;
+			if (!line.isEmpty() && metrics.stringWidth(longer) > width)
+			{
+				out.append(escapeHtml(line)).append("<br>");
+				line = word;
+			}
+			else
+			{
+				line = longer;
+			}
+		}
+		return out.append(escapeHtml(line)).toString();
+	}
+
+	/** A request waiting on the player's answer; its button opens Accept / Decline. */
+	private Need requestNeed(LendingRequest r)
+	{
+		String status = r.isExtension() ? extensionTitle(r, null, true)
+			: r.isRemoval() ? (r.isStaffRemoval() ? "Staff review: remove a loan" : r.getFrom() + " asks to remove the loan")
+			: r.isBorrowRequest() ? r.getFrom() + " wants to borrow it"
+			: r.getFrom() + " offers to lend it to you";
+		String item = r.getItemName() != null ? r.getItemName() : "A request";
+		return new Need(item + (r.getQuantity() > 1 ? " x" + r.getQuantity() : ""), status, null, "Answer",
+			"Accept or decline it", "requests", "request:" + r.getId(),
+			() -> new RequestCard(r, true).getComponentPopupMenu());
+	}
+
+	/**
+	 * An overdue loan the player lent or borrowed. Its button opens the loan's own menu,
+	 * which the lender and the borrower each see with their own options; a loan in
+	 * another group has no menu here, so that one is only shown.
+	 */
+	private Need loanNeed(LendingEntry loan, String me, boolean otherGroup)
+	{
+		boolean lent = me.equalsIgnoreCase(loan.getLender());
+		long days = ChronoUnit.DAYS.between(Instant.ofEpochMilli(loan.getDueTime()), Instant.now());
+		String late = days <= 0 ? "Overdue today" : days == 1 ? "1 day overdue" : days + " days overdue";
+		String status = lent ? "Lent to " + loan.getBorrower() : "Return to " + loan.getLender();
+		String tooltip = otherGroup ? "It's listed under Your Loans in Other Groups"
+			: lent ? "Give more time, or have the loan removed"
+			: "Trade it back, or ask for more time";
+		return new Need(loan.getItem() + " x" + loan.getQuantity(), status, late, otherGroup ? "Show" : "Options",
+			tooltip, otherGroup ? "otherloans" : "loans", "loan:" + loan.getId(),
+			otherGroup ? null : () -> new LoanCard(loan).getComponentPopupMenu());
+	}
+
+	/** A Looking For post that something the player has listed would answer; its button opens I Have This Item. */
+	private Need wantNeed(LookingForRequest r)
+	{
+		// A post's own quantity field counts its items; one item has its own amount.
+		LookingForItem only = r.items.size() == 1 ? r.items.get(0) : null;
+		String title = r.isMultiItem() ? r.itemName + " (" + r.items.size() + " items)"
+			: only != null ? only.itemName + (only.quantity > 1 ? " x" + only.quantity : "")
+			: r.itemName;
+		return new Need(title,
+			r.requesterName + " is looking for this", null, "Offer", "Offer to lend it",
+			"lookingfor", "lookingfor:" + r.id, () -> new LookingForCard(r).getComponentPopupMenu());
+	}
+
+	/**
+	 * One thing in the "Needs you" box: the item, a gray line saying where it stands, a
+	 * red line saying how late (null for none), the word on its button, what hovering it
+	 * says, the section it is listed in, the name of its row there (see findRow), and
+	 * what builds its row's menu (null for none). The menu comes from a card made for
+	 * it at the click, so it's never stale; its dialogs all open over the panel.
+	 */
+	@lombok.Value
+	private static class Need
+	{
+		String title;
+		String status;
+		String detail;
+		String action;
+		String tooltip;
+		String section;
+		String row;
+		java.util.function.Supplier<JPopupMenu> menu;
+	}
+
+	/** A "Needs you" card's face: rounded and dark, with a soft red edge. */
+	private static final class NeedButton extends JPanel
+	{
+		NeedButton()
+		{
+			super(new BorderLayout(0, 3));
+			setOpaque(false);
+			setBorder(new EmptyBorder(6, 8, 7, 8));
+		}
+
+		@Override
+		protected void paintComponent(Graphics g)
+		{
+			Graphics2D g2 = (Graphics2D) g.create();
+			g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+			g2.setColor(ColorScheme.DARKER_GRAY_COLOR);
+			g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 10, 10);
+			g2.setColor(new Color(0x7A, 0x34, 0x34));
+			g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 10, 10);
+			g2.dispose();
+		}
+	}
+
+	/**
+	 * The action word on a "Needs you" button, in the large bold font, white on a rounded
+	 * orange pill like the panel's Create and Offer Item buttons; lighter on hover.
+	 */
+	private static final class NeedAction extends JLabel
+	{
+		private boolean hover;
+
+		NeedAction(String text)
+		{
+			super(text);
+			setFont(FontManager.getRunescapeBoldFont());
+			setForeground(Color.WHITE);
+			setBorder(new EmptyBorder(2, 7, 3, 7));
+		}
+
+		void setHover(boolean hover)
+		{
+			this.hover = hover;
+			repaint();
+		}
+
+		@Override
+		protected void paintComponent(Graphics g)
+		{
+			Graphics2D g2 = (Graphics2D) g.create();
+			g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+			g2.setColor(hover ? new Color(0xF0, 0x9A, 0x10) : ColorScheme.BRAND_ORANGE);
+			g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+			g2.dispose();
+			super.paintComponent(g);
+		}
+	}
+
+	/**
+	 * Lines a row up with the rest of the list. Labels, and panels made only of
+	 * labels, count as left-aligned, and the list shoves those across to the right
+	 * of everything else; centred at full width, their text still starts at the left.
+	 */
+	private static void fullWidthRow(JComponent row)
+	{
+		row.setAlignmentX(Component.CENTER_ALIGNMENT);
+		row.setMaximumSize(new Dimension(Integer.MAX_VALUE, row.getPreferredSize().height));
 	}
 
 	/**
@@ -1495,11 +1843,9 @@ public class DashboardPanel extends JPanel
 			worth.setFont(FontManager.getRunescapeSmallFont());
 			worth.setForeground(Color.YELLOW);
 
-			JPanel top = new JPanel(new BorderLayout());
-			top.setOpaque(false);
-			top.add(title, BorderLayout.WEST);
-			top.add(worth, BorderLayout.EAST);
-			add(top, BorderLayout.NORTH);
+			// The worth sits beside the pictures, where there's room, so a long name and
+			// its tag have the top line to themselves instead of running under it.
+			add(title, BorderLayout.NORTH);
 
 			JPanel icons = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
 			icons.setOpaque(false);
@@ -1520,7 +1866,11 @@ public class DashboardPanel extends JPanel
 				more.setForeground(Color.LIGHT_GRAY);
 				icons.add(more);
 			}
-			add(icons, BorderLayout.CENTER);
+			JPanel iconRow = new JPanel(new BorderLayout(4, 0));
+			iconRow.setOpaque(false);
+			iconRow.add(icons, BorderLayout.CENTER);
+			iconRow.add(worth, BorderLayout.EAST);
+			add(iconRow, BorderLayout.CENTER);
 
 			if (showOwner)
 			{
@@ -1999,6 +2349,8 @@ public class DashboardPanel extends JPanel
 		public LoanCard(LendingEntry loan, boolean readOnly)
 		{
 			this.loan = loan;
+			// How a "Needs you" button finds it.
+			setName("loan:" + loan.getId());
 
 			setLayout(new BorderLayout(10, 0));
 			setBackground(ColorScheme.DARKER_GRAY_COLOR);
@@ -2058,27 +2410,26 @@ public class DashboardPanel extends JPanel
 				dueTimeLabel.setForeground(Color.GREEN);
 			}
 
+			JLabel valueLabel = new JLabel(QuantityFormatter.quantityToStackSize(loan.getValue()) + " GP");
+			valueLabel.setFont(FontManager.getRunescapeSmallFont());
+			valueLabel.setForeground(Color.YELLOW);
+
+			// The value shares the due date's line, so the item's name has the card's
+			// whole width. Left-aligned like the labels above it, and no taller than they are.
+			JPanel valuePanel = new JPanel(new BorderLayout(6, 0));
+			valuePanel.setOpaque(false);
+			valuePanel.add(dueTimeLabel, BorderLayout.CENTER);
+			valuePanel.add(valueLabel, BorderLayout.EAST);
+			valuePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+			valuePanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, valuePanel.getPreferredSize().height));
+
 			detailsPanel.add(itemLabel);
 			detailsPanel.add(Box.createVerticalStrut(3));
 			detailsPanel.add(borrowerLabel);
 			detailsPanel.add(Box.createVerticalStrut(3));
-			detailsPanel.add(dueTimeLabel);
+			detailsPanel.add(valuePanel);
 
 			add(detailsPanel, BorderLayout.CENTER);
-
-			// Right side: Value
-			JPanel valuePanel = new JPanel();
-			valuePanel.setLayout(new BoxLayout(valuePanel, BoxLayout.Y_AXIS));
-			valuePanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-
-			JLabel valueLabel = new JLabel(QuantityFormatter.quantityToStackSize(loan.getValue()) + " GP");
-			valueLabel.setFont(FontManager.getRunescapeSmallFont());
-			valueLabel.setForeground(Color.YELLOW);
-			valueLabel.setAlignmentX(Component.RIGHT_ALIGNMENT);
-
-			valuePanel.add(valueLabel);
-
-			add(valuePanel, BorderLayout.EAST);
 
 			// Hover anywhere on the card shows the full deal: borrower, dates,
 			// collateral, notes (tooltips don't inherit, so set on every component)
@@ -2089,7 +2440,7 @@ public class DashboardPanel extends JPanel
 			{
 				setComponentPopupMenu(buildLoanMenu());
 			}
-			addHoverEffect(this, ColorScheme.DARKER_GRAY_HOVER_COLOR, ColorScheme.DARKER_GRAY_COLOR, detailsPanel, valuePanel);
+			addHoverEffect(this, ColorScheme.DARKER_GRAY_HOVER_COLOR, ColorScheme.DARKER_GRAY_COLOR, detailsPanel);
 		}
 
 		private JPopupMenu buildLoanMenu()
@@ -3150,6 +3501,8 @@ public class DashboardPanel extends JPanel
 		{
 			this.request = request;
 			this.incoming = incoming;
+			// How a "Needs you" button finds it.
+			setName("request:" + request.getId());
 
 			setLayout(new BorderLayout(5, 0));
 			Color bgColor = incoming ? new Color(45, 60, 45) : new Color(55, 55, 45); // Green tint in, amber tint out
@@ -3200,12 +3553,17 @@ public class DashboardPanel extends JPanel
 			detailsPanel.setLayout(new BoxLayout(detailsPanel, BoxLayout.Y_AXIS));
 			detailsPanel.setBackground(bgColor);
 
-			JLabel titleLabel = new JLabel(title);
+			// Names and items come from other members: shown as typed, never read as HTML.
+			JLabel titleLabel = new JLabel();
+			titleLabel.putClientProperty("html.disable", Boolean.TRUE);
+			titleLabel.setText(title);
 			titleLabel.setFont(FontManager.getRunescapeSmallFont());
 			titleLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 			detailsPanel.add(titleLabel);
 
-			JLabel itemLabel = new JLabel(request.getItemName()
+			JLabel itemLabel = new JLabel();
+			itemLabel.putClientProperty("html.disable", Boolean.TRUE);
+			itemLabel.setText(request.getItemName()
 				+ (request.getQuantity() > 1 ? " x" + request.getQuantity() : "")
 				+ (extLoan != null ? "  • until " + DataService.dueText(request.proposedDueTime(extLoan.getLendTime()))
 					: request.isRemoval() ? "" : "  • " + request.getDurationDays() + " days"));
@@ -3504,7 +3862,7 @@ public class DashboardPanel extends JPanel
 		final long base = Math.max(System.currentTimeMillis(), loan.getDueTime());
 		JPanel panel = new JPanel();
 		panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
-		JLabel introLabel = new JLabel("<html><div style='width:220px'>" + intro
+		JLabel introLabel = new JLabel("<html><div style='width:220px'>" + escapeHtml(intro)
 			+ "<br><br>Due now: " + DataService.dueText(loan.getDueTime()) + "</div></html>");
 		introLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
 		panel.add(introLabel);
@@ -3962,6 +4320,8 @@ public class DashboardPanel extends JPanel
 		public LookingForCard(LookingForRequest request)
 		{
 			this.request = request;
+			// How a "Needs you" button finds it.
+			setName("lookingfor:" + request.id);
 
 			setLayout(new BorderLayout(5, 0));
 			// Use a blue-tinted background to differentiate from offerings
@@ -3978,16 +4338,16 @@ public class DashboardPanel extends JPanel
 			if (request.isMultiItem())
 			{
 				StringBuilder tooltipSb = new StringBuilder();
-				tooltipSb.append("<html><b>").append(request.itemName).append("</b><br>");
+				tooltipSb.append("<html><b>").append(escapeHtml(request.itemName)).append("</b><br>");
 				tooltipSb.append(request.getItemCount()).append(" items | ").append(QuantityFormatter.quantityToStackSize(request.getTotalValue())).append(" GP<br>");
 				tooltipSb.append("<i>Right-click to view all items</i></html>");
 				setToolTipText(tooltipSb.toString());
 			}
 			else
 			{
-				setToolTipText("<html><b>" + request.itemName + "</b> x" + request.quantity + "<br>" +
+				setToolTipText("<html><b>" + escapeHtml(request.itemName) + "</b> x" + request.quantity + "<br>" +
 					"Duration: " + request.durationDays + " days<br>" +
-					(request.notes != null && !request.notes.isEmpty() ? "Note: " + request.notes : "") + "</html>");
+					(request.notes != null && !request.notes.isEmpty() ? "Note: " + escapeHtml(request.notes) : "") + "</html>");
 			}
 
 			// Left side: the item's own icon - the first one on a multi-item post
@@ -4023,7 +4383,10 @@ public class DashboardPanel extends JPanel
 			// The post's own title on top...
 			String title = request.itemName;
 			if (title.length() > 20) title = title.substring(0, 17) + "...";
-			JLabel titleLabel = new JLabel(title);
+			// Typed by another member: shown as typed, never read as HTML.
+			JLabel titleLabel = new JLabel();
+			titleLabel.putClientProperty("html.disable", Boolean.TRUE);
+			titleLabel.setText(title);
 			titleLabel.setFont(FontManager.getRunescapeSmallFont());
 			titleLabel.setForeground(Color.WHITE);
 
@@ -4055,7 +4418,7 @@ public class DashboardPanel extends JPanel
 				JLabel match = new JLabel(who);
 				match.setFont(FontManager.getRunescapeSmallFont());
 				match.setForeground(request.wantsMine ? ColorScheme.BRAND_ORANGE : new Color(0x8C, 0xE0, 0x8C));
-				match.setToolTipText("<html>Listed right now by:<br>" + String.join("<br>", request.listedBy) + "</html>");
+				match.setToolTipText("<html>Listed right now by:<br>" + escapeHtml(String.join("\n", request.listedBy)).replace("\n", "<br>") + "</html>");
 				detailsPanel.add(match);
 				setMaximumSize(new Dimension(Integer.MAX_VALUE, 94));
 				setPreferredSize(new Dimension(200, 88));
@@ -4255,8 +4618,8 @@ public class DashboardPanel extends JPanel
 			JPanel panel = new JPanel(new GridBagLayout());
 			GridBagConstraints gbc = createDefaultGbc();
 			gbc.gridy = 0; gbc.gridwidth = 2;
-			panel.add(new JLabel("<html><b>Offer: " + request.itemName + "</b> to " + request.requesterName +
-				(groupName != null ? " <font color='#FFA500'>(" + groupName + ")</font>" : "") +
+			panel.add(new JLabel("<html><b>Offer: " + escapeHtml(request.itemName) + "</b> to " + escapeHtml(request.requesterName) +
+				(groupName != null ? " <font color='#FFA500'>(" + escapeHtml(groupName) + ")</font>" : "") +
 				"<br><font color='gray'>Requested: x" + request.quantity + " for " + request.durationDays + " days</font></html>"), gbc);
 
 			gbc.gridy = 1; gbc.gridwidth = 1;
@@ -4330,6 +4693,46 @@ public class DashboardPanel extends JPanel
 						"Please enter valid numbers.", "Error", JOptionPane.ERROR_MESSAGE);
 				}
 			}
+		}
+	}
+
+	/** Holds the list in its scroll pane at the pane's own width; it only scrolls up and down. */
+	private static final class WidthTrackingPanel extends JPanel implements Scrollable
+	{
+		WidthTrackingPanel()
+		{
+			super(new BorderLayout());
+		}
+
+		@Override
+		public Dimension getPreferredScrollableViewportSize()
+		{
+			return getPreferredSize();
+		}
+
+		@Override
+		public int getScrollableUnitIncrement(Rectangle visible, int orientation, int direction)
+		{
+			return 16;
+		}
+
+		@Override
+		public int getScrollableBlockIncrement(Rectangle visible, int orientation, int direction)
+		{
+			return orientation == SwingConstants.VERTICAL ? visible.height : visible.width;
+		}
+
+		@Override
+		public boolean getScrollableTracksViewportWidth()
+		{
+			return true;
+		}
+
+		@Override
+		public boolean getScrollableTracksViewportHeight()
+		{
+			// Fills the pane when the list is shorter than it, as before.
+			return getParent() instanceof JViewport && getParent().getHeight() > getPreferredSize().height;
 		}
 	}
 }
